@@ -11,10 +11,18 @@
 
 import collections
 import logging
+import os
 import threading
 import time
 import random
 import bitcoin.rpc
+
+_BITCOIN_RPC_SERVICE_URL = os.getenv("BITCOIN_RPC_SERVICE_URL")
+
+def make_proxy():
+    if _BITCOIN_RPC_SERVICE_URL:
+        return bitcoin.rpc.Proxy(service_url=_BITCOIN_RPC_SERVICE_URL)
+    return bitcoin.rpc.Proxy()
 
 from bitcoin.core import COIN, b2lx, b2x, x, lx, CTxIn, CTxOut, COutPoint, CTransaction, str_money_value
 from bitcoin.core.script import CScript, OP_RETURN
@@ -248,7 +256,11 @@ class Stamper:
         bumped appropriately.
         """
 
-        delta_fee = int((old_tx.calc_weight() + 3)/4 * relay_feerate)
+        # python-bitcoinlib 0.11.x has no CTransaction.calc_weight().
+        # Approximate virtual size from serialized tx size so the old stamper
+        # fee-bump path can keep operating.
+        old_tx_vsize = len(old_tx.serialize())
+        delta_fee = int(old_tx_vsize * relay_feerate)
 
         old_change_txout = old_tx.vout[0]
 
@@ -292,7 +304,7 @@ class Stamper:
         # FIXME: we shouldn't have to create a new proxy each time, but with
         # current python-bitcoinlib and the RPC implementation it seems that
         # the proxy connection can timeout w/o recovering properly.
-        proxy = bitcoin.rpc.Proxy()
+        proxy = make_proxy()
 
         new_blocks = self.known_blocks.update_from_proxy(proxy)
 
@@ -336,7 +348,7 @@ class Stamper:
                 except BrokenPipeError:
                     logging.error("BrokenPipeError to get block")
                     time.sleep(5)
-                    proxy = bitcoin.rpc.Proxy()
+                    proxy = make_proxy()
 
             # Pre-compute the block txids once, rather than recalculating them
             # for each unconfirmed_tx
@@ -450,7 +462,7 @@ class Stamper:
         logging.debug("New tip is %s" % b2x(tip_timestamp.msg))
         # make_merkle_tree() seems to take long enough on really big adds
         # that the proxy dies
-        proxy = bitcoin.rpc.Proxy()
+        proxy = make_proxy()
 
         sent_tx = None
         while sent_tx is None:
