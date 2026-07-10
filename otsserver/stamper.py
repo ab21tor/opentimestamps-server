@@ -19,10 +19,13 @@ import bitcoin.rpc
 
 _BITCOIN_RPC_SERVICE_URL = os.getenv("BITCOIN_RPC_SERVICE_URL")
 
-def make_proxy():
+def make_proxy(timeout=120):
+    # Explicit RPC timeout: the 2026-07-03 audit found recurring
+    # RemoteDisconnected noise in the calendar's logs from RPC calls
+    # outliving bitcoinlib's default HTTP timeout.
     if _BITCOIN_RPC_SERVICE_URL:
-        return bitcoin.rpc.Proxy(service_url=_BITCOIN_RPC_SERVICE_URL)
-    return bitcoin.rpc.Proxy()
+        return bitcoin.rpc.Proxy(service_url=_BITCOIN_RPC_SERVICE_URL, timeout=timeout)
+    return bitcoin.rpc.Proxy(timeout=timeout)
 
 from bitcoin.core import COIN, b2lx, b2x, x, lx, CTxIn, CTxOut, COutPoint, CTransaction, str_money_value
 from bitcoin.core.script import CScript, OP_RETURN
