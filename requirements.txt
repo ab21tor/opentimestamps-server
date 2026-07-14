@@ -5,4 +5,8 @@ requests>=2.21
 qrcode==6.1
 image==1.5.27
 simplejson==3.16.0
-python-bitcoinlib>=0.12.1,<0.13.0
+# Upstream's floor is 0.12.1, but the deployed otsd image pins 0.11.2
+# (timestamp-gateway otsd/Dockerfile) and this code must stay compatible
+# with it; floor widened to match deployed reality. stamper.py avoids
+# CTransaction.calc_weight() (absent in 0.11.x) for this reason.
+python-bitcoinlib>=0.11.2,<0.13.0

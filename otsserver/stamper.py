@@ -259,11 +259,18 @@ class Stamper:
         bumped appropriately.
         """
 
-        # python-bitcoinlib 0.11.x has no CTransaction.calc_weight().
-        # Approximate virtual size from serialized tx size so the old stamper
-        # fee-bump path can keep operating.
-        old_tx_vsize = len(old_tx.serialize())
-        delta_fee = int(old_tx_vsize * relay_feerate)
+        # Exact BIP141 virtual size. python-bitcoinlib 0.11.x (the deployed
+        # pin) has no CTransaction.calc_weight(), but stripped serialization
+        # is available, so weight = stripped*3 + total reproduces upstream's
+        # calc_weight() exactly — including for non-segwit txs, where
+        # stripped == total and the formula reduces to total*4.
+        # The prior workaround here (8145dc6) billed delta_fee on
+        # len(old_tx.serialize()) — total size including witness — which
+        # overpaid 52.9% over true vsize on our 1-input P2WPKH shape
+        # (234 bytes billed vs 153 vbytes).
+        old_tx_stripped_size = len(old_tx.serialize(dict(include_witness=False)))
+        old_tx_weight = old_tx_stripped_size * 3 + len(old_tx.serialize())
+        delta_fee = int((old_tx_weight + 3) / 4 * relay_feerate)
 
         old_change_txout = old_tx.vout[0]
 
