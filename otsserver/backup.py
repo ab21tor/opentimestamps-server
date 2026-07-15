@@ -15,6 +15,7 @@ from opentimestamps.core.op import Op
 from opentimestamps.core.serialize import BytesSerializationContext, BytesDeserializationContext, TruncationError, \
     StreamSerializationContext
 import bitcoin.rpc
+from otsserver.stamper import make_proxy
 import leveldb
 import logging
 import socketserver
@@ -285,7 +286,7 @@ class AskBackup(threading.Thread):
                     op = Op.deserialize(ctx)
                     ops[key] = op
 
-            proxy = bitcoin.rpc.Proxy()
+            proxy = make_proxy(timeout=30)
 
             # Verify all bitcoin attestation are valid
             logging.debug("Total attestations: " + str(len(attestations)))
@@ -302,7 +303,7 @@ class AskBackup(threading.Thread):
                         except Exception as err:
                             logging.info("%s - error contacting bitcoin node, sleeping..." % (err))
                             time.sleep(SLEEP_SECS)
-                            proxy = bitcoin.rpc.Proxy()
+                            proxy = make_proxy(timeout=30)
 
             # verify all ops connects to an attestation
             logging.debug("Total ops: " + str(len(ops)))

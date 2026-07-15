@@ -11,6 +11,7 @@
 
 import binascii
 import http.server
+import logging
 import qrcode
 import socketserver
 import time
@@ -25,6 +26,7 @@ import bitcoin.core
 from bitcoin.core import b2lx, b2x, COIN
 
 from otsserver.backup import Backup
+from otsserver.stamper import make_proxy
 import otsserver
 from opentimestamps.core.serialize import BytesSerializationContext
 
@@ -212,8 +214,9 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
             try:
-                proxy = bitcoin.rpc.Proxy()
+                proxy = make_proxy(timeout=5)
             except Exception as err:
+                logging.error("homepage: failed to construct bitcoin RPC proxy: %r" % err, exc_info=True)
                 return
 
             # minconf=1 will underestimate the balance when timestamp txs are
