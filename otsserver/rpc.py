@@ -214,7 +214,14 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
             try:
-                proxy = make_proxy(timeout=5)
+                # Per-op socket timeout (connect + each recv) — a hung-transport
+                # detector, not a render budget. Must clear the Tor bridge's
+                # honest TTFB (~1-2s) and its transient circuit stalls, which
+                # cut ~11% of renders when this sat at 5s (2026-07-17). Paired
+                # with the gateway health probe's read timeout (timestamp-gateway
+                # main.py, timeout=(5, 45)), which must outlast a FULL render:
+                # change the two together.
+                proxy = make_proxy(timeout=30)
             except Exception as err:
                 logging.error("homepage: failed to construct bitcoin RPC proxy: %r" % err, exc_info=True)
                 return

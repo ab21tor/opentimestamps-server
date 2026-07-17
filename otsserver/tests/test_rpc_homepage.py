@@ -123,6 +123,24 @@ class Test_homepage_bitcoin_wiring(unittest.TestCase):
             captured.output,
         )
 
+    def test_homepage_rpc_timeout_is_thirty_seconds(self):
+        """The homepage per-op RPC timeout is a hung-transport detector, not a
+        render budget: it must clear the Tor bridge's transient circuit stalls
+        (which cut ~11% of renders while this sat at 5s, 2026-07-17) and stays
+        paired with the gateway probe's 45s read timeout, which must outlast a
+        full render. Pin the value so neither moves alone."""
+        seen = []
+
+        def capturing_make_proxy(timeout=None):
+            seen.append(timeout)
+            return FakeProxy()
+
+        with mock.patch.object(otsserver.rpc, "make_proxy", capturing_make_proxy):
+            head, body = drive_homepage(make_handler_cls())
+
+        self.assertEqual(seen, [30])
+        self.assertIn(b"Best-block", body)
+
 
 if __name__ == "__main__":
     unittest.main()
