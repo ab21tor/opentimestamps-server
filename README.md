@@ -81,6 +81,35 @@ example configuration for nginx is provided under `contrib/nginx`.
 
 ## Unit tests
 
+Test modules live under `otsserver/tests/`:
+
+- `test_calendar.py` — inherited from upstream.
+- `test_otsd_launcher.py`, `test_rpc_homepage.py`, `test_stamper_loop.py` —
+  regression tests for this branch's delta (launcher flags, homepage RPC
+  wiring, stamper-loop crash fixes). They stub everything external with
+  `unittest.mock`: no bitcoind, no network.
+
+No test module needs a running Bitcoin node. Every test module DOES need the
+full dependency set installed, and one dependency — `leveldb` — is a native
+build: `otsserver/calendar.py` imports it at module level, so without it every
+module (upstream-inherited and delta alike) fails at collection with
+`ModuleNotFoundError`, before a single test runs.
+
+Verified 2026-07-24 in the deployment-matched environment — the otsd image
+base `python:3.11-slim` plus `build-essential libleveldb-dev`, then
+`pip install -r requirements.txt pytest`:
+
 ```
-python3 -m unittest discover -v
+python -m pytest otsserver/tests -q                  # 10 passed
+python -m pytest otsserver/tests/test_otsd_launcher.py \
+    otsserver/tests/test_rpc_homepage.py \
+    otsserver/tests/test_stamper_loop.py -q          # 6 passed (branch delta)
+python -m pytest otsserver/tests/test_calendar.py -q # 4 passed (upstream)
+python3 -m unittest discover -v                      # Ran 10 tests ... OK
 ```
+
+Verified failure mode on a clean macOS machine (Python 3.13, fresh venv):
+`pip install -r requirements.txt` fails building the `leveldb` wheel, so
+nothing is importable and no test can run. Other platforms and Python
+versions have not been tried here; treat any claim about them as unverified
+until you run the commands above.
