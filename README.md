@@ -79,15 +79,60 @@ By default `otsd` binds to localhost; `otsd` is not designed to be exposed
 directly to the public and requires a reverse proxy for production usage. An
 example configuration for nginx is provided under `contrib/nginx`.
 
+## Anchor receipts
+
+Set the `OTSD_ANCHOR_RECEIPTS` environment variable to a file path and the
+stamper appends one JSON line per anchor transaction, recording what that
+anchor actually cost. The file exists for the gateway's anchor-billing
+feature, which reads and dedupes it; nothing in this server ever reads it
+back. Unset (the default), the feature is entirely off and the server
+behaves exactly as before.
+
+A natural home is inside the calendar directory, e.g.
+`~/.otsd/calendar/anchor-receipts.jsonl`, but any writable path works.
+
+Exactly one line is appended per anchor, at the moment the stamper's own
+existing logic considers the transaction confirmed — the same point the
+commitments are saved to the calendar; no new confirmation policy is
+introduced. Broadcasts and RBF fee bumps write nothing; a replaced txid
+never appears in the file. The file is append-only JSONL: each line is
+appended atomically, and existing bytes are never rewritten or truncated.
+
+Each line is a JSON object with exactly these fields. The format is an
+interface parsed by other software — treat it as pinned:
+
+- `txid` — the anchor transaction id; 64 hex characters, RPC display
+  order.
+- `fee_sats` — the actual final fee of the confirmed transaction, in
+  satoshis. The stamper constructs the transaction, so this is input
+  value minus output value of the version that confirmed — the fee after
+  any RBF bumps, never an estimate.
+- `commitments` — the number of commitments this anchor carried.
+- `confirmed_height` — the height of the block containing the anchor
+  transaction.
+- `confirmed_at` — unix time at which the stamper deemed the transaction
+  confirmed and wrote the line. Bookkeeping, not consensus data: this is
+  the stamper's wall clock, not a block timestamp.
+
+Two guarantees:
+
+- A receipt write failure never breaks anchoring. The stamper logs one
+  warning and continues; the calendar save always happens.
+- A crash at the wrong moment may produce a duplicate or extra line,
+  never a silently missing one. The receipt is written before the
+  calendar save: a missed receipt is silently lost revenue, while the
+  gateway dedupes by txid, so the trade goes to the extra line.
+
 ## Unit tests
 
 Test modules live under `otsserver/tests/`:
 
 - `test_calendar.py` — inherited from upstream.
-- `test_otsd_launcher.py`, `test_rpc_homepage.py`, `test_stamper_loop.py` —
-  regression tests for this branch's delta (launcher flags, homepage RPC
-  wiring, stamper-loop crash fixes). They stub everything external with
-  `unittest.mock`: no bitcoind, no network.
+- `test_otsd_launcher.py`, `test_rpc_homepage.py`, `test_stamper_loop.py`,
+  `test_anchor_receipts.py` — regression tests for this branch's delta
+  (launcher flags, homepage RPC wiring, stamper-loop crash fixes, anchor
+  receipts). They stub everything external with `unittest.mock`: no
+  bitcoind, no network.
 
 No test module needs a running Bitcoin node. Every test module DOES need the
 full dependency set installed, and one dependency — `leveldb` — is a native
@@ -95,17 +140,18 @@ build: `otsserver/calendar.py` imports it at module level, so without it every
 module (upstream-inherited and delta alike) fails at collection with
 `ModuleNotFoundError`, before a single test runs.
 
-Verified 2026-07-24 in the deployment-matched environment — the otsd image
-base `python:3.11-slim` plus `build-essential libleveldb-dev`, then
-`pip install -r requirements.txt pytest`:
+Verified 2026-07-28 in the deployment-matched environment — the otsd image
+(base `python:3.11-slim` plus `build-essential libleveldb-dev` and
+`pip install -r requirements.txt`), plus `pip install pytest`:
 
 ```
-python -m pytest otsserver/tests -q                  # 10 passed
+python -m pytest otsserver/tests -q                  # 17 passed
 python -m pytest otsserver/tests/test_otsd_launcher.py \
     otsserver/tests/test_rpc_homepage.py \
-    otsserver/tests/test_stamper_loop.py -q          # 6 passed (branch delta)
+    otsserver/tests/test_stamper_loop.py \
+    otsserver/tests/test_anchor_receipts.py -q       # 13 passed (branch delta)
 python -m pytest otsserver/tests/test_calendar.py -q # 4 passed (upstream)
-python3 -m unittest discover -v                      # Ran 10 tests ... OK
+python3 -m unittest discover -v                      # Ran 17 tests ... OK
 ```
 
 Verified failure mode on a clean macOS machine (Python 3.13, fresh venv):

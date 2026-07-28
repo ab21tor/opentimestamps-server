@@ -10,6 +10,7 @@
 # in the LICENSE file.
 
 import collections
+import json
 import logging
 import os
 import threading
@@ -41,8 +42,8 @@ from otsserver.calendar import Journal
 DUST = 330
 
 KnownBlock = collections.namedtuple('KnownBlock', ['height', 'hash'])
-TimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'commitment_timestamps'])
-UnconfirmedTimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'n'])
+TimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'commitment_timestamps', 'fee', 'height'])
+UnconfirmedTimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'n', 'fee'])
 
 
 def make_btc_block_merkle_tree(blk_txids):
@@ -175,6 +176,25 @@ def _get_tx_fee(tx, proxy):
     value_out = sum(txout.nValue for txout in tx.vout)
     return value_in - value_out
 
+
+def _append_anchor_receipt(path, receipt):
+    """Append one anchor receipt line to the JSONL file at path
+
+    The line is an interface: the gateway's anchor billing parses these
+    fields. See the "Anchor receipts" section of the README.
+
+    A single os.write() on an O_APPEND fd appends the whole line
+    atomically; existing bytes are never rewritten or truncated.
+    """
+    line = json.dumps(receipt) + '\n'
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 # not using proxy.listunspent() because it tries to convert bech32 address as base58
 def listunspent(proxy, minconf=0, maxconf=999999):
     r = proxy._call('listunspent', minconf, maxconf)
@@ -286,6 +306,26 @@ class Stamper:
 
     def __save_confirmed_timestamp_tx(self, confirmed_tx):
         """Save a fully confirmed timestamp to disk"""
+
+        # Receipt before calendar save: if we crash between the two, the
+        # commitments are re-anchored by a new tx with its own receipt, so
+        # at worst the file gains an extra line. A possible duplicate line
+        # is preferred over a possible missed one — a missed receipt is
+        # silently lost revenue, and the gateway dedupes by txid.
+        if self.anchor_receipts_path:
+            txid = b2lx(confirmed_tx.tx.GetTxid())
+            try:
+                _append_anchor_receipt(self.anchor_receipts_path,
+                                       {'txid': txid,
+                                        'fee_sats': confirmed_tx.fee,
+                                        'commitments': len(confirmed_tx.commitment_timestamps),
+                                        'confirmed_height': confirmed_tx.height,
+                                        'confirmed_at': int(time.time())})
+            except Exception as exp:
+                # Anchoring is the job, the receipt is the diary: a failed
+                # write must never break the stamp loop.
+                logging.warning("Failed to write anchor receipt for tx %s: %r" % (txid, exp))
+
         self.calendar.add_commitment_timestamps(confirmed_tx.commitment_timestamps)
         logging.info("tx %s fully confirmed, %d timestamps added to calendar" %
                      (b2lx(confirmed_tx.tx.GetTxid()),
@@ -383,7 +423,8 @@ class Stamper:
                              % (b2x(confirmed_tx.tip_timestamp.msg), b2lx(confirmed_tx.tx.GetTxid())))
                 # Success!
                 (tip_timestamp, commitment_timestamps) = self.__pending_to_merkle_tree(confirmed_tx.n)
-                mined_tx = TimestampTx(confirmed_tx.tx, tip_timestamp, commitment_timestamps)
+                mined_tx = TimestampTx(confirmed_tx.tx, tip_timestamp, commitment_timestamps,
+                                       confirmed_tx.fee, block_height)
                 assert tip_timestamp.msg == unconfirmed_tx.tip_timestamp.msg
 
                 mined_tx.tip_timestamp.merge(block_timestamp)
@@ -428,7 +469,7 @@ class Stamper:
         new_tx = False
         if self.unconfirmed_txs:
             bump_feerate = self.relay_feerate
-            (prev_tx, prev_tip_timestamp, prev_commitment_timestamps) = self.unconfirmed_txs[-1]
+            prev_tx = self.unconfirmed_txs[-1].tx
 
         # First transaction of a new cycle
         else:
@@ -521,7 +562,7 @@ class Stamper:
             logging.info("Sent timestamp tx %s; %d total commitments" % (b2lx(sent_tx.GetTxid()),
                                                                          len(commitment_timestamps)))
 
-        self.unconfirmed_txs.append(UnconfirmedTimestampTx(sent_tx, tip_timestamp, len(commitment_timestamps)))
+        self.unconfirmed_txs.append(UnconfirmedTimestampTx(sent_tx, tip_timestamp, len(commitment_timestamps), fee))
 
     def __loop(self):
         logging.info("Starting stamper loop")
@@ -624,6 +665,10 @@ class Stamper:
         self.min_tx_interval = min_tx_interval
         self.max_fee = max_fee
         self.max_pending = max_pending
+
+        # Unset (the default) = anchor receipts entirely off; set = path to
+        # the append-only JSONL receipts file the gateway's billing reads.
+        self.anchor_receipts_path = os.getenv("OTSD_ANCHOR_RECEIPTS") or None
 
         self.known_blocks = KnownBlocks()
         self.unconfirmed_txs = []
