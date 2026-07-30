@@ -464,6 +464,15 @@ class Stamper:
 
         if not self.pending_commitments:
             logging.debug("No pending commitments, no tx needed")
+            # An expired departure clock must not lie in wait over an empty
+            # queue: the first commitment after an idle stretch would trigger
+            # a broadcast within seconds, timestamping its own arrival on the
+            # public chain. Broadcast times must be a property of the box's
+            # own schedule, independent of submission times, so roll the
+            # clock forward by the same law as a post-confirmation
+            # reschedule. (2026-07-30)
+            if not self.unconfirmed_txs:
+                self.next_timestamp_tx = time.time() + (self.min_tx_interval * random.uniform(1, 2))
             return
 
         new_tx = False
@@ -676,7 +685,10 @@ class Stamper:
         self.pending_commitments = OrderedSet()
         self.txs_waiting_for_confirmation = {}
 
-        self.next_timestamp_tx = time.time()
+        # Arm the departure clock free-running from the first moment: an
+        # expired clock at startup would let the first commitment after a
+        # restart fire a broadcast within seconds. (2026-07-30)
+        self.next_timestamp_tx = time.time() + (self.min_tx_interval * random.uniform(1, 2))
         self.journal_cursor = None
 
         self.thread = threading.Thread(target=self.__loop)

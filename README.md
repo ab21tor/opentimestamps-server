@@ -123,16 +123,28 @@ Two guarantees:
   calendar save: a missed receipt is silently lost revenue, while the
   gateway dedupes by txid, so the trade goes to the extra line.
 
+## Anchor cadence
+
+Anchor departures happen only at the scheduled moments of a free-running
+jittered clock: the next departure is always `min_tx_interval` × a uniform
+random factor between 1 and 2 in the future, re-armed when an anchor
+confirms, when the clock expires over an empty queue, and at startup. An
+idle window rolls the clock silently, so the first commitment after
+idleness waits for the next scheduled departure like any other. Anchor
+timing is therefore independent of submission timing: a broadcast time
+never reveals when a commitment arrived. There is no new configuration —
+the schedule is governed by the existing `--btc-min-tx-interval` knob.
+
 ## Unit tests
 
 Test modules live under `otsserver/tests/`:
 
 - `test_calendar.py` — inherited from upstream.
 - `test_otsd_launcher.py`, `test_rpc_homepage.py`, `test_stamper_loop.py`,
-  `test_anchor_receipts.py` — regression tests for this branch's delta
-  (launcher flags, homepage RPC wiring, stamper-loop crash fixes, anchor
-  receipts). They stub everything external with `unittest.mock`: no
-  bitcoind, no network.
+  `test_anchor_receipts.py`, `test_stamper_cadence.py` — regression tests
+  for this branch's delta (launcher flags, homepage RPC wiring,
+  stamper-loop crash fixes, anchor receipts, anchor cadence). They stub
+  everything external with `unittest.mock`: no bitcoind, no network.
 
 No test module needs a running Bitcoin node. Every test module DOES need the
 full dependency set installed, and one dependency — `leveldb` — is a native
@@ -140,18 +152,19 @@ build: `otsserver/calendar.py` imports it at module level, so without it every
 module (upstream-inherited and delta alike) fails at collection with
 `ModuleNotFoundError`, before a single test runs.
 
-Verified 2026-07-28 in the deployment-matched environment — the otsd image
+Verified 2026-07-30 in the deployment-matched environment — the otsd image
 (base `python:3.11-slim` plus `build-essential libleveldb-dev` and
 `pip install -r requirements.txt`), plus `pip install pytest`:
 
 ```
-python -m pytest otsserver/tests -q                  # 17 passed
+python -m pytest otsserver/tests -q                  # 21 passed
 python -m pytest otsserver/tests/test_otsd_launcher.py \
     otsserver/tests/test_rpc_homepage.py \
     otsserver/tests/test_stamper_loop.py \
-    otsserver/tests/test_anchor_receipts.py -q       # 13 passed (branch delta)
+    otsserver/tests/test_anchor_receipts.py \
+    otsserver/tests/test_stamper_cadence.py -q       # 17 passed (branch delta)
 python -m pytest otsserver/tests/test_calendar.py -q # 4 passed (upstream)
-python3 -m unittest discover -v                      # Ran 17 tests ... OK
+python3 -m unittest discover -v                      # Ran 21 tests ... OK
 ```
 
 Verified failure mode on a clean macOS machine (Python 3.13, fresh venv):
