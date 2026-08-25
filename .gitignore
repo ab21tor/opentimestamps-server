@@ -30,3 +30,6 @@ pip-log.txt
 
 #Idea IDE
 .idea/
+
+# Pre-edit copies left beside edited files
+*.bak-*

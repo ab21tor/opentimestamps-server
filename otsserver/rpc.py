@@ -53,11 +53,18 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
         # Might be missing or otherwise invalid
         try:
             content_length = int(content_length)
-        except TypeError:
+        except (TypeError, ValueError):
             self.send_response(400)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'invalid Content-Length')
+            return
+
+        if content_length < 1:
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'invalid digest length')
             return
 
         if content_length > self.MAX_DIGEST_LENGTH:
@@ -216,7 +223,7 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 # Per-op socket timeout (connect + each recv) — a hung-transport
                 # detector, not a render budget. Must clear the Tor bridge's
-                # honest TTFB (~1-2s) and its transient circuit stalls, which
+                # TTFB (~1-2s) and its transient circuit stalls, which
                 # cut ~11% of renders when this sat at 5s (2026-07-17). Paired
                 # with the gateway health probe's read timeout (timestamp-gateway
                 # main.py, timeout=(5, 45)), which must outlast a FULL render:
@@ -366,8 +373,9 @@ Latest mined transactions: </br>
             self.get_timestamp()
         elif self.path == '/tip':
             self.get_tip()
-        elif self.path.startswith('/experimental/backup/'):
-            self.get_backup()
+        # /experimental/backup/ deliberately unregistered: it served calendar
+        # data unauthenticated. The replication tooling (otsd-backup.py,
+        # otsserver/backup.py) remains; re-register only behind auth.
         else:
             self.send_response(404)
             self.send_header('Content-Type', 'text/plain')

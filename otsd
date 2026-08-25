@@ -85,8 +85,7 @@ args.parser = parser
 
 # ~/.otsd exists only when the DEFAULT calendar path is in use — a custom
 # --calendar must not leave a stray dotdir in the operator's home. stdout is
-# the log (captured by docker/journald); the old RotatingFileHandler wrote an
-# undocumented DEBUG file inside the container on top of it.
+# the log (captured by docker/journald).
 if args.calendar_path == parser.get_default('calendar_path'):
     default_dir = os.path.expanduser("~/.otsd")
     if not os.path.exists(default_dir):

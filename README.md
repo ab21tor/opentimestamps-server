@@ -76,8 +76,11 @@ bitcoin-cli -generate 10
 ```
 
 By default `otsd` binds to localhost; `otsd` is not designed to be exposed
-directly to the public and requires a reverse proxy for production usage. An
-example configuration for nginx is provided under `contrib/nginx`.
+directly to the public. Never expose the calendar's HTTP port publicly: the
+homepage discloses the anchor wallet's balance and address, the pending
+queue, and the complete anchor transaction history to anyone who can reach
+it. Serve clients through the gateway; if the calendar itself must be
+reachable, put an authenticating reverse proxy in front.
 
 ## Anchor receipts
 
@@ -113,6 +116,34 @@ interface parsed by other software — treat it as pinned:
 - `confirmed_at` — unix time at which the stamper deemed the transaction
   confirmed and wrote the line. Bookkeeping, not consensus data: this is
   the stamper's wall clock, not a block timestamp.
+- `records` — the number of individual digest submissions whose
+  commitments sit inside this transaction's anchor tree. A record is one
+  submission accepted by the aggregator — one leaf of a per-second merkle
+  tree. A digest re-submitted within the aggregator's dedupe horizon
+  (in-memory, one hour, capped at 65536 entries, refreshed on every hit)
+  attaches to the existing pending commitment and is counted once. The
+  count is fixed when the anchor tree closes over the pending
+  commitments; the receipt carries the count of the tree that actually
+  confirmed. The counter errs low, never high, with one bounded
+  exception: resubmission across a restart boundary (or past the
+  horizon), where the fresh aggregator cannot know the digest was
+  already counted, records the same digest twice. Otherwise miscounts
+  only ever err low: a commitment whose count is unknown (recorded
+  before this feature was enabled, or lost to a crash) sums as 0, with
+  one warning logged per affected tree. `0` therefore means "unknown",
+  not "empty" — a real tree always has at least one leaf.
+
+The per-tree counts behind `records` live in a sidecar next to the
+journal, `journal.counts`: one 4-byte big-endian integer per journal
+entry index, written only after the journal entry itself is durable, so a
+crash can lose counts but never invent them. The sidecar exists only when
+`OTSD_ANCHOR_RECEIPTS` is set and grows at 4 bytes per journal entry —
+1/11th of the journal's own growth, sharing its append-only lifecycle.
+Nothing needs to be migrated when enabling the feature on an existing
+calendar: older entries simply have no counts. The sidecar is per-second
+activity metadata: it records how many submissions each second's tree
+carried — no digests, but a traffic-volume record, sharing the calendar's
+privacy posture.
 
 Two guarantees:
 
@@ -122,6 +153,17 @@ Two guarantees:
   never a silently missing one. The receipt is written before the
   calendar save: a missed receipt is silently lost revenue, while the
   gateway dedupes by txid, so the trade goes to the extra line.
+
+Under records × rate billing that second guarantee has a sharper
+consequence than an extra line: the commitments left unsaved by a crash
+between the receipt write and the calendar save are re-anchored on restart
+under a new txid, producing a second receipt and a second bill for the
+same records. The ordering still goes to duplicate-over-miss — a missed
+receipt is revenue nothing downstream can surface, while a duplicate is
+visible on /anchor-bills and refundable, and the `records` field on every
+bill lets the client reconcile records billed against records submitted.
+The operator-side handling is in the timestamp-gateway operator guide,
+"Anchor billing" → "The double-bill crash edge".
 
 ## Anchor cadence
 
@@ -135,40 +177,55 @@ timing is therefore independent of submission timing: a broadcast time
 never reveals when a commitment arrived. There is no new configuration —
 the schedule is governed by the existing `--btc-min-tx-interval` knob.
 
+## Restart checkpoint (journal.known-good)
+
+`<calendar>/journal.known-good` holds the journal index the stamper's
+restart scan may begin at: everything below it is already anchored in the
+calendar. Upstream only ever *read* this file (an operator convenience,
+never written); this fork writes it after every confirmed anchor — the
+lowest journal index still outstanding (pending, or riding a mined tree
+that has not yet reached `--btc-min-confirmations`), or the scan cursor
+itself when nothing is outstanding. Written atomically beside the journal;
+a failed write warns and never interrupts anchoring. Without it a restart
+re-reads the entire journal and probes the calendar once per entry — a
+cost that grows with all history; with it, a restart's catch-up is one
+anchor window. Deleting the file is always safe and merely restores the
+slow full rescan. There is no new configuration.
+
 ## Unit tests
 
 Test modules live under `otsserver/tests/`:
 
 - `test_calendar.py` — inherited from upstream.
 - `test_otsd_launcher.py`, `test_rpc_homepage.py`, `test_stamper_loop.py`,
-  `test_anchor_receipts.py`, `test_stamper_cadence.py` — regression tests
-  for this branch's delta (launcher flags, homepage RPC wiring,
-  stamper-loop crash fixes, anchor receipts, anchor cadence). They stub
-  everything external with `unittest.mock`: no bitcoind, no network.
+  `test_anchor_receipts.py`, `test_stamper_cadence.py`,
+  `test_rpc_digest.py`, `test_anchor_records.py`,
+  `test_aggregator_dedupe.py`, `test_stamper_read_errors.py`,
+  `test_stamper_checkpoint.py`, `test_stamper_wallet_empty.py` — regression
+  tests for this branch's delta (launcher flags, homepage RPC wiring,
+  stamper-loop crash fixes, anchor receipts, anchor cadence, the /digest
+  Content-Length handling, anchor-receipt record counts, aggregator
+  dedupe, pending-fill read-error survival, the restart checkpoint,
+  empty-wallet warn-once). They stub everything external with
+  `unittest.mock`: no bitcoind, no network.
 
-No test module needs a running Bitcoin node. Every test module DOES need the
+No test module needs a running Bitcoin node. Every module does need the
 full dependency set installed, and one dependency — `leveldb` — is a native
 build: `otsserver/calendar.py` imports it at module level, so without it every
-module (upstream-inherited and delta alike) fails at collection with
-`ModuleNotFoundError`, before a single test runs.
+module fails at collection with `ModuleNotFoundError`.
 
-Verified 2026-07-30 in the deployment-matched environment — the otsd image
-(base `python:3.11-slim` plus `build-essential libleveldb-dev` and
-`pip install -r requirements.txt`), plus `pip install pytest`:
+Run the suite in the deployment-matched environment — the otsd image (base
+`python:3.11-slim` plus `build-essential libleveldb-dev` and
+`pip install -r requirements.txt`) — or in a Python ≤ 3.11 venv:
 
 ```
-python -m pytest otsserver/tests -q                  # 21 passed
-python -m pytest otsserver/tests/test_otsd_launcher.py \
-    otsserver/tests/test_rpc_homepage.py \
-    otsserver/tests/test_stamper_loop.py \
-    otsserver/tests/test_anchor_receipts.py \
-    otsserver/tests/test_stamper_cadence.py -q       # 17 passed (branch delta)
-python -m pytest otsserver/tests/test_calendar.py -q # 4 passed (upstream)
-python3 -m unittest discover -v                      # Ran 21 tests ... OK
+python -m unittest discover -v                       # Ran 42 tests ... OK
 ```
 
-Verified failure mode on a clean macOS machine (Python 3.13, fresh venv):
-`pip install -r requirements.txt` fails building the `leveldb` wheel, so
-nothing is importable and no test can run. Other platforms and Python
-versions have not been tried here; treat any claim about them as unverified
-until you run the commands above.
+The otsd image has no pytest; where pytest is installed,
+`python -m pytest otsserver/tests -q` runs the identical set.
+
+Known limit: py-leveldb does not build on Python 3.12+ (`pip install -r
+requirements.txt` fails on the `leveldb` wheel, so nothing is importable and
+no test can run). Other platforms and Python versions have not been tried;
+treat any claim about them as unverified until you run the command above.

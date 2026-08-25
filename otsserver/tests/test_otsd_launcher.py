@@ -12,8 +12,7 @@
 """Regression tests for the otsd launcher's ~/.otsd handling.
 
 The launcher unconditionally created ~/.otsd even when --calendar pointed
-elsewhere (and, before its removal, the debug file too) — a stray dotdir in
-whatever $HOME the daemon ran under. The mkdir must happen only when the
+elsewhere — a stray dotdir in whatever $HOME the daemon ran under. The mkdir must happen only when the
 default calendar path is actually in use.
 
 Driven via subprocess: otsd is a script, and both runs exit early at

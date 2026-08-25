@@ -83,10 +83,20 @@ class JournalWriter(Journal):
 
         logging.info("Journal has %d entries" % (self.append_fd.tell() // self.COMMITMENT_SIZE))
 
-    def submit(self, commitment):
+        # Record-count sidecar for anchor receipts, written only after the
+        # journal entry itself is durable so a crash can lose counts but
+        # never invent them. Created only when the anchor-receipts feature
+        # is on; unset, nothing here changes.
+        self.record_counts = RecordCountsWriter(path + '.counts') \
+            if os.getenv("OTSD_ANCHOR_RECEIPTS") else None
+
+    def submit(self, commitment, records=None):
         """Add a new commitment to the journal
 
         Returns only after the commitment is synchronized to disk.
+
+        records is the number of digest submissions aggregated under this
+        commitment (its merkle tree's leaf count); None means unknown.
         """
         # Pad with null HMAC if necessary
         if len(commitment) == self.COMMITMENT_SIZE - HMAC_SIZE:
@@ -96,9 +106,97 @@ class JournalWriter(Journal):
             raise ValueError("Journal commitments must be exactly %d bytes long" % self.COMMITMENT_SIZE)
 
         assert (self.append_fd.tell() % self.COMMITMENT_SIZE) == 0
+        idx = self.append_fd.tell() // self.COMMITMENT_SIZE
         self.append_fd.write(commitment)
         self.append_fd.flush()
         os.fsync(self.append_fd.fileno())
+
+        if self.record_counts is not None and records:
+            try:
+                self.record_counts.put(idx, records)
+            except Exception as exp:
+                # The commitment is already durable; a lost count only
+                # undercounts the eventual receipt, the acceptable failure
+                # direction. It must never break aggregation.
+                logging.warning("Failed to write record count for journal entry %d: %r" % (idx, exp))
+
+
+class RecordCounts:
+    """Read-only accessor for the journal's record-count sidecar
+
+    The sidecar (journal path + '.counts') holds one 4-byte big-endian
+    integer per journal entry index: the number of digest submissions
+    (merkle tree leaves) aggregated under that entry. Holes — entries from
+    before OTSD_ANCHOR_RECEIPTS was set, or counts lost to a crash — read
+    as zero, and a real tree always has at least one leaf, so zero means
+    "unknown" and is returned as None. Callers sum None as 0: receipts may
+    only ever undercount.
+    """
+    RECORD_SIZE = 4
+
+    # True once a read failure has been warned about; class-level default
+    # so the writer subclass, which does not call this __init__, shares it.
+    io_failed = False
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+
+    def get(self, idx):
+        """Return the record count for journal entry idx, or None if unknown
+
+        Never raises: counting must never break aggregation, stamping, or
+        anchoring. Any read failure is an unknown count (None, summed as
+        0 — errs low), warned once until a read succeeds again.
+        """
+        try:
+            if self.fd is None:
+                try:
+                    self.fd = os.open(self.path, os.O_RDONLY)
+                except FileNotFoundError:
+                    return None
+            data = os.pread(self.fd, self.RECORD_SIZE, idx * self.RECORD_SIZE)
+        except OSError as exp:
+            # Drop the fd so a repaired file is picked up by reopening.
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+            if not self.io_failed:
+                logging.warning("Cannot read record-count sidecar %s: %r; "
+                                "counts unknown (summed as 0) until it reads again"
+                                % (self.path, exp))
+                self.io_failed = True
+            return None
+
+        if self.io_failed:
+            self.io_failed = False
+            logging.info("Record-count sidecar %s is readable again" % self.path)
+
+        if len(data) != self.RECORD_SIZE:
+            return None
+
+        count = struct.unpack('>L', data)[0]
+        return count if count else None
+
+
+class RecordCountsWriter(RecordCounts):
+    """Writer for the record-count sidecar"""
+    def __init__(self, path):
+        self.path = path
+        self.fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+
+    def put(self, idx, count):
+        """Record the count for journal entry idx; entries are write-once
+
+        A torn write over the sparse file's zeros leaves a big-endian
+        prefix with a zero tail, which is always <= the true value: even a
+        crash mid-write can only undercount.
+        """
+        os.pwrite(self.fd, struct.pack('>L', count), idx * self.RECORD_SIZE)
+        os.fsync(self.fd)
 
 class LevelDbCalendar:
     def __init__(self, path):
@@ -230,7 +328,7 @@ class Calendar:
             logging.error('HMAC secret key not set; %r does not exist' % hmac_key_path)
             sys.exit(1)
 
-    def submit(self, submitted_commitment):
+    def submit(self, submitted_commitment, records=None):
         idx = int(time.time())
 
         serialized_idx = struct.pack('>L', idx)
@@ -242,7 +340,7 @@ class Calendar:
         macced_commitment = commitment.ops.add(OpAppend(mac))
 
         macced_commitment.attestations.add(PendingAttestation(self.uri))
-        self.journal.submit(macced_commitment.msg)
+        self.journal.submit(macced_commitment.msg, records=records)
 
     def __contains__(self, commitment):
         return commitment in self.db
@@ -277,17 +375,31 @@ class Aggregator:
 
             logging.info("Aggregated %d digests under commitment %s" % (len(digests), b2x(digests_commitment.msg)))
 
-            self.calendar.submit(digests_commitment)
+            self.calendar.submit(digests_commitment, records=len(digests))
 
             # Notify all requesters that the commitment is done
             for done_event in done_events:
                 done_event.set()
 
-    def __init__(self, calendar, exit_event, commitment_interval=1):
+    def __init__(self, calendar, exit_event, commitment_interval=1,
+                 dedupe_horizon=3600, dedupe_max_entries=65536):
         self.calendar = calendar
         self.commitment_interval = commitment_interval
         self.digest_queue = queue.Queue()
         self.exit_event = exit_event
+
+        # Idempotency horizon: raw submitted msg -> (expires_at, timestamp,
+        # done_event) for every submission still inside dedupe_horizon
+        # seconds, capped at dedupe_max_entries (oldest evicted first).
+        # Insertion order is expiry order — a duplicate hit re-inserts at the
+        # back with a fresh expiry — so purging from the front is sufficient.
+        # In-memory by design: a restart empties it, making resubmission
+        # across a restart boundary the one bounded duplicate-count path.
+        self.dedupe_horizon = dedupe_horizon
+        self.dedupe_max_entries = dedupe_max_entries
+        self._recent = {}
+        self._recent_lock = threading.Lock()
+
         self.thread = threading.Thread(target=self.__loop)
         self.thread.start()
 
@@ -296,15 +408,41 @@ class Aggregator:
 
         Aggregator thread will aggregate the message along with all other
         messages, and return a Timestamp
-        """
-        timestamp = Timestamp(msg)
 
-        # Add nonce to ensure requester doesn't learn anything about other
-        # messages being committed at the same time, as well as to ensure that
-        # anything we store related to this commitment can't be controlled by
-        # them.
-        done_event = threading.Event()
-        self.digest_queue.put((nonce_timestamp(timestamp), done_event))
+        A msg identical to one submitted within the last dedupe_horizon
+        seconds does not become a second pending commitment: the caller is
+        attached to the earlier submission's timestamp — same receipt path,
+        counted as a record once. The dedupe keys on msg exactly as
+        submitted, before the nonce below is applied.
+        """
+        now = time.time()
+
+        with self._recent_lock:
+            while self._recent:
+                oldest = next(iter(self._recent))
+                if self._recent[oldest][0] > now:
+                    break
+                del self._recent[oldest]
+
+            entry = self._recent.pop(msg, None)
+            if entry is not None:
+                (_, timestamp, done_event) = entry
+                # Refresh at the back so recurring resubmissions (e.g. a
+                # client's periodic retry sweep) stay deduped beyond the
+                # first pass.
+                self._recent[msg] = (now + self.dedupe_horizon, timestamp, done_event)
+            else:
+                timestamp = Timestamp(msg)
+                done_event = threading.Event()
+                self._recent[msg] = (now + self.dedupe_horizon, timestamp, done_event)
+                if len(self._recent) > self.dedupe_max_entries:
+                    del self._recent[next(iter(self._recent))]
+
+                # Add nonce to ensure requester doesn't learn anything about other
+                # messages being committed at the same time, as well as to ensure that
+                # anything we store related to this commitment can't be controlled by
+                # them.
+                self.digest_queue.put((nonce_timestamp(timestamp), done_event))
 
         done_event.wait()
 

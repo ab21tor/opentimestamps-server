@@ -22,6 +22,8 @@ class Test_LevelDbCalendar(unittest.TestCase):
     def test_creation(self):
         with tempfile.TemporaryDirectory() as db_path:
             cal = LevelDbCalendar(db_path)
+            # A fresh calendar contains nothing.
+            self.assertNotIn(b'foo', cal)
 
     def test_contains(self):
         with tempfile.TemporaryDirectory() as db_path:

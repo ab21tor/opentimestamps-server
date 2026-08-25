@@ -21,9 +21,8 @@ import bitcoin.rpc
 _BITCOIN_RPC_SERVICE_URL = os.getenv("BITCOIN_RPC_SERVICE_URL")
 
 def make_proxy(timeout=120):
-    # Explicit RPC timeout: the 2026-07-03 audit found recurring
-    # RemoteDisconnected noise in the calendar's logs from RPC calls
-    # outliving bitcoinlib's default HTTP timeout.
+    # Explicit RPC timeout: RPC calls that outlive bitcoinlib's default HTTP
+    # timeout surface as RemoteDisconnected noise in the calendar's logs.
     if _BITCOIN_RPC_SERVICE_URL:
         return bitcoin.rpc.Proxy(service_url=_BITCOIN_RPC_SERVICE_URL, timeout=timeout)
     return bitcoin.rpc.Proxy(timeout=timeout)
@@ -36,14 +35,16 @@ from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
 from opentimestamps.core.op import OpPrepend, OpSHA256
 from opentimestamps.core.timestamp import Timestamp, make_merkle_tree
 
-from otsserver.calendar import Journal
+from otsserver.calendar import Journal, RecordCounts
 
 # https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp
 DUST = 330
 
 KnownBlock = collections.namedtuple('KnownBlock', ['height', 'hash'])
-TimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'commitment_timestamps', 'fee', 'height'])
-UnconfirmedTimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'n', 'fee'])
+# records: digest submissions summed over this tx's tree at its close; 0
+# when anchor receipts are off or the counts are unknown (never overcount).
+TimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'commitment_timestamps', 'fee', 'height', 'records'], defaults=[0])
+UnconfirmedTimestampTx = collections.namedtuple('TimestampTx', ['tx', 'tip_timestamp', 'n', 'fee', 'records'], defaults=[0])
 
 
 def make_btc_block_merkle_tree(blk_txids):
@@ -260,6 +261,11 @@ def find_unspent(proxy):
 class Stamper:
     """Timestamping bot"""
 
+    # Empty-wallet warn-once flag. Class-level default (the RecordCounts
+    # io_failed pattern) so test doubles built via __new__ share it; the
+    # first trip shadows it with an instance attribute.
+    wallet_empty_warned = False
+
     @staticmethod
     def __create_new_timestamp_tx_template(outpoint, txout_value, change_scriptPubKey):
         """Create a new timestamp transaction template
@@ -284,10 +290,9 @@ class Stamper:
         # is available, so weight = stripped*3 + total reproduces upstream's
         # calc_weight() exactly — including for non-segwit txs, where
         # stripped == total and the formula reduces to total*4.
-        # The prior workaround here (8145dc6) billed delta_fee on
-        # len(old_tx.serialize()) — total size including witness — which
-        # overpaid 52.9% over true vsize on our 1-input P2WPKH shape
-        # (234 bytes billed vs 153 vbytes).
+        # Billing delta_fee on len(old_tx.serialize()) instead — total size
+        # including witness — overpays 52.9% on the 1-input P2WPKH shape
+        # (234 bytes vs 153 vbytes).
         old_tx_stripped_size = len(old_tx.serialize(dict(include_witness=False)))
         old_tx_weight = old_tx_stripped_size * 3 + len(old_tx.serialize())
         delta_fee = int((old_tx_weight + 3) / 4 * relay_feerate)
@@ -320,16 +325,45 @@ class Stamper:
                                         'fee_sats': confirmed_tx.fee,
                                         'commitments': len(confirmed_tx.commitment_timestamps),
                                         'confirmed_height': confirmed_tx.height,
-                                        'confirmed_at': int(time.time())})
+                                        'confirmed_at': int(time.time()),
+                                        'records': confirmed_tx.records})
             except Exception as exp:
-                # Anchoring is the job, the receipt is the diary: a failed
-                # write must never break the stamp loop.
+                # A failed receipt write must never break the stamp loop.
                 logging.warning("Failed to write anchor receipt for tx %s: %r" % (txid, exp))
 
         self.calendar.add_commitment_timestamps(confirmed_tx.commitment_timestamps)
         logging.info("tx %s fully confirmed, %d timestamps added to calendar" %
                      (b2lx(confirmed_tx.tx.GetTxid()),
                       len(confirmed_tx.commitment_timestamps)))
+
+    def __write_journal_checkpoint(self):
+        """Persist journal.known-good after a confirmed anchor
+
+        The checkpoint is the lowest journal index whose commitment is not
+        yet anchored — outstanding = pending commitments plus mined-but-not-
+        yet-deep trees, exactly what commitment_idxs holds; with nothing
+        outstanding it is the scan cursor itself. Everything below it is in
+        the calendar, so a restart's scan begins there instead of at index
+        zero. Atomic via rename: a torn write can never truncate an
+        existing checkpoint. The checkpoint is a convenience: any failure
+        warns and must never break the stamp loop.
+        """
+        try:
+            if self.commitment_idxs:
+                idx = min(self.commitment_idxs.values())
+            else:
+                idx = self.journal_cursor
+            if idx is None:
+                return
+            path = self.calendar.path + '/journal.known-good'
+            tmp = path + '.tmp'
+            with open(tmp, 'w') as fd:
+                fd.write('%d\n' % idx)
+                fd.flush()
+                os.fsync(fd.fileno())
+            os.replace(tmp, path)
+        except Exception as exp:
+            logging.warning("Failed to write journal checkpoint: %r" % exp)
 
     def __pending_to_merkle_tree(self, n):
             # Update the most recent timestamp transaction with new commitments
@@ -347,6 +381,28 @@ class Stamper:
             logging.debug("Done making merkle tree")
 
             return tip_timestamp, commitment_timestamps
+
+    def __count_tree_records(self, commitment_timestamps):
+        """Sum the per-commitment record counts for one closed tree
+
+        This number becomes a bill: a record that can't be proven counted
+        must not be charged, so a missing count sums as 0 — undercount plus
+        one warning per tree is the acceptable failure direction.
+        """
+        records = 0
+        missing = 0
+        for commitment_timestamp in commitment_timestamps:
+            count = self.commitment_records.get(commitment_timestamp.msg)
+            if count is None:
+                missing += 1
+            else:
+                records += count
+
+        if missing:
+            logging.warning("anchor records: %d of %d commitments in tree have no record count; "
+                            "receipt will undercount" % (missing, len(commitment_timestamps)))
+
+        return records
 
     def __do_bitcoin(self):
         """Do Bitcoin-related maintenance"""
@@ -372,6 +428,13 @@ class Stamper:
             confirmed_tx = self.txs_waiting_for_confirmation.pop(block_height - self.min_confirmations + 1, None)
             if confirmed_tx is not None:
                 self.__save_confirmed_timestamp_tx(confirmed_tx)
+                # The anchor is final: these commitments' record counts can
+                # never be summed into another tree, and their journal
+                # entries are behind the checkpoint from here on.
+                for commitment_timestamp in confirmed_tx.commitment_timestamps:
+                    self.commitment_records.pop(commitment_timestamp.msg, None)
+                    self.commitment_idxs.pop(commitment_timestamp.msg, None)
+                self.__write_journal_checkpoint()
 
             # If there already are txs waiting for confirmation at this
             # block_height, there was a reorg and those pending commitments now
@@ -424,7 +487,7 @@ class Stamper:
                 # Success!
                 (tip_timestamp, commitment_timestamps) = self.__pending_to_merkle_tree(confirmed_tx.n)
                 mined_tx = TimestampTx(confirmed_tx.tx, tip_timestamp, commitment_timestamps,
-                                       confirmed_tx.fee, block_height)
+                                       confirmed_tx.fee, block_height, confirmed_tx.records)
                 assert tip_timestamp.msg == unconfirmed_tx.tip_timestamp.msg
 
                 mined_tx.tip_timestamp.merge(block_timestamp)
@@ -464,13 +527,12 @@ class Stamper:
 
         if not self.pending_commitments:
             logging.debug("No pending commitments, no tx needed")
-            # An expired departure clock must not lie in wait over an empty
-            # queue: the first commitment after an idle stretch would trigger
-            # a broadcast within seconds, timestamping its own arrival on the
-            # public chain. Broadcast times must be a property of the box's
-            # own schedule, independent of submission times, so roll the
-            # clock forward by the same law as a post-confirmation
-            # reschedule. (2026-07-30)
+            # An expired departure clock over an empty queue would let the
+            # first commitment after an idle stretch trigger a broadcast
+            # within seconds, timestamping its own arrival on the public
+            # chain. Broadcast times must depend only on the box's own
+            # schedule, never on submission times, so roll the clock forward
+            # exactly as a post-confirmation reschedule does.
             if not self.unconfirmed_txs:
                 self.next_timestamp_tx = time.time() + (self.min_tx_interval * random.uniform(1, 2))
             return
@@ -487,8 +549,15 @@ class Stamper:
             unspent = find_unspent(proxy)
 
             if not len(unspent):
-                logging.error("Can't timestamp; no spendable outputs")
+                # Warn once, not once per loop second: a drained wallet is
+                # one incident, not a stream of them.
+                if not self.wallet_empty_warned:
+                    logging.error("Can't timestamp; no spendable outputs")
+                    self.wallet_empty_warned = True
                 return
+            if self.wallet_empty_warned:
+                self.wallet_empty_warned = False
+                logging.info("Spendable outputs available again; anchoring resumes")
 
             change_addr = proxy._call("getnewaddress", "", "bech32")
             change_addr_info = proxy._call("getaddressinfo", change_addr)
@@ -519,6 +588,9 @@ class Stamper:
             bump_feerate = initial_feerate
 
         (tip_timestamp, commitment_timestamps) = self.__pending_to_merkle_tree(len(self.pending_commitments))
+        # The record count is fixed here, when the tree closes over the
+        # pending commitments; it rides beside fee to the receipt.
+        records = self.__count_tree_records(commitment_timestamps) if self.anchor_receipts_path else 0
         logging.debug("New tip is %s" % b2x(tip_timestamp.msg))
         # make_merkle_tree() seems to take long enough on really big adds
         # that the proxy dies
@@ -571,12 +643,15 @@ class Stamper:
             logging.info("Sent timestamp tx %s; %d total commitments" % (b2lx(sent_tx.GetTxid()),
                                                                          len(commitment_timestamps)))
 
-        self.unconfirmed_txs.append(UnconfirmedTimestampTx(sent_tx, tip_timestamp, len(commitment_timestamps), fee))
+        self.unconfirmed_txs.append(UnconfirmedTimestampTx(sent_tx, tip_timestamp, len(commitment_timestamps), fee,
+                                                           records))
 
     def __loop(self):
         logging.info("Starting stamper loop")
 
         journal = Journal(self.calendar.path + '/journal')
+        record_counts = RecordCounts(self.calendar.path + '/journal.counts') \
+            if self.anchor_receipts_path else None
 
         try:
             with open(self.calendar.path + '/journal.known-good', 'r') as known_good_fd:
@@ -584,25 +659,51 @@ class Stamper:
         except FileNotFoundError as exp:
             idx = 0
 
+        read_failed = False
+
         while not self.exit_event.is_set():
-            # Get all pending commitments
-            while len(self.pending_commitments) < self.max_pending:
-                try:
-                    commitment = journal[idx]
-                except KeyError:
-                    break
+            # Get all pending commitments. The reads here (journal,
+            # calendar membership) sit outside the __do_bitcoin guard and
+            # must never kill the thread: a failed read adds nothing this
+            # round — errs low — anchoring of what is already pending
+            # continues below, and the fill retries next second, warned
+            # once until a read succeeds again.
+            try:
+                while len(self.pending_commitments) < self.max_pending:
+                    try:
+                        commitment = journal[idx]
+                    except KeyError:
+                        break
 
-                # Is this commitment already stamped?
-                if commitment not in self.calendar:
-                    self.pending_commitments.add(commitment)
-                    if idx % 1000 == 0:
-                        logging.debug('Added %s (idx %d) to pending commitments; %d total'
-                                      % (b2x(commitment), idx, len(self.pending_commitments)))
-                else:
-                    if idx % 10000 == 0:
-                        logging.debug('Commitment at idx %d already stamped' % idx)
+                    # Is this commitment already stamped?
+                    if commitment not in self.calendar:
+                        self.pending_commitments.add(commitment)
+                        # setdefault: a resubmitted commitment keeps its
+                        # LOWEST index, so the checkpoint can never advance
+                        # past an unanchored journal entry.
+                        self.commitment_idxs.setdefault(commitment, idx)
+                        if record_counts is not None:
+                            count = record_counts.get(idx)
+                            if count is not None:
+                                self.commitment_records[commitment] = count
+                        if idx % 1000 == 0:
+                            logging.debug('Added %s (idx %d) to pending commitments; %d total'
+                                          % (b2x(commitment), idx, len(self.pending_commitments)))
+                    else:
+                        if idx % 10000 == 0:
+                            logging.debug('Commitment at idx %d already stamped' % idx)
 
-                idx += 1
+                    idx += 1
+            except Exception as exp:
+                if not read_failed:
+                    logging.warning("Pending-commitment read failed: %r; "
+                                    "stamping continues with %d pending; retrying every second"
+                                    % (exp, len(self.pending_commitments)))
+                    read_failed = True
+            else:
+                if read_failed:
+                    read_failed = False
+                    logging.info("Pending-commitment reads succeeding again")
 
             self.journal_cursor = idx
 
@@ -685,9 +786,20 @@ class Stamper:
         self.pending_commitments = OrderedSet()
         self.txs_waiting_for_confirmation = {}
 
+        # Per-commitment record counts read from the journal.counts sidecar,
+        # keyed by commitment msg; populated only when anchor receipts are
+        # on, released once the commitment's anchor is final.
+        self.commitment_records = {}
+
+        # Journal index per outstanding commitment (pending, or riding a
+        # mined-but-not-yet-deep tree), released with commitment_records
+        # once its anchor is final. min() over this is the journal
+        # checkpoint: everything below it is anchored.
+        self.commitment_idxs = {}
+
         # Arm the departure clock free-running from the first moment: an
         # expired clock at startup would let the first commitment after a
-        # restart fire a broadcast within seconds. (2026-07-30)
+        # restart fire a broadcast within seconds.
         self.next_timestamp_tx = time.time() + (self.min_tx_interval * random.uniform(1, 2))
         self.journal_cursor = None
 

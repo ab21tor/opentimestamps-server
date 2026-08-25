@@ -202,7 +202,7 @@ class Test_anchor_receipts(unittest.TestCase):
         receipt = json.loads(self.read_lines()[0])
         self.assertEqual(set(receipt.keys()),
                          {'txid', 'fee_sats', 'commitments',
-                          'confirmed_height', 'confirmed_at'})
+                          'confirmed_height', 'confirmed_at', 'records'})
 
         self.assertIsInstance(receipt['txid'], str)
         self.assertEqual(len(receipt['txid']), 64)

@@ -146,7 +146,7 @@ class Test_departure_clock(unittest.TestCase):
             do_bitcoin(stamper)
             after = time.time()
 
-        # The post-confirmation reschedule law is exactly as before ...
+        # The post-confirmation reschedule is exactly as before ...
         self.assertGreaterEqual(stamper.next_timestamp_tx, before + INTERVAL)
         self.assertLessEqual(stamper.next_timestamp_tx, after + 2 * INTERVAL)
         # ... and so is the confirmation bookkeeping.

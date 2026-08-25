@@ -1,6 +1,10 @@
 Merkle Mountain Ranges
 ----------------------
 
+> **Historical (upstream design doc).** This describes an upstream design;
+> the running fork aggregates per-second merkle trees and does not use an
+> MMR. Kept for background only.
+
 As digests are accumulated we hash them into trees, building up the largest
 perfect binary trees possible as we go. At least one tree will always exist,
 with 2^k digests at the base, and 2^(k+1)-1 total elements. If the total number
