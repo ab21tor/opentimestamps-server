@@ -1,0 +1,13 @@
+# The notary notarising itself: one manifest per UTC day, hash-chained to
+# the previous one, stamped through the calendar's operator lane
+# (POST /operator/digest, never a record, never a bill), proofs upgraded
+# when the anchor real traffic paid for confirms. Paths assume the fork
+# clone at ~/opentimestamps-server and state at ~/selfstamp; edit if not.
+[Unit]
+Description=selfstamp: manifest of the box's own books, stamped via the operator lane
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/opentimestamps-server/ops/selfstamp.py run --config %h/selfstamp/config.json
+StandardOutput=append:%h/selfstamp/selfstamp.log
+StandardError=append:%h/selfstamp/selfstamp.log

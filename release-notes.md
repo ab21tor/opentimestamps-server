@@ -1,8 +1,9 @@
 # OpenTimestamps Server Release Notes
 
 > **Fork note.** This tree is a fork (`0.7.1+fork`) carrying anchor
-> receipts, record counts, aggregator dedupe, and stamper hardening on top
-> of upstream v0.7.1. The notes below are upstream's and end there; fork
+> receipts, record counts, aggregator dedupe, stamper hardening, and the
+> operator lane with the `ops/selfstamp.py` diary tool on top of upstream
+> v0.7.1. The notes below are upstream's and end there; fork
 > changes are documented in README.md and the timestamp-gateway operator
 > guide.
 

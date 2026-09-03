@@ -96,7 +96,9 @@ class JournalWriter(Journal):
         Returns only after the commitment is synchronized to disk.
 
         records is the number of digest submissions aggregated under this
-        commitment (its merkle tree's leaf count); None means unknown.
+        commitment (its merkle tree's leaf count); None means unknown; 0
+        means known to hold no billable record (an operator-lane-only tree,
+        see Aggregator.submit) and is stored as the KNOWN_ZERO sentinel.
         """
         # Pad with null HMAC if necessary
         if len(commitment) == self.COMMITMENT_SIZE - HMAC_SIZE:
@@ -111,9 +113,9 @@ class JournalWriter(Journal):
         self.append_fd.flush()
         os.fsync(self.append_fd.fileno())
 
-        if self.record_counts is not None and records:
+        if self.record_counts is not None and records is not None:
             try:
-                self.record_counts.put(idx, records)
+                self.record_counts.put(idx, records or RecordCounts.KNOWN_ZERO)
             except Exception as exp:
                 # The commitment is already durable; a lost count only
                 # undercounts the eventual receipt, the acceptable failure
@@ -130,9 +132,20 @@ class RecordCounts:
     before OTSD_ANCHOR_RECEIPTS was set, or counts lost to a crash — read
     as zero, and a real tree always has at least one leaf, so zero means
     "unknown" and is returned as None. Callers sum None as 0: receipts may
-    only ever undercount.
+    only ever undercount. A known zero — a tree whose leaves were all
+    operator-lane submissions — is stored as KNOWN_ZERO and returned as 0,
+    which is a fact, not a hole.
     """
     RECORD_SIZE = 4
+
+    # Zero in the file already means unknown, so known zero is stored as
+    # all-ones. Any value >= KNOWN_ZERO_THRESHOLD reads as 0: a one-second
+    # tree cannot have 2**31 leaves, and every torn big-endian prefix of the
+    # sentinel (0xFF000000, 0xFFFF0000, 0xFFFFFF00) stays above the
+    # threshold, so a torn write still cannot overcount; the all-zero
+    # prefix reads as unknown, summed as 0.
+    KNOWN_ZERO = 0xFFFFFFFF
+    KNOWN_ZERO_THRESHOLD = 0x80000000
 
     # True once a read failure has been warned about; class-level default
     # so the writer subclass, which does not call this __init__, shares it.
@@ -179,6 +192,8 @@ class RecordCounts:
             return None
 
         count = struct.unpack('>L', data)[0]
+        if count >= self.KNOWN_ZERO_THRESHOLD:
+            return 0
         return count if count else None
 
 
@@ -360,13 +375,16 @@ class Aggregator:
         while not self.exit_event.wait(self.commitment_interval):
             digests = []
             done_events = []
+            records = 0
             last_commitment = time.time()
             while not self.digest_queue.empty():
                 # This should never raise the Empty exception, as we should be
                 # the only thread taking items off the queue
-                (digest, done_event) = self.digest_queue.get_nowait()
+                (digest, done_event, counted) = self.digest_queue.get_nowait()
                 digests.append(digest)
                 done_events.append(done_event)
+                if counted:
+                    records += 1
 
             if not len(digests):
                 continue
@@ -375,7 +393,10 @@ class Aggregator:
 
             logging.info("Aggregated %d digests under commitment %s" % (len(digests), b2x(digests_commitment.msg)))
 
-            self.calendar.submit(digests_commitment, records=len(digests))
+            # Operator-lane leaves ride the tree and its anchor but are not
+            # records: they never reach a receipt or a bill. A tree of only
+            # operator leaves is a known zero, not an unknown count.
+            self.calendar.submit(digests_commitment, records=records)
 
             # Notify all requesters that the commitment is done
             for done_event in done_events:
@@ -403,11 +424,16 @@ class Aggregator:
         self.thread = threading.Thread(target=self.__loop)
         self.thread.start()
 
-    def submit(self, msg):
+    def submit(self, msg, counted=True):
         """Submit message for aggregation
 
         Aggregator thread will aggregate the message along with all other
         messages, and return a Timestamp
+
+        counted=False is the operator lane (rpc.py POST /operator/digest):
+        the msg is aggregated and timestamped like any other leaf but is
+        not a record, so it never reaches a receipt or a bill. The first
+        submission of a msg decides; a dedupe hit never changes the count.
 
         A msg identical to one submitted within the last dedupe_horizon
         seconds does not become a second pending commitment: the caller is
@@ -442,7 +468,7 @@ class Aggregator:
                 # messages being committed at the same time, as well as to ensure that
                 # anything we store related to this commitment can't be controlled by
                 # them.
-                self.digest_queue.put((nonce_timestamp(timestamp), done_event))
+                self.digest_queue.put((nonce_timestamp(timestamp), done_event, counted))
 
         done_event.wait()
 

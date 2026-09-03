@@ -1,0 +1,14 @@
+{
+  "state_dir": "~/selfstamp",
+  "calendar_url": "http://127.0.0.1:14788",
+  "host": null,
+  "books": {
+    "receipts": "~/gateway/receipts/anchor-receipts.jsonl",
+    "payer_log": "~/auto-anchor/logs/payer.log",
+    "payer_state": "~/auto-anchor/pay-anchor-bills.state",
+    "compose": "~/gateway/docker-compose.yml",
+    "env": "~/gateway/.env"
+  },
+  "journal": true,
+  "fork_head": "~/opentimestamps-server"
+}

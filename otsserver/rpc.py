@@ -12,6 +12,7 @@
 import binascii
 import http.server
 import logging
+import os
 import qrcode
 import socketserver
 import time
@@ -34,6 +35,15 @@ from otsserver.calendar import Journal
 renderer = pystache.Renderer()
 
 
+def operator_lane_enabled():
+    """True when OTSD_OPERATOR_LANE=1: POST /operator/digest is served
+
+    Unset (the default) the path is an ordinary 404 and the server behaves
+    exactly as before. See the "Operator lane" section of the README.
+    """
+    return os.getenv('OTSD_OPERATOR_LANE') == '1'
+
+
 def get_qr(data):
     img = qrcode.make(data)
     buf = BytesIO()
@@ -47,7 +57,8 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
 
     digest_queue = None
 
-    def post_digest(self):
+    def post_digest(self, counted=True):
+        """Aggregate one digest; counted=False is the operator lane (do_POST)"""
         content_length = self.headers['Content-Length']
 
         # Might be missing or otherwise invalid
@@ -76,7 +87,7 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
 
         digest = self.rfile.read(content_length)
 
-        timestamp = self.aggregator.submit(digest)
+        timestamp = self.aggregator.submit(digest, counted=counted)
 
         ctx = BytesSerializationContext()
         timestamp.serialize(ctx)
@@ -197,6 +208,13 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == '/digest':
             self.post_digest()
+
+        elif self.path == '/operator/digest' and operator_lane_enabled():
+            # Operator lane: the box's own diary (ops/selfstamp.py) rides
+            # the same per-second trees and anchors as client digests, but
+            # its leaves are not records — they never reach a receipt or a
+            # bill. Off unless OTSD_OPERATOR_LANE=1, when this is the 404.
+            self.post_digest(counted=False)
 
         else:
             self.send_response(404)

@@ -1,0 +1,14 @@
+# Daily heartbeat for ops/selfstamp.py — a user unit (systemctl --user).
+# 00:30 UTC: the period covered is the previous UTC day, so the journal
+# digest is taken over a finished day. Persistent=true fires a missed run
+# at the next boot; the tool itself is idempotent per period.
+[Unit]
+Description=selfstamp: daily manifest of the box's own books (00:30 UTC)
+
+[Timer]
+OnCalendar=*-*-* 00:30:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

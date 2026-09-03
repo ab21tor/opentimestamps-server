@@ -113,7 +113,7 @@ class Test_record_counts_sidecar(unittest.TestCase):
                        Timestamp(hashlib.sha256(b'dup').digest()),
                        Timestamp(hashlib.sha256(b'other').digest())]
             for digest, event in zip(digests, events):
-                aggregator.digest_queue.put((digest, event))
+                aggregator.digest_queue.put((digest, event, True))
             for event in events:
                 self.assertTrue(event.wait(5))
         finally:
