@@ -74,7 +74,7 @@ def drive_homepage(handler_cls):
     return head, body
 
 
-def make_handler_cls():
+def make_handler_cls(anchor_receipts_path=None):
     class TestHandler(otsserver.rpc.RPCRequestHandler):
         pass
 
@@ -83,6 +83,7 @@ def make_handler_cls():
             pending_commitments=set(),
             txs_waiting_for_confirmation={},
             unconfirmed_txs=[],
+            anchor_receipts_path=anchor_receipts_path,
         )
     )
     TestHandler.lightning_invoice_file = None
@@ -122,6 +123,17 @@ class Test_homepage_bitcoin_wiring(unittest.TestCase):
                 for line in captured.output),
             captured.output,
         )
+
+    def test_homepage_states_whether_anchors_are_receipted(self):
+        """The gateway's /health reads this line: a calendar restarted with
+        receipts off must say "off" where it used to say nothing."""
+        with mock.patch.object(otsserver.rpc, "make_proxy",
+                               lambda timeout=None: FakeProxy()):
+            _, off_body = drive_homepage(make_handler_cls(None))
+            _, on_body = drive_homepage(make_handler_cls("/receipts/anchor-receipts.jsonl"))
+        self.assertIn(b"Anchor receipts: off", off_body)
+        self.assertIn(b"Anchor receipts: on", on_body)
+        self.assertNotIn(b"Anchor receipts: on", off_body)
 
     def test_homepage_rpc_timeout_is_thirty_seconds(self):
         """The homepage per-op RPC timeout is a hung-transport detector, not a

@@ -390,6 +390,57 @@ class Test_stamper_records(unittest.TestCase):
         # The first close's count is untouched by the re-close.
         self.assertEqual(stamper.unconfirmed_txs[-2].records, 5)
 
+    def test_close_reread_recovers_a_count_the_scan_missed(self):
+        # The scan reads a count once, the second its journal entry
+        # appears, which can be the instant before the aggregator's sidecar
+        # write lands. The tree close must read such a count again; a
+        # count still absent then is a real hole and sums as 0, warned.
+        stamper = make_stamper(self.receipts_path)
+        counts_path = os.path.join(self.tmpdir.name, 'journal.counts')
+        with open(counts_path, 'wb') as fd:
+            fd.write(pack_count(4) + pack_count(7) + pack_count(0))
+        stamper.record_counts = RecordCounts(counts_path)
+        a, b, c = [Timestamp(bytes([i]) * 44) for i in (1, 2, 3)]
+        stamper.commitment_idxs = {a.msg: 0, b.msg: 1, c.msg: 2}
+        # b's count was missed by the scan; c's is a hole on disk.
+        stamper.commitment_records = {a.msg: 4}
+
+        with self.assertLogs(level='WARNING') as captured:
+            records = stamper._Stamper__count_tree_records([a, b, c])
+
+        self.assertEqual(records, 11)
+        self.assertEqual(stamper.commitment_records[b.msg], 7)
+        warnings = [r for r in captured.records
+                    if r.levelname == 'WARNING' and 'record count' in r.getMessage()]
+        self.assertEqual(len(warnings), 1, captured.output)
+        self.assertIn('1 of 3', warnings[0].getMessage())
+
+    def test_close_reread_is_inert_without_a_reader(self):
+        # Receipts off (no reader) or no journal index: the missing count
+        # is a hole exactly as before, never an exception.
+        stamper = make_stamper(None)
+        a = Timestamp(b'\x01' * 44)
+        stamper.commitment_idxs = {a.msg: 0}
+        with self.assertLogs(level='WARNING'):
+            self.assertEqual(stamper._Stamper__count_tree_records([a]), 0)
+
+    def test_scan_warns_once_when_receipts_are_off_but_the_sidecar_exists(self):
+        # A sidecar exists only because receipts were on: a calendar
+        # restarted without OTSD_ANCHOR_RECEIPTS is anchoring for free and
+        # must say so at startup.
+        self.make_journal_files(self.tmpdir.name)
+        with self.assertLogs(level='WARNING') as captured:
+            self.run_scan(self.tmpdir.name, receipts_on=False)
+        warnings = [r for r in captured.records
+                    if 'were on before and are off now' in r.getMessage()]
+        self.assertEqual(len(warnings), 1, captured.output)
+
+    def test_scan_is_quiet_when_receipts_are_off_and_no_sidecar_exists(self):
+        with open(os.path.join(self.tmpdir.name, 'journal'), 'wb') as fd:
+            fd.write(struct.pack('>L', 0) + b'\x10' * 40)
+        with self.assertNoLogs(level='WARNING'):
+            self.run_scan(self.tmpdir.name, receipts_on=False)
+
     def make_journal_files(self, cal_path):
         """A real journal of three entries; counts for idx 0 and 2 only"""
         entries = [struct.pack('>L', i) + bytes([0x10 + i]) * 40
@@ -423,9 +474,10 @@ class Test_stamper_records(unittest.TestCase):
                                   max_fee=1000000,
                                   max_pending=100)
                 deadline = time.time() + 5
-                while (len(stamper.pending_commitments) < 3
+                while (stamper.journal_cursor is None
                        and time.time() < deadline):
                     time.sleep(0.05)
+                time.sleep(0.1)
                 exit_event.set()
                 stamper.thread.join(5)
         return stamper

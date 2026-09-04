@@ -266,6 +266,15 @@ class Stamper:
     # first trip shadows it with an instance attribute.
     wallet_empty_warned = False
 
+    # Fee-cap warn-once flag, the same pattern: one ERROR on entering the
+    # blocked state, one INFO when a transaction goes out again.
+    fee_capped_warned = False
+
+    # Reader for the journal.counts sidecar, set by the stamper loop when
+    # anchor receipts are on; None keeps every count path inert. Class-level
+    # default for the same test-double reason.
+    record_counts = None
+
     @staticmethod
     def __create_new_timestamp_tx_template(outpoint, txout_value, change_scriptPubKey):
         """Create a new timestamp transaction template
@@ -392,7 +401,19 @@ class Stamper:
         records = 0
         missing = 0
         for commitment_timestamp in commitment_timestamps:
-            count = self.commitment_records.get(commitment_timestamp.msg)
+            msg = commitment_timestamp.msg
+            count = self.commitment_records.get(msg)
+            if count is None:
+                # The scan reads each count once, the second its journal
+                # entry appears -- which can be the instant before the
+                # aggregator's sidecar write lands. By tree close the
+                # sidecar is complete, so a count the scan missed is read
+                # again here; only a count still absent is a hole.
+                idx = self.commitment_idxs.get(msg)
+                if self.record_counts is not None and idx is not None:
+                    count = self.record_counts.get(idx)
+                    if count is not None:
+                        self.commitment_records[msg] = count
             if count is None:
                 missing += 1
             else:
@@ -608,10 +629,29 @@ class Stamper:
 
             fee = _get_tx_fee(unsigned_tx, proxy)
             if fee is None:
-                logging.debug("Can't determine txfee of transaction; skipping")
+                if self.unconfirmed_txs:
+                    # The in-flight anchor's input is no longer a confirmed
+                    # unspent output: a shallow reorg took its parent, or a
+                    # version this stamper does not track (one a restart
+                    # forgot) was mined. No bump can ever be priced from
+                    # here, so the cycle is dead. Abandon it: the pending
+                    # commitments are untouched, and the next pass starts a
+                    # fresh cycle from what the wallet actually holds.
+                    logging.warning("Anchor cycle abandoned: the input of in-flight tx %s is no longer "
+                                    "confirmed (a reorg, or an untracked version was mined); "
+                                    "%d commitments stay pending; starting a fresh cycle"
+                                    % (b2lx(prev_tx.GetTxid()), len(self.pending_commitments)))
+                    self.unconfirmed_txs.clear()
+                else:
+                    logging.debug("Can't determine txfee of transaction; skipping")
                 return
             if fee > self.max_fee:
-                logging.error("Maximum txfee reached!")
+                # Warn once, not once per loop second: a blocked cap is one
+                # incident, cleared when a transaction goes out again.
+                if not self.fee_capped_warned:
+                    logging.error("Maximum txfee reached! fee %d > cap %d; anchoring waits for a lower feerate"
+                                  % (fee, self.max_fee))
+                    self.fee_capped_warned = True
                 return
 
             r = proxy.signrawtransactionwithwallet(unsigned_tx)
@@ -635,6 +675,10 @@ class Stamper:
 
             sent_tx = signed_tx
 
+        if self.fee_capped_warned:
+            self.fee_capped_warned = False
+            logging.info("Fee back under the cap; anchoring resumes")
+
         if self.unconfirmed_txs:
             logging.info("Sent timestamp tx %s, replacing %s; %d total commitments; %d prior tx versions" %
                          (b2lx(sent_tx.GetTxid()), b2lx(prev_tx.GetTxid()), len(commitment_timestamps),
@@ -652,6 +696,16 @@ class Stamper:
         journal = Journal(self.calendar.path + '/journal')
         record_counts = RecordCounts(self.calendar.path + '/journal.counts') \
             if self.anchor_receipts_path else None
+        # Shared with the tree close, which re-reads counts the scan missed.
+        self.record_counts = record_counts
+
+        if record_counts is None and os.path.exists(self.calendar.path + '/journal.counts'):
+            # The sidecar only ever exists because receipts were on: this
+            # calendar was receipting its anchors and is now anchoring for
+            # free, with nothing downstream to show it. Say so once, loudly.
+            logging.warning("OTSD_ANCHOR_RECEIPTS is unset but %s/journal.counts exists: anchor receipts "
+                            "were on before and are off now; anchors will not be receipted or billed"
+                            % self.calendar.path)
 
         try:
             with open(self.calendar.path + '/journal.known-good', 'r') as known_good_fd:

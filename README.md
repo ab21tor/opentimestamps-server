@@ -130,8 +130,11 @@ interface parsed by other software — treat it as pinned:
   already counted, records the same digest twice. Otherwise miscounts
   only ever err low: a commitment whose count is unknown (recorded
   before this feature was enabled, or lost to a crash) sums as 0, with
-  one warning logged per affected tree. `0` therefore means "unknown",
-  not "empty" — a real tree always has at least one leaf.
+  one warning logged per affected tree. A count the stamper's scan read
+  before the aggregator had written it is read again when the anchor
+  tree closes, so a busy second is never lost to that race; only a count
+  still absent then is a hole. `0` therefore means "unknown", not
+  "empty" — a real tree always has at least one leaf.
 
 The per-tree counts behind `records` live in a sidecar next to the
 journal, `journal.counts`: one 4-byte big-endian integer per journal
@@ -149,10 +152,13 @@ Two guarantees:
 
 - A receipt write failure never breaks anchoring. The stamper logs one
   warning and continues; the calendar save always happens.
-- A crash at the wrong moment may produce a duplicate or extra line,
-  never a silently missing one. The receipt is written before the
-  calendar save: a missed receipt is silently lost revenue, while the
-  gateway dedupes by txid, so the trade goes to the extra line.
+- A crash at the wrong moment may produce an extra receipt, never a
+  silently missing one. The receipt is written before the calendar
+  save: a missed receipt is silently lost revenue, while an extra one is
+  visible downstream, so the trade goes to the extra receipt. The extra
+  receipt is a re-anchor under a new txid (next paragraph), not a
+  repeated line, so the gateway's txid dedupe does not remove it — by
+  design.
 
 Under records × rate billing that second guarantee has a sharper
 consequence than an extra line: the commitments left unsaved by a crash
@@ -165,6 +171,13 @@ bill lets the client reconcile records billed against records submitted.
 The operator-side handling is in the timestamp-gateway operator guide,
 "Anchor billing" → "The double-bill crash edge".
 
+Turning the feature off again is loud. If `OTSD_ANCHOR_RECEIPTS` is unset
+while the sidecar already exists, the stamper warns at startup that
+receipts were on before and are off now — the calendar is anchoring for
+free — and the status page's `Anchor receipts: on|off` line says which.
+The gateway's `/health` reads that line and reports `billing:
+receipts_off` while its own billing is on.
+
 ## Anchor cadence
 
 Anchor departures happen only at the scheduled moments of a free-running
@@ -176,6 +189,16 @@ idleness waits for the next scheduled departure like any other. Anchor
 timing is therefore independent of submission timing: a broadcast time
 never reveals when a commitment arrived. There is no new configuration —
 the schedule is governed by the existing `--btc-min-tx-interval` knob.
+
+An in-flight anchor whose input stops being a confirmed unspent output —
+a shallow reorg took the parent whose change it spends, or a version this
+stamper does not track (one a restart forgot) was mined — can never be
+bumped again. The stamper notices the moment a bump cannot be priced,
+warns once, drops the dead versions, and starts a fresh cycle from the
+wallet's confirmed outputs on the next pass; the pending commitments are
+untouched and anchor once, so nothing is lost and nothing is billed
+twice. A fee cap that blocks the next transaction is likewise logged once
+on entry and once on recovery, not once per loop second.
 
 ## Restart checkpoint (journal.known-good)
 
@@ -355,14 +378,17 @@ Test modules live under `otsserver/tests/`:
   `test_rpc_digest.py`, `test_anchor_records.py`,
   `test_aggregator_dedupe.py`, `test_stamper_read_errors.py`,
   `test_stamper_checkpoint.py`, `test_stamper_wallet_empty.py`,
-  `test_operator_lane.py`, `test_selfstamp.py` — regression
-  tests for this branch's delta (launcher flags, homepage RPC wiring,
-  stamper-loop crash fixes, anchor receipts, anchor cadence, the /digest
-  Content-Length handling, anchor-receipt record counts, aggregator
-  dedupe, pending-fill read-error survival, the restart checkpoint,
-  empty-wallet warn-once, the operator lane and known-zero counts, the
-  self-stamp tool). They stub everything external with
-  `unittest.mock`: no bitcoind, no network.
+  `test_operator_lane.py`, `test_selfstamp.py`,
+  `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py` — regression
+  tests for this branch's delta (launcher flags, homepage RPC wiring and
+  the receipts status line, stamper-loop crash fixes, anchor receipts,
+  anchor cadence, the /digest Content-Length handling, anchor-receipt
+  record counts and their close-time re-read, aggregator dedupe,
+  pending-fill read-error survival, the restart checkpoint, empty-wallet
+  warn-once, the operator lane and known-zero counts, the self-stamp
+  tool, dead-cycle recovery, fee-cap warn-once, the receipts-off startup
+  warning). They stub everything external with `unittest.mock`: no
+  bitcoind, no network.
 
 No test module needs a running Bitcoin node. Every module does need the
 full dependency set installed, and one dependency — `leveldb` — is a native

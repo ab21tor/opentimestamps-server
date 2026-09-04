@@ -314,6 +314,7 @@ Most recent merkle tree tip: {{ tip }}</br>
 Best-block: <a href="{{ explorer_url }}/block/{{ best_block }}">{{ best_block }}</a>, height {{ block_height }}</br>
 </br>
 Wallet balance: {{ balance }} sats (confirmed)</br>
+Anchor receipts: {{ anchor_receipts }}</br>
 </p>
 
 <hr>
@@ -372,6 +373,10 @@ Latest mined transactions: </br>
               'best_block': bitcoin.core.b2lx(proxy.getbestblockhash()),
               'block_height': proxy.getblockcount(),
               'balance': str_sat(wallet_balance),
+              # "on"/"off": whether anchors are being receipted. The gateway's
+              # /health reads this line so a calendar restarted with receipts
+              # off cannot anchor for free unnoticed.
+              'anchor_receipts': 'on' if getattr(self.calendar.stamper, 'anchor_receipts_path', None) else 'off',
               'address': address,
               'address_qr': get_qr(address),
               'transactions': transactions[:288],
