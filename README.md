@@ -359,14 +359,16 @@ file that is not there and a gap in `seq`.
   the calendar's URI (an onion) to upgrade them, so the operator upgrades
   before handing over.
 
-**Witnessed on the first deployment.** The first two manifests
-(2026-09-02, seq 1, and 2026-09-03, seq 2) were submitted through the
-operator lane, rode the next anchor that real traffic paid for, and were
-upgraded through the box's own lane; `verify` reports both as `chain=ok
-proof=bitcoin height=965446`, and both journal entries hold the known-zero
-sentinel in the record-count sidecar. The unit tests drive the tool
-against a stdlib fake of the calendar protocol and cross-check the proof
-bytes with the opentimestamps library.
+**Measured on the first deployment.** As of 2026-09-08 the box holds six
+manifests, seq 1 to 6 (2026-09-02 to 2026-09-07), every one submitted
+through the operator lane by the daily timer with no hands; `verify`
+reports `chain=ok` across the set, five proofs `bitcoin` at heights 965446,
+965446, 965550, 965866 and 965866 (each upgraded through the box's own lane
+by the timer's upgrade pass), and the newest `pending` until the next
+anchor. The journal entries hold the known-zero sentinel in the
+record-count sidecar. The unit tests drive the tool against a stdlib fake
+of the calendar protocol and cross-check the proof bytes with the
+opentimestamps library.
 
 ## Unit tests
 
