@@ -143,7 +143,7 @@ crash can lose counts but never invent them. The sidecar exists only when
 `OTSD_ANCHOR_RECEIPTS` is set and grows at 4 bytes per journal entry —
 1/11th of the journal's own growth, sharing its append-only lifecycle.
 Nothing needs to be migrated when enabling the feature on an existing
-calendar: older entries simply have no counts. The sidecar is per-second
+calendar: older entries have no counts. The sidecar is per-second
 activity metadata: it records how many submissions each second's tree
 carried — no digests, but a traffic-volume record, sharing the calendar's
 privacy posture.
@@ -151,25 +151,25 @@ privacy posture.
 Two guarantees:
 
 - A receipt write failure never breaks anchoring. The stamper logs one
-  warning and continues; the calendar save always happens.
-- A crash at the wrong moment may produce an extra receipt, never a
-  silently missing one. The receipt is written before the calendar
-  save: a missed receipt is silently lost revenue, while an extra one is
-  visible downstream, so the trade goes to the extra receipt. The extra
-  receipt is a re-anchor under a new txid (next paragraph), not a
-  repeated line, so the gateway's txid dedupe does not remove it — by
-  design.
-
-Under records × rate billing that second guarantee has a sharper
-consequence than an extra line: the commitments left unsaved by a crash
-between the receipt write and the calendar save are re-anchored on restart
-under a new txid, producing a second receipt and a second bill for the
-same records. The ordering still goes to duplicate-over-miss — a missed
-receipt is revenue nothing downstream can surface, while a duplicate is
-visible on /anchor-bills and refundable, and the `records` field on every
-bill lets the client reconcile records billed against records submitted.
-The operator-side handling is in the timestamp-gateway operator guide,
-"Anchor billing" → "The double-bill crash edge".
+  warning and continues; the calendar save always happens, and the
+  receipt is kept in the pending marker (below) until it can be written.
+- No crash bills the same records twice, and a crash loses at most one
+  receipt, named. The receipt is written *after* the calendar save,
+  guarded by a marker: before the save the stamper writes
+  `<receipts file>.pending` — the receipt line plus one commitment of the
+  anchor's tree — atomically; after the save it appends the receipt and
+  removes the marker. A marker still present at the next start (or when
+  the next anchor confirms) is settled by asking the calendar whether it
+  holds that commitment. It does: the save completed, the receipt is
+  owed, and it is appended unless its txid is already on file
+  (`recovered from the pending marker`). It does not: the save never
+  happened, those commitments are still pending and will be re-anchored
+  under a new txid with their own receipt, so this receipt is discarded
+  (`nothing is owed for <txid>`) — writing it would have billed the same
+  records twice. An unreadable marker is set aside as
+  `<marker>.corrupt-<time>` and warned about. This replaced the earlier
+  receipt-before-save ordering, whose one operator-visible failure was
+  exactly that double bill (full review, 2026-09-08).
 
 Turning the feature off again is loud. If `OTSD_ANCHOR_RECEIPTS` is unset
 while the sidecar already exists, the stamper warns at startup that
@@ -276,7 +276,7 @@ resubmitted rather than rewritten, a pending proof is asked about once, a
 complete proof is never touched again. The trigger is the clock and only
 the clock: an anchor confirming — which appends a receipt line, including
 the anchor that carried this very diary — never causes a manifest; the
-next day's manifest simply records the new receipts hash. Missed days are
+next day's manifest records the new receipts hash. Missed days are
 not backfilled; a gap in the dates is honest downtime evidence and the
 chain still links across it.
 
@@ -376,7 +376,7 @@ Test modules live under `otsserver/tests/`:
 
 - `test_calendar.py` — inherited from upstream.
 - `test_otsd_launcher.py`, `test_rpc_homepage.py`, `test_stamper_loop.py`,
-  `test_anchor_receipts.py`, `test_stamper_cadence.py`,
+  `test_anchor_receipts.py`, `test_receipt_marker.py`, `test_aggregator_failure.py`, `test_stamper_cadence.py`,
   `test_rpc_digest.py`, `test_anchor_records.py`,
   `test_aggregator_dedupe.py`, `test_stamper_read_errors.py`,
   `test_stamper_checkpoint.py`, `test_stamper_wallet_empty.py`,
@@ -402,7 +402,7 @@ Run the suite in the deployment-matched environment — the otsd image (base
 `pip install -r requirements.txt`) — or in a Python ≤ 3.11 venv:
 
 ```
-python -m unittest discover -v                       # Ran 42 tests ... OK
+python -m unittest discover -v                       # Ran 92 tests ... OK
 ```
 
 The otsd image has no pytest; where pytest is installed,

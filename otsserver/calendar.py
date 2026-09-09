@@ -369,7 +369,20 @@ class Calendar:
         self.db.add_timestamps(new_timestamps)
 
 
+class AggregatorUnavailable(Exception):
+    """submit() could not get its digest committed: the aggregator loop has
+    stopped, or a round did not finish within submit_timeout seconds."""
+
+
 class Aggregator:
+    # Longest a submit() waits for its round to be committed. A round is one
+    # commitment_interval plus the calendar write; anything past this means
+    # the loop is wedged (a hung disk) or gone, and the caller gets
+    # AggregatorUnavailable (HTTP 503 in rpc.py) instead of waiting forever.
+    # Under the gateway's post timeout, so the client sees the 503 and
+    # retries: the dedupe horizon attaches the retry to this same leaf.
+    SUBMIT_TIMEOUT = 30
+
     def __loop(self):
         logging.info("Starting aggregator loop")
         while not self.exit_event.wait(self.commitment_interval):
@@ -389,14 +402,31 @@ class Aggregator:
             if not len(digests):
                 continue
 
-            digests_commitment = make_merkle_tree(digests)
+            try:
+                digests_commitment = make_merkle_tree(digests)
 
-            logging.info("Aggregated %d digests under commitment %s" % (len(digests), b2x(digests_commitment.msg)))
+                logging.info("Aggregated %d digests under commitment %s" % (len(digests), b2x(digests_commitment.msg)))
 
-            # Operator-lane leaves ride the tree and its anchor but are not
-            # records: they never reach a receipt or a bill. A tree of only
-            # operator leaves is a known zero, not an unknown count.
-            self.calendar.submit(digests_commitment, records=records)
+                # Operator-lane leaves ride the tree and its anchor but are not
+                # records: they never reach a receipt or a bill. A tree of only
+                # operator leaves is a known zero, not an unknown count.
+                self.calendar.submit(digests_commitment, records=records)
+            except Exception as exp:
+                # A round that did not commit (a full disk failing the
+                # journal fsync was the reproduction) must not leave the
+                # thread dead behind a live HTTP server: every later
+                # submit() would wait forever and the homepage would still
+                # say the calendar is fine. Say so, wake the waiters with a
+                # refusal, and stop the process so the supervisor restarts
+                # it. Nothing is lost that was not lost already: the round's
+                # digests were never written, and their clients get a 503.
+                logging.error("Aggregator round failed, %d digests not committed; stopping: %r"
+                              % (len(digests), exp))
+                self.failure = exp
+                self.exit_event.set()
+                for done_event in done_events:
+                    done_event.set()
+                return
 
             # Notify all requesters that the commitment is done
             for done_event in done_events:
@@ -408,6 +438,9 @@ class Aggregator:
         self.commitment_interval = commitment_interval
         self.digest_queue = queue.Queue()
         self.exit_event = exit_event
+        self.submit_timeout = self.SUBMIT_TIMEOUT
+        # Set to the exception that stopped the loop; None while it runs.
+        self.failure = None
 
         # Idempotency horizon: raw submitted msg -> (expires_at, timestamp,
         # done_event) for every submission still inside dedupe_horizon
@@ -441,6 +474,9 @@ class Aggregator:
         counted as a record once. The dedupe keys on msg exactly as
         submitted, before the nonce below is applied.
         """
+        if self.failure is not None or self.exit_event.is_set():
+            raise AggregatorUnavailable('aggregator loop has stopped')
+
         now = time.time()
 
         with self._recent_lock:
@@ -470,6 +506,9 @@ class Aggregator:
                 # them.
                 self.digest_queue.put((nonce_timestamp(timestamp), done_event, counted))
 
-        done_event.wait()
+        if not done_event.wait(self.submit_timeout):
+            raise AggregatorUnavailable('aggregator round not committed within %ds' % self.submit_timeout)
+        if self.failure is not None:
+            raise AggregatorUnavailable('aggregator loop has stopped: %r' % (self.failure,))
 
         return timestamp

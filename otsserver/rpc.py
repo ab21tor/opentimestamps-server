@@ -26,7 +26,6 @@ from io import BytesIO
 import bitcoin.core
 from bitcoin.core import b2lx, b2x, COIN
 
-from otsserver.backup import Backup
 from otsserver.stamper import make_proxy
 import otsserver
 from opentimestamps.core.serialize import BytesSerializationContext
@@ -54,6 +53,11 @@ def get_qr(data):
 class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
     MAX_DIGEST_LENGTH = 64
     """Largest digest that can be POSTed for timestamping"""
+
+    # Socket timeout for every read on a connection: a peer that opens a
+    # connection and never sends (or never finishes) its request no longer
+    # pins a handler thread until it closes (full review N15, 2026-09-08).
+    timeout = 60
 
     digest_queue = None
 
@@ -87,7 +91,19 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
 
         digest = self.rfile.read(content_length)
 
-        timestamp = self.aggregator.submit(digest, counted=counted)
+        try:
+            timestamp = self.aggregator.submit(digest, counted=counted)
+        except otsserver.calendar.AggregatorUnavailable as exp:
+            # The loop is gone or wedged (calendar.Aggregator): the digest
+            # was not committed. A 503 the client retries beats a request
+            # that never answers.
+            logging.warning("digest refused, %s" % exp)
+            self.send_response(503)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Retry-After', '5')
+            self.end_headers()
+            self.wfile.write(b'aggregator unavailable')
+            return
 
         ctx = BytesSerializationContext()
         timestamp.serialize(ctx)
@@ -119,25 +135,6 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(204)
             self.send_header('Cache-Control', 'public, max-age=10')
             self.end_headers()
-
-    def get_backup(self):
-        chunk = self.path[len('/experimental/backup/'):]
-        try:
-            chunk = int(chunk)
-            result = self.backup[chunk]
-        except:
-            self.send_response(404)
-            self.send_header('Content-Type', 'text/plain')
-            self.send_header('Cache-Control', 'public, max-age=60')
-            self.end_headers()
-            return
-
-        assert result is not None
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/octet-stream')
-        self.send_header('Cache-Control', 'public, max-age=31536000')
-        self.end_headers()
-        self.wfile.write(result)
 
     def get_timestamp(self):
         commitment = self.path[len('/timestamp/'):]
@@ -396,9 +393,9 @@ Latest mined transactions: </br>
             self.get_timestamp()
         elif self.path == '/tip':
             self.get_tip()
-        # /experimental/backup/ deliberately unregistered: it served calendar
-        # data unauthenticated. The replication tooling (otsd-backup.py,
-        # otsserver/backup.py) remains; re-register only behind auth.
+        # Upstream's /experimental/backup/ is gone from this fork (2026-09-08):
+        # it served calendar data unauthenticated, and the replication
+        # tooling behind it (otsd-backup.py, otsserver/backup.py) ran nowhere.
         else:
             self.send_response(404)
             self.send_header('Content-Type', 'text/plain')
@@ -420,9 +417,6 @@ class StampServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         rpc_request_handler.lightning_invoice_file = lightning_invoice_file
         rpc_request_handler.donation_addr = donation_addr
         rpc_request_handler.explorer_url = explorer_url
-
-        journal = Journal(calendar.path + '/journal')
-        rpc_request_handler.backup = Backup(journal, calendar, calendar.path + '/backup_cache')
 
         super().__init__(server_address, rpc_request_handler)
 

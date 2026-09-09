@@ -178,6 +178,44 @@ def _get_tx_fee(tx, proxy):
     return value_in - value_out
 
 
+def marker_path(receipts_path):
+    """The pending-receipt marker that sits beside the receipts file"""
+    return receipts_path + '.pending'
+
+
+def _write_pending_receipt(receipts_path, body):
+    """Write the pending-receipt marker atomically (tmp + fsync + rename)
+
+    body is {'receipt': <the line to append later>, 'probe': <hex of one
+    commitment in the anchor's tree>}: enough to settle, after a crash,
+    whether the calendar save the marker guards ever happened.
+    """
+    path = marker_path(receipts_path)
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, (json.dumps(body) + '\n').encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+
+
+def _receipt_on_file(receipts_path, txid):
+    """True if a receipt line for txid is already in the receipts file"""
+    try:
+        with open(receipts_path, 'rb') as fd:
+            for line in fd:
+                try:
+                    if json.loads(line).get('txid') == txid:
+                        return True
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        pass
+    return False
+
+
 def _append_anchor_receipt(path, receipt):
     """Append one anchor receipt line to the JSONL file at path
 
@@ -318,32 +356,104 @@ class Stamper:
                                 [CTxOut(0, CScript([OP_RETURN, new_commitment]))],
                                 nLockTime=new_min_block_height)
 
-    def __save_confirmed_timestamp_tx(self, confirmed_tx):
-        """Save a fully confirmed timestamp to disk"""
+    def settle_pending_receipt(self):
+        """Settle a pending-receipt marker left by an earlier crash
 
-        # Receipt before calendar save: if we crash between the two, the
-        # commitments are re-anchored by a new tx with its own receipt, so
-        # at worst the file gains an extra line. A possible duplicate line
-        # is preferred over a possible missed one — a missed receipt is
-        # silently lost revenue, and the gateway dedupes by txid.
+        The marker (see __save_confirmed_timestamp_tx) holds the receipt
+        and one commitment of the anchor's tree. If that commitment is in
+        the calendar the save happened and the receipt is owed: it is
+        appended unless its txid is already on file. If it is not, the
+        save never happened: those commitments are still pending and will
+        be re-anchored under a new txid with their own receipt, so this
+        receipt must not be written — writing it would bill the same
+        records twice. Either way the marker is removed and the outcome
+        logged. Runs at stamper start and before any new marker; a no-op
+        when receipts are off or no marker exists.
+        """
+        if not self.anchor_receipts_path:
+            return
+        path = marker_path(self.anchor_receipts_path)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, 'rb') as fd:
+                body = json.loads(fd.read())
+            receipt = body['receipt']
+            txid = receipt['txid']
+            probe = bytes.fromhex(body['probe'])
+        except (ValueError, KeyError, TypeError) as exp:
+            aside = '%s.corrupt-%d' % (path, int(time.time()))
+            logging.warning("Pending anchor receipt marker %s is unreadable (%r); set aside as %s, "
+                            "no receipt written" % (path, exp, aside))
+            os.rename(path, aside)
+            return
+
+        if probe in self.calendar:
+            if _receipt_on_file(self.anchor_receipts_path, txid):
+                logging.info("Pending anchor receipt for tx %s is already on file; marker removed" % txid)
+            else:
+                _append_anchor_receipt(self.anchor_receipts_path, receipt)
+                logging.warning("Anchor receipt for tx %s recovered from the pending marker: the calendar "
+                                "save completed before an earlier stop, the receipt had not been written" % txid)
+        else:
+            logging.warning("Pending anchor receipt for tx %s discarded: the calendar never saved that "
+                            "anchor's commitments (an earlier stop hit before the save), so they will "
+                            "be re-anchored and receipted under a new txid; nothing is owed for %s"
+                            % (txid, txid))
+        os.unlink(path)
+
+    def __save_confirmed_timestamp_tx(self, confirmed_tx):
+        """Save a fully confirmed timestamp to disk, then receipt it
+
+        Marker before the save, receipt after it. A crash before the save
+        leaves a marker whose commitments the calendar does not hold: they
+        re-anchor under a new txid with their own receipt, and the marker
+        is discarded at the next start (settle_pending_receipt) — never a
+        second bill for the same records. A crash after the save leaves a
+        marker whose commitments the calendar holds: the receipt is
+        recovered from it. What a crash can lose is at most one receipt,
+        and the marker names it; what it can never do is bill twice.
+        """
+        txid = b2lx(confirmed_tx.tx.GetTxid())
+        receipt = None
         if self.anchor_receipts_path:
-            txid = b2lx(confirmed_tx.tx.GetTxid())
+            receipt = {'txid': txid,
+                       'fee_sats': confirmed_tx.fee,
+                       'commitments': len(confirmed_tx.commitment_timestamps),
+                       'confirmed_height': confirmed_tx.height,
+                       'confirmed_at': int(time.time()),
+                       'records': confirmed_tx.records}
             try:
-                _append_anchor_receipt(self.anchor_receipts_path,
-                                       {'txid': txid,
-                                        'fee_sats': confirmed_tx.fee,
-                                        'commitments': len(confirmed_tx.commitment_timestamps),
-                                        'confirmed_height': confirmed_tx.height,
-                                        'confirmed_at': int(time.time()),
-                                        'records': confirmed_tx.records})
+                self.settle_pending_receipt()
+                _write_pending_receipt(self.anchor_receipts_path,
+                                       {'receipt': receipt,
+                                        'probe': confirmed_tx.commitment_timestamps[0].msg.hex()})
             except Exception as exp:
-                # A failed receipt write must never break the stamp loop.
-                logging.warning("Failed to write anchor receipt for tx %s: %r" % (txid, exp))
+                # A failed marker write must never break the stamp loop;
+                # without it a stop between the save and the receipt
+                # loses the receipt silently, so say so now.
+                logging.warning("Failed to write pending anchor receipt marker for tx %s: %r" % (txid, exp))
 
         self.calendar.add_commitment_timestamps(confirmed_tx.commitment_timestamps)
         logging.info("tx %s fully confirmed, %d timestamps added to calendar" %
-                     (b2lx(confirmed_tx.tx.GetTxid()),
-                      len(confirmed_tx.commitment_timestamps)))
+                     (txid, len(confirmed_tx.commitment_timestamps)))
+
+        if receipt is not None:
+            try:
+                _append_anchor_receipt(self.anchor_receipts_path, receipt)
+            except Exception as exp:
+                # A failed receipt write must never break the stamp loop.
+                # The marker stays: the receipt is recovered from it before
+                # the next anchor's marker, or at the next start.
+                logging.warning("Failed to write anchor receipt for tx %s: %r; the pending marker "
+                                "keeps it until it can be written" % (txid, exp))
+                return
+            try:
+                os.unlink(marker_path(self.anchor_receipts_path))
+            except FileNotFoundError:
+                pass
+            except OSError as exp:
+                logging.warning("Failed to remove pending anchor receipt marker for tx %s: %r" % (txid, exp))
 
     def __write_journal_checkpoint(self):
         """Persist journal.known-good after a confirmed anchor
@@ -699,6 +809,14 @@ class Stamper:
         # Shared with the tree close, which re-reads counts the scan missed.
         self.record_counts = record_counts
 
+        # A marker left by a stop between an anchor's calendar save and its
+        # receipt (or just before the save) is settled before anything else.
+        try:
+            self.settle_pending_receipt()
+        except Exception as exp:
+            logging.error("Settling the pending anchor receipt marker failed: %r; stamping continues"
+                          % (exp,), exc_info=True)
+
         if record_counts is None and os.path.exists(self.calendar.path + '/journal.counts'):
             # The sidecar only ever exists because receipts were on: this
             # calendar was receipting its anchors and is now anchoring for
@@ -810,8 +928,10 @@ class Stamper:
                     return "Pending confirmation in Bitcoin blockchain"
                 idx += 1
 
-            for height, ttx in self.txs_waiting_for_confirmation.items():
-               for commitment_timestamp in ttx.commitment_timestamps:
+            # A snapshot: the stamper thread mutates this dict while an RPC
+            # thread is here (N16, 2026-09-08).
+            for height, ttx in list(self.txs_waiting_for_confirmation.items()):
+                for commitment_timestamp in ttx.commitment_timestamps:
                     if commitment == commitment_timestamp.msg:
                         return "Timestamped by transaction %s; waiting for %d confirmations"\
                                % (b2lx(ttx.tx.GetTxid()), self.min_confirmations)

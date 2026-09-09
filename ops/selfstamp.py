@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (C) 2026 The OpenTimestamps developers
+# Copyright (C) 2026 ab21tor
 #
 # This file is part of the OpenTimestamps Server.
 #

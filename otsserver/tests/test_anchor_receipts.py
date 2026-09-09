@@ -1,4 +1,4 @@
-# Copyright (C) 2026 The OpenTimestamps developers
+# Copyright (C) 2026 ab21tor
 #
 # This file is part of the OpenTimestamps Server.
 #
@@ -165,11 +165,14 @@ class Test_anchor_receipts(unittest.TestCase):
 
         stamper.calendar.add_commitment_timestamps.assert_called_once_with(
             mined_tx.commitment_timestamps)
+        # Two writes fail on an unwritable path — the pending marker before
+        # the save and the receipt after it — and each warns, naming the tx.
         warnings = [r for r in captured.records
                     if r.levelname == 'WARNING'
                     and 'anchor receipt' in r.getMessage()]
-        self.assertEqual(len(warnings), 1, captured.output)
-        self.assertIn(b2lx(final.GetTxid()), warnings[0].getMessage())
+        self.assertEqual(len(warnings), 2, captured.output)
+        for w in warnings:
+            self.assertIn(b2lx(final.GetTxid()), w.getMessage())
 
     def test_append_only_existing_bytes_untouched(self):
         stamper = make_stamper(self.receipts_path)
