@@ -1,0 +1,123 @@
+{
+ "name": "second failure joins: names the rest",
+ "base": {
+  "health_reach": true,
+  "health": {
+   "status": "ok",
+   "payment": "unknown",
+   "otsd": "ok",
+   "wallet": "absent",
+   "float": "inactive",
+   "proofs": "absent",
+   "backup": "absent",
+   "billing": "ok"
+  },
+  "containers": {
+   "gateway-gateway-1": "Up 3 hours",
+   "gateway-otsd-1": "Up 3 hours",
+   "gateway-tor-1": "Up 3 hours"
+  },
+  "units_system": {
+   "kiosk.service": "active",
+   "bitcoind.service": "active",
+   "docker.service": "active",
+   "nftables.service": "active"
+  },
+  "units_user": {
+   "aircraft-endpoint.service": "active",
+   "aircraft-feeder.service": "active",
+   "phoenixd.service": "active",
+   "anchor-payer.timer": "active",
+   "selfstamp.timer": "active"
+  },
+  "disk": {
+   "/": 9.1,
+   "/boot/firmware": 15.0
+  },
+  "temp_c": 46.1,
+  "mem_avail_mb": 6600,
+  "feeder_age": 20,
+  "feeder_err_polls": 0,
+  "endpoint_age": 5,
+  "endpoint_breaker": "ok",
+  "journal_errors": 0,
+  "ssh_failures": 0,
+  "anchors": 4,
+  "anchor_age_h": 6.2,
+  "uptime_s": 97000,
+  "kernel_running": "6.18.34+rpt-rpi-2712",
+  "kernel_newest": "6.18.34+rpt-rpi-2712",
+  "reboot_required_file": false,
+  "updates_total": 0,
+  "updates_security": 0,
+  "egress_drops": 0,
+  "dhcp_lease_left_h": 20.0,
+  "tor_alive_lines": 1,
+  "tor_circuits": 15,
+  "tor_net_warn": 0,
+  "btc_peers": 11,
+  "ssh_sources": []
+ },
+ "runs": [
+  {
+   "t": 1788600000,
+   "obs": {}
+  },
+  {
+   "t": 1788600300,
+   "obs": {
+    "feeder_age": 700
+   }
+  },
+  {
+   "t": 1788600600,
+   "obs": {
+    "feeder_age": 700
+   }
+  },
+  {
+   "t": 1788600900,
+   "obs": {
+    "feeder_age": 700,
+    "disk": {
+     "/": 91.0,
+     "/boot/firmware": 15.0
+    }
+   }
+  },
+  {
+   "t": 1788601200,
+   "obs": {
+    "feeder_age": 700,
+    "disk": {
+     "/": 91.0,
+     "/boot/firmware": 15.0
+    }
+   }
+  },
+  {
+   "t": 1788601500,
+   "obs": {
+    "feeder_age": 700,
+    "disk": {
+     "/": 91.0,
+     "/boot/firmware": 15.0
+    }
+   }
+  }
+ ],
+ "expect": [
+  [
+   "pi5 heartbeat"
+  ],
+  [],
+  [
+   "DEGRADED: feeder log stale 11m | still: none"
+  ],
+  [],
+  [
+   "DEGRADED: / at 91.0% | still: feeder log stale 11m"
+  ],
+  []
+ ]
+}

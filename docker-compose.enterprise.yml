@@ -1,0 +1,82 @@
+# The appliance shape: the calendar alone. One service, otsd, built from this
+# checkout (Dockerfile at the root: a copy of timestamp-gateway/otsd/Dockerfile)
+# and reachable on host loopback 14788 only — the door for the client adapter
+# (api-endpoint, CALENDAR_URL), ops/selfstamp.py and ops/watch.py. No
+# gateway, no tor, no payer, no Lightning: the README's "The appliance shape"
+# section is the install; the hosted shape lives in the timestamp-gateway repo.
+#
+# Needs beside it: .env (BITCOIN_RPC_SERVICE_URL, and optionally
+# ANCHOR_INTERVAL_SECONDS, OTSD_CALENDAR_DIR — see .env.enterprise.example),
+# a synced bitcoind on this host whose RPC binds the docker0 address and
+# allows the subnet pinned below, and the three calendar identity files
+# (README, "The appliance shape", step 3). Receipts land in ./receipts on
+# the host (gitignored): the box's logbook, read by the watcher and hashed
+# daily by selfstamp.
+#
+#   docker compose -f docker-compose.enterprise.yml up -d --build   # first run
+#   docker compose -f docker-compose.enterprise.yml up -d           # after a pull
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  otsd:
+    build: .
+    logging: *bounded-logging
+    restart: unless-stopped
+    networks:
+      - cal_net
+    # host.docker.internal = this host's docker0 address: where bitcoind
+    # binds its RPC for the container (README, "The appliance shape", step 1).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # --rpc-address 0.0.0.0: reachable on the compose network, published on
+    # host loopback only (ports:). --btc-max-fee takes BTC (0.0002 BTC =
+    # 20,000 sats — never "fix" it to 20000); it is the most one anchor cycle
+    # can spend. --btc-min-tx-interval is the coverage tier: the departure
+    # clock is this × a uniform factor between 1 and 2, so 21600 (the
+    # default) anchors every 6–12 h and 3600 every 1–2 h. No -v: INFO is
+    # the production level.
+    command: ["python", "/app/otsd", "--rpc-address", "0.0.0.0", "--calendar", "/calendar",
+              "--btc-conf-target", "12", "--btc-max-fee", "0.0002",
+              "--btc-min-tx-interval", "${ANCHOR_INTERVAL_SECONDS:-21600}"]
+    # otsd's clean-exit path hangs off KeyboardInterrupt — SIGINT, not the
+    # compose-default SIGTERM, is what actually runs it.
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    # Loopback only: the adapter's counted door (/digest), the operator lane
+    # (/operator/digest, OTSD_OPERATOR_LANE=1 below) and the JSON status the
+    # watcher reads all live here. Nothing off-box can reach it.
+    ports:
+      - "127.0.0.1:14788:14788"
+    volumes:
+      # Calendar state — the proof namespace. Destroying it strands every
+      # pending proof this calendar has issued. Default: named volume; set
+      # OTSD_CALENDAR_DIR to a host path to manage it yourself.
+      - ${OTSD_CALENDAR_DIR:-otsd_calendar}:/calendar
+      # Calendar code: this checkout.
+      - .:/app
+      # The logbook: one JSONL line per confirmed anchor, host-readable.
+      - ./receipts:/receipts
+    environment:
+      # Full RPC URL including credentials. Set in the gitignored .env ONLY.
+      # Unset -> otsd exits at startup with a clear error.
+      - BITCOIN_RPC_SERVICE_URL=${BITCOIN_RPC_SERVICE_URL:-}
+      # Anchor receipts -> the host bind mount above.
+      - OTSD_ANCHOR_RECEIPTS=/receipts/anchor-receipts.jsonl
+      # POST /operator/digest: uncounted leaves for the self-stamp diary.
+      - OTSD_OPERATOR_LANE=1
+
+networks:
+  cal_net:
+    driver: bridge
+    # Pinned so bitcoin.conf's rpcallowip line is a constant, not a lookup.
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  otsd_calendar:

@@ -8,6 +8,21 @@ running a server locally can be useful for developers of OpenTimestamps
 protocol clients, particularly with a local Bitcoin node running in regtest
 mode.
 
+## Two shapes
+
+This fork is the calendar of two deployment shapes, and it is the same code
+in both:
+
+- **Hosted**: the calendar behind the `timestamp-gateway` (an L402 door, or
+  a free door with anchor billing), sold across a trust boundary; the payer
+  is `auto-anchor`, the client adapter `api-endpoint` in its `GATEWAY_URL`
+  mode. The gateway repo's README and operator guide are the install.
+- **Appliance**: one box runs bitcoind, this calendar alone
+  (`docker-compose.enterprise.yml`, loopback only), the client adapter in
+  its `CALENDAR_URL` mode, the self-stamper and the watcher (both in
+  `ops/`). No gateway, no Lightning, no payer, no payment anywhere; the
+  receipts file is the box's logbook. The install is "The appliance
+  shape" below, written to be followed by a stranger.
 
 ## Installation
 
@@ -370,6 +385,234 @@ record-count sidecar. The unit tests drive the tool against a stdlib fake
 of the calendar protocol and cross-check the proof bytes with the
 opentimestamps library.
 
+## The appliance shape
+
+One box, five parts, two repos. bitcoind runs on the host; the calendar
+runs in Docker (the py-leveldb dependency pins it to Python 3.11, so the
+image carries its own interpreter); the client adapter, the self-stamper
+and the watcher are stdlib Python and run on whatever Python the host has.
+Nothing listens off-box: the calendar is published on loopback 14788, the
+adapter's door is wherever `LISTEN_ADDR` says, and the three tools have no
+listener at all. What the box does not have: a gateway, Tor, phoenixd, a
+payer, an L402 secret, a bills token.
+
+| Part | Where it runs | Reads | Writes | Listens |
+|---|---|---|---|---|
+| bitcoind (pruned mainnet, Bitcoin Core) | host, system unit, user `bitcoin` | the network | its datadir, the anchor wallet | 8333 (p2p), RPC on loopback and the docker0 address |
+| otsd (this checkout) | Docker, `docker-compose.enterprise.yml` | bitcoind RPC | `/calendar` (volume), `receipts/anchor-receipts.jsonl` | 127.0.0.1:14788 |
+| api-endpoint (`CALENDAR_URL` mode) | host, user unit | the calendar on loopback | `DATA_DIR`: `debts/`, `proofs/`, `pending/`, `heartbeat`, `log` | `LISTEN_ADDR` (the one route, `POST /record`) |
+| `ops/selfstamp.py` | host, user timer, 00:30 UTC | the books, `journalctl`, the calendar's operator lane | `~/selfstamp/manifests/` | none |
+| `ops/watch.py` | host, user timer, every 5 min | the calendar's JSON status, units, containers, files, the journal | `~/watcher/status`, `state.json`, `watch.log`, ntfy (optional) | none |
+
+The steps below assume an operator account (here `appliance`) with its
+home at `/home/appliance`, the two clones at `~/opentimestamps-server` and
+`~/api-endpoint`, and adapter state under `~/appliance`. Every path is a
+choice; the units and examples name these.
+
+### 0. Host prerequisites
+
+- A Linux host with systemd, Docker Engine 24+ with Compose v2, `git` and
+  `python3` (any current version: the tools are stdlib).
+- The operator account runs user units without a login session:
+  `sudo loginctl enable-linger appliance`.
+- A persistent journal, so the self-stamper's daily journal digest covers
+  a real day: `/etc/systemd/journald.conf.d/50-persistent.conf` with
+  `[Journal]`, `Storage=persistent`, `SystemMaxUse=1G`, `Compress=yes`, then
+  `sudo systemctl restart systemd-journald && sudo journalctl --flush`.
+- Two host matters this tree does not carry and an appliance cannot go
+  without; each is its own session, named here so nothing is assumed:
+  **the host firewall** (inbound default-deny except ssh from the LAN and
+  8333; outbound default-deny with bitcoind, apt and the optional ntfy
+  channel allowed by owner), and **backups** (the calendar directory with
+  the journal above the LevelDB, `receipts/`, the adapter's `DATA_DIR`,
+  `~/selfstamp/manifests`, the compose `.env`; encrypted, off-box).
+
+### 1. bitcoind on the host
+
+Install Bitcoin Core (the pinned reference runs 31.x), create the user and
+directories, and write `/etc/bitcoin/bitcoin.conf`:
+
+```
+server=1
+prune=50000          # 10000 is enough: otsd needs only recent blocks
+dbcache=2000         # sizing for sync; the default (450) is fine afterwards
+rpcbind=127.0.0.1
+rpcbind=172.17.0.1   # docker0: what host.docker.internal resolves to in the container
+rpcallowip=127.0.0.1
+rpcallowip=172.30.0.0/24     # the compose subnet, pinned in docker-compose.enterprise.yml
+rpcauth=otsd:<salt>$<hmac>   # generated below; the password goes into the compose .env only
+rpcwhitelistdefault=0        # keeps the cookie (root) unrestricted; without it the whitelist empties every other user
+rpcwhitelist=otsd:estimatesmartfee,getaddressinfo,getbalance,getbestblockhash,getblock,getblockcount,getblockhash,getblockheader,getnewaddress,getrawtransaction,gettransaction,gettxout,listtransactions,listunspent,sendrawtransaction,signrawtransactionwithwallet
+natpmp=0
+```
+
+The rpcauth line and its password:
+
+```bash
+python3 -c 'import os, hmac, hashlib
+s = os.urandom(16).hex(); p = os.urandom(32).hex()
+print("rpcauth=otsd:%s$%s" % (s, hmac.new(s.encode(), p.encode(), hashlib.sha256).hexdigest()))
+print("password", p)'
+```
+
+The unit, `/etc/systemd/system/bitcoind.service` (the reference box's,
+hardened; `Type=notify` needs Bitcoin Core's `-startupnotify` as below):
+
+```
+[Unit]
+Description=Bitcoin Core daemon (pruned mainnet)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=bitcoin
+Group=bitcoin
+ExecStart=/usr/local/bin/bitcoind -conf=/etc/bitcoin/bitcoin.conf -datadir=/var/lib/bitcoind -pid=/run/bitcoind/bitcoind.pid -startupnotify='systemd-notify --ready' -shutdownnotify='systemd-notify --stopping'
+Type=notify
+NotifyAccess=all
+PIDFile=/run/bitcoind/bitcoind.pid
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=infinity
+TimeoutStopSec=600
+RuntimeDirectory=bitcoind
+RuntimeDirectoryMode=0710
+StateDirectory=bitcoind
+StateDirectoryMode=0710
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+PrivateDevices=yes
+ProtectHome=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Let it sync fully before step 2 (a wallet on a syncing node reads a zero
+balance; shipping the box pre-synced, or loading an assumeutxo snapshot,
+turns days into hours and is a product decision, not a step here). Then the
+anchor wallet, named `otsd-island` by convention, loaded on every start:
+
+```bash
+sudo -u bitcoin bitcoin-cli -conf=/etc/bitcoin/bitcoin.conf -named createwallet wallet_name=otsd-island load_on_startup=true
+sudo -u bitcoin bitcoin-cli -conf=/etc/bitcoin/bitcoin.conf -rpcwallet=otsd-island getnewaddress "" bech32
+```
+
+Fund that address on-chain: it is the anchoring float, the consumable. A
+top-up is an ordinary on-chain payment to an address of this wallet from
+anywhere; nothing on the box needs to be reachable for it.
+
+### 2. The calendar (this checkout)
+
+```bash
+git clone -b calendar-ops https://github.com/ab21tor/opentimestamps-server ~/opentimestamps-server
+cd ~/opentimestamps-server
+cp .env.enterprise.example .env && chmod 600 .env
+# .env: BITCOIN_RPC_SERVICE_URL=http://otsd:<the password from step 1>@host.docker.internal:8332/wallet/otsd-island
+#       ANCHOR_INTERVAL_SECONDS (optional: the coverage tier, default 21600)
+```
+
+First run only, the calendar's identity — three files otsd refuses to
+start without. The `uri` is written into every pending attestation the
+calendar issues and is permanent; on the appliance it is the loopback
+address the adapter and the tools use, `http://127.0.0.1:14788/` (it need
+not resolve off-box: upgrades go through the adapter, or through
+`ots upgrade -c http://127.0.0.1:14788` on the box). The `donation_addr`
+is a fresh address of the anchor wallet, so the "donation" address on the
+status page is the refill address:
+
+```bash
+docker compose -f docker-compose.enterprise.yml run --rm otsd sh -c \
+  'echo "http://127.0.0.1:14788/" > /calendar/uri \
+   && head -c 32 /dev/urandom > /calendar/hmac-key \
+   && echo "<a bech32 address from step 1>" > /calendar/donation_addr'
+docker compose -f docker-compose.enterprise.yml up -d --build   # first run; plain `up -d` after a pull
+docker compose -f docker-compose.enterprise.yml logs otsd       # expect: journal opened, no RPC errors
+curl -s -H 'Accept: application/json' http://127.0.0.1:14788/ | python3 -m json.tool
+```
+
+The JSON status must show `best_block` (the calendar can see Bitcoin),
+`anchor_receipts: "on"`, and the wallet `balance`. `receipts/` is created
+on the first confirmed anchor; it is gitignored, host-readable, and the
+box's logbook: one line per anchor, `records` per line.
+
+### 3. The client adapter
+
+```bash
+git clone https://github.com/ab21tor/api-endpoint ~/api-endpoint
+mkdir -p ~/appliance ~/.config/systemd/user
+cp ~/api-endpoint/deploy/api-endpoint.env.example ~/appliance/api-endpoint.env && chmod 600 ~/appliance/api-endpoint.env
+# edit: LISTEN_ADDR (loopback, or the LAN address the lab's systems reach), DATA_DIR (absolute)
+cp ~/api-endpoint/deploy/api-endpoint.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now api-endpoint.service
+printf 'hello' | curl -s --data-binary @- http://127.0.0.1:8402/record      # received <sha256 of "hello">
+ls ~/appliance/endpoint-data/proofs                                          # <fp>.ots within seconds, pending
+```
+
+Every record goes to the calendar's counted `/digest`, so it appears in
+the receipts' `records`; the operator lane below is never used by the
+adapter. Knobs, the two shapes and the claims: the api-endpoint README,
+"The appliance shape".
+
+### 4. The self-stamper
+
+```bash
+mkdir -p ~/selfstamp && cp ops/selfstamp.config.example.json ~/selfstamp/config.json && chmod 600 ~/selfstamp/config.json
+```
+
+Books for the appliance (edit `config.json`): `receipts`
+`~/opentimestamps-server/receipts/anchor-receipts.jsonl`, `compose`
+`~/opentimestamps-server/docker-compose.enterprise.yml`, `env`
+`~/opentimestamps-server/.env`, `endpoint_env` `~/appliance/api-endpoint.env`,
+`endpoint_heartbeat` `~/appliance/endpoint-data/heartbeat`; `journal: true`;
+`fork_head` `~/opentimestamps-server`; no payer books. Then:
+
+```bash
+cp ops/systemd/selfstamp.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now selfstamp.timer
+python3 ops/selfstamp.py run --config ~/selfstamp/config.json      # the genesis manifest, by hand, once
+python3 ops/selfstamp.py verify --manifests ~/selfstamp/manifests
+```
+
+### 5. The watcher
+
+```bash
+mkdir -p ~/watcher && cp ops/watch.config.example ~/watcher/config && chmod 600 ~/watcher/config
+# edit: NTFY_URL (or leave empty), the two absolute paths, CONTAINERS if the checkout is not named opentimestamps-server
+cp ops/systemd/watcher.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now watcher.timer
+WATCH_DIR=~/watcher python3 -B ops/watch.py --dry                   # every check, nothing sent
+```
+
+The appliance runs fifteen checks (the six whose knobs are empty neither
+fail nor count): the calendar's status — reachable, Bitcoin-visible,
+receipts on, wallet above `CAL_MIN_SATS` — the containers and units, disk,
+temperature, memory, the adapter's heartbeat and breaker, journal errors,
+ssh failures and unexpected logins, the age of the last confirmed anchor,
+pending reboots, refused outbound packets, bitcoind's peers. One line a
+day is the heartbeat; alerts go out on transitions only.
+
+### What the box then is
+
+Its health is three plain readings, no listener added for them: the
+calendar's JSON on loopback, the adapter's `heartbeat` file, the receipts
+file. When the anchor wallet runs dry the calendar keeps accepting and
+anchoring waits (one warning in its log; the watcher's `calendar` check
+alarms first, at five fee caps); the adapter's intake never stops and
+debts are never dropped. Refill is an on-chain payment to the wallet.
+
+An anchored proof verifies with the public client against the box's own
+node — `ots verify` — or anywhere else with a Bitcoin view; nothing in it
+names a service that must stay alive. A pending proof names the box's own
+loopback calendar, which is where the adapter upgrades it.
+
+Dependencies on the box, in full: the otsd image (`python:3.11-slim` by
+digest; `opentimestamps`, `leveldb`, `pystache`, `qrcode`, `image`,
+`simplejson`, `python-bitcoinlib 0.11.2`), Bitcoin Core, Docker, and the
+host's Python for three stdlib tools. Nothing else.
+
 ## Unit tests
 
 Test modules live under `otsserver/tests/`:
@@ -381,7 +624,8 @@ Test modules live under `otsserver/tests/`:
   `test_aggregator_dedupe.py`, `test_stamper_read_errors.py`,
   `test_stamper_checkpoint.py`, `test_stamper_wallet_empty.py`,
   `test_operator_lane.py`, `test_selfstamp.py`,
-  `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py` — regression
+  `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py`,
+  `test_watch.py` — regression
   tests for this branch's delta (launcher flags, homepage RPC wiring and
   the receipts status line, stamper-loop crash fixes, anchor receipts,
   anchor cadence, the /digest Content-Length handling, anchor-receipt
@@ -389,8 +633,9 @@ Test modules live under `otsserver/tests/`:
   pending-fill read-error survival, the restart checkpoint, empty-wallet
   warn-once, the operator lane and known-zero counts, the self-stamp
   tool, dead-cycle recovery, fee-cap warn-once, the receipts-off startup
-  warning). They stub everything external with `unittest.mock`: no
-  bitcoind, no network.
+  warning, the watcher's 29 fixture scenarios and its appliance-shape
+  additions). They stub everything external with `unittest.mock` or
+  stdlib fakes: no bitcoind, no network.
 
 No test module needs a running Bitcoin node. Every module does need the
 full dependency set installed, and one dependency — `leveldb` — is a native
@@ -402,7 +647,7 @@ Run the suite in the deployment-matched environment — the otsd image (base
 `pip install -r requirements.txt`) — or in a Python ≤ 3.11 venv:
 
 ```
-python -m unittest discover -v                       # Ran 92 tests ... OK
+python -m unittest discover -v                       # Ran 100 tests ... OK
 ```
 
 The otsd image has no pytest; where pytest is installed,

@@ -1,0 +1,48 @@
+# <WATCH_DIR>/config, mode 0600 (WATCH_DIR defaults to ~/watcher; the unit sets
+# it). KEY=VALUE; a key left out uses the default in ops/watch.py; a key set
+# EMPTY skips its check entirely, so it neither fails nor counts. The only
+# secret is the ntfy topic URL. Empty = no off-box channel (status file only).
+NTFY_URL=
+# The box's name in every message (empty = the hostname).
+NAME=
+
+# --- The appliance shape (docker-compose.enterprise.yml): the calendar's own
+# JSON status replaces the gateway's /health; no feeder, no tor, no phoenixd.
+HEALTH_URL=
+CALENDAR_URL=http://127.0.0.1:14788
+# Alarm below this confirmed anchor-wallet balance: five fee caps at the
+# shipped 20,000-sat cap, the same threshold as the gateway's float alarm.
+CAL_MIN_SATS=100000
+# The compose project name is the checkout's directory name: <dir>-otsd-1.
+CONTAINERS=opentimestamps-server-otsd-1
+UNITS_SYSTEM=bitcoind.service,docker.service,nftables.service
+UNITS_USER=api-endpoint.service,selfstamp.timer
+FEEDER_LOG=
+TOR_CONTAINER=
+# No separate boot partition on most x86 boxes; set it where there is one.
+DISK_BOOT=
+# nmcli-managed DHCP interface, or empty for a static address.
+DHCP_IFACE=
+ENDPOINT_HEARTBEAT=/home/appliance/appliance/endpoint-data/heartbeat
+RECEIPTS=/home/appliance/opentimestamps-server/receipts/anchor-receipts.jsonl
+
+# --- Thresholds (rulings 2026-09-04): disk 85%, temp 75C, mem 256MB, endpoint
+# 180s, journal 20 errors/run, ssh 10 failures/run, anchor 36h (three times
+# the default 6–12 h departure window), heartbeat at 08:00Z, confirm 2 runs.
+DISK_PCT=85
+TEMP_C=75
+MEM_MB=256
+ENDPOINT_STALE_S=180
+JOURNAL_ERRORS=20
+SSH_FAILURES=10
+ANCHOR_MAX_H=36
+HEARTBEAT_HOUR=8
+CONFIRM_RUNS=2
+# Accepted ssh logins from any source not listed here alert once
+# (comma-separated addresses or CIDRs).
+SSH_KNOWN_SOURCES=
+
+# --- The hosted shape (the Pi): leave HEALTH_URL, CONTAINERS, UNITS_*,
+# FEEDER_LOG, TOR_CONTAINER, DISK_BOOT and DHCP_IFACE at their defaults (or
+# set them to the Pi's values) and add CALENDAR_URL=http://127.0.0.1:14788 to
+# gain the calendar check beside /health: 21 checks.

@@ -33,3 +33,7 @@ pip-log.txt
 
 # Pre-edit copies left beside edited files
 *.bak-*
+
+# Appliance shape (docker-compose.enterprise.yml): the logbook and the local config
+receipts/
+.env

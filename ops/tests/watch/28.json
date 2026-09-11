@@ -1,0 +1,143 @@
+{
+ "name": "appliance: wallet low, then receipts off, then gone: one alert, no re-alarm",
+ "cfg": {
+  "NAME": "appliance",
+  "HEALTH_URL": "",
+  "CALENDAR_URL": "http://127.0.0.1:14788",
+  "CONTAINERS": "opentimestamps-server-otsd-1",
+  "UNITS_SYSTEM": "bitcoind.service,docker.service,nftables.service",
+  "UNITS_USER": "api-endpoint.service,selfstamp.timer",
+  "FEEDER_LOG": "",
+  "TOR_CONTAINER": "",
+  "DISK_BOOT": "",
+  "DHCP_IFACE": ""
+ },
+ "base": {
+  "calendar_reach": true,
+  "calendar": {
+   "best_block": "00000000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "anchor_receipts": "on",
+   "balance": "212,015",
+   "pending_commitments": "1,204",
+   "most_recent_tx": "None"
+  },
+  "containers": {
+   "opentimestamps-server-otsd-1": "Up 3 days"
+  },
+  "units_system": {
+   "bitcoind.service": "active",
+   "docker.service": "active",
+   "nftables.service": "active"
+  },
+  "units_user": {
+   "api-endpoint.service": "active",
+   "selfstamp.timer": "active"
+  },
+  "disk": {
+   "/": 21.0
+  },
+  "temp_c": 41.0,
+  "mem_avail_mb": 12000,
+  "endpoint_age": 5,
+  "endpoint_breaker": "ok",
+  "journal_errors": 0,
+  "ssh_failures": 0,
+  "anchors": 40,
+  "anchor_age_h": 3.1,
+  "btc_peers": 9,
+  "uptime_s": 300000
+ },
+ "runs": [
+  {
+   "t": 1788600000,
+   "obs": {}
+  },
+  {
+   "t": 1788600300,
+   "obs": {
+    "calendar": {
+     "best_block": "00000000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "anchor_receipts": "on",
+     "balance": "4,000",
+     "pending_commitments": "1,204",
+     "most_recent_tx": "None"
+    }
+   }
+  },
+  {
+   "t": 1788600600,
+   "obs": {
+    "calendar": {
+     "best_block": "00000000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "anchor_receipts": "on",
+     "balance": "4,000",
+     "pending_commitments": "1,204",
+     "most_recent_tx": "None"
+    }
+   }
+  },
+  {
+   "t": 1788600900,
+   "obs": {
+    "calendar": {
+     "best_block": "00000000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "anchor_receipts": "off",
+     "balance": "212,015",
+     "pending_commitments": "1,204",
+     "most_recent_tx": "None"
+    }
+   }
+  },
+  {
+   "t": 1788601200,
+   "obs": {
+    "calendar": {
+     "best_block": "00000000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "anchor_receipts": "off",
+     "balance": "212,015",
+     "pending_commitments": "1,204",
+     "most_recent_tx": "None"
+    }
+   }
+  },
+  {
+   "t": 1788601500,
+   "obs": {
+    "calendar_reach": false,
+    "calendar": null
+   }
+  },
+  {
+   "t": 1788601800,
+   "obs": {
+    "calendar_reach": false,
+    "calendar": null
+   }
+  },
+  {
+   "t": 1788602100,
+   "obs": {}
+  },
+  {
+   "t": 1788602400,
+   "obs": {}
+  }
+ ],
+ "expect": [
+  [
+   "appliance heartbeat"
+  ],
+  [],
+  [
+   "appliance DEGRADED: anchor wallet 4000 sats < 100000 | still: none"
+  ],
+  [],
+  [],
+  [],
+  [],
+  [],
+  [
+   "appliance RECOVERED: all 15 checks ok (was: calendar"
+  ]
+ ]
+}

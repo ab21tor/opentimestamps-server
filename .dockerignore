@@ -1,0 +1,7 @@
+# The image copies requirements.txt only; the code is mounted at runtime.
+.git
+.venv
+receipts
+__pycache__
+*.py[co]
+*.bak-*

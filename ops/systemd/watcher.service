@@ -1,0 +1,17 @@
+# Box health watcher: one check pass per timer tick, alerts on transitions
+# only, no listener. A user unit (systemctl --user); the script lives in the
+# fork checkout (read-only on the box, -B writes no __pycache__), its config,
+# state, status and log in WATCH_DIR. Paths assume the fork clone at
+# ~/opentimestamps-server and WATCH_DIR at ~/watcher; edit if not.
+[Unit]
+Description=box health watcher: one check pass, alerts on transitions only
+# Deliberately no After=/Requires=/Wants= (the 2026-09-03 boot-cycle lesson): the timer
+# fires on its own clock; a check that runs before a unit is up simply reports it.
+
+[Service]
+Type=oneshot
+Environment=WATCH_DIR=%h/watcher
+ExecStart=/usr/bin/python3 -B %h/opentimestamps-server/ops/watch.py
+StandardOutput=append:%h/watcher/watch.log
+StandardError=append:%h/watcher/watch.log
+Nice=10
