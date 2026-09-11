@@ -9,6 +9,10 @@
     "compose": "~/gateway/docker-compose.yml",
     "env": "~/gateway/.env"
   },
+  "audit_logs": {},
+  "float_low_sats": 100000,
   "journal": true,
-  "fork_head": "~/opentimestamps-server"
+  "fork_head": "~/opentimestamps-server",
+  "outbox": null,
+  "inbox": null
 }

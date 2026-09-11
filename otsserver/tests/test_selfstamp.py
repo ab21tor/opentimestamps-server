@@ -106,7 +106,9 @@ class FakeCalendar:
         self.mined_height = None
         self.operator_posts = 0
         self.client_posts = 0
-        self.gets = 0
+        self.gets = 0            # GET /timestamp/<hex> only
+        self.status_gets = 0     # GET / (the JSON status page)
+        self.balance_sats = 212015   # None -> the status answers 500
         cal = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -133,6 +135,17 @@ class FakeCalendar:
                 self._reply(200, body)
 
             def do_GET(self):
+                if self.path == '/':
+                    # The homepage as JSON (rpc.py do_GET with Accept:
+                    # application/json): balance rendered with commas, as
+                    # str_sat does. The one status the float reader uses.
+                    cal.status_gets += 1
+                    if cal.balance_sats is None:
+                        return self._reply(500, b'homepage failed', 'text/plain')
+                    body = json.dumps({'best_block': '00' * 32, 'anchor_receipts': 'on',
+                                       'balance': '{:,}'.format(cal.balance_sats),
+                                       'pending_commitments': '3', 'most_recent_tx': 'None'})
+                    return self._reply(200, body.encode(), 'application/json')
                 cal.gets += 1
                 if not self.path.startswith('/timestamp/'):
                     return self._reply(404, b'not found', 'text/plain')
@@ -287,7 +300,7 @@ class Test_run_heartbeat(SelfstampCase):
         self.assertEqual(rc, 0, self.log)
         self.assertEqual(self.manifests(), ['2026-09-01.json'])
         m = self.manifest('2026-09-01.json')
-        self.assertEqual(m['schema'], 'selfstamp/1')
+        self.assertEqual(m['schema'], 'selfstamp/2')
         self.assertEqual(m['host'], 'testbox')
         self.assertEqual(m['period'], '2026-09-01')
         self.assertEqual(m['created_at'], '2026-09-02T00:30:07Z')
@@ -417,7 +430,7 @@ class Test_verify_chain(SelfstampCase):
     def test_an_altered_byte_in_history_is_detected(self):
         path = self.dir / '2026-09-02.json'
         raw = path.read_bytes()
-        tampered = raw.replace(b'"schema": "selfstamp/1"', b'"schema": "selfstamp/2"')
+        tampered = raw.replace(b'"schema": "selfstamp/2"', b'"schema": "selfstamp/1"')
         self.assertNotEqual(raw, tampered)
         path.write_bytes(tampered)
 
@@ -519,6 +532,321 @@ class Test_inputs(unittest.TestCase):
         self.assertEqual(cfg['journal'], False)
         self.assertIsNone(cfg['fork_head'])
         self.assertIsNone(cfg['host'])
+
+
+def iso_mtime(path):
+    return datetime.datetime.fromtimestamp(os.stat(path).st_mtime,
+                                           datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class Test_commissioning(SelfstampCase):
+    """Item 13 of the 2026-09-11 green review: the genesis manifest is the
+    commissioning certificate."""
+
+    def fake_repo(self, commit):
+        repo = self.root / 'repo'
+        (repo / '.git' / 'refs' / 'heads').mkdir(parents=True)
+        (repo / '.git' / 'HEAD').write_text('ref: refs/heads/calendar-ops\n')
+        (repo / '.git' / 'refs' / 'heads' / 'calendar-ops').write_text(commit + '\n')
+        return repo
+
+    def test_genesis_carries_the_commissioning_block_and_later_manifests_do_not(self):
+        commit = '1d0fe48e589b86fb1f14299f813d0fa5d87de102'
+        self.cfg['fork_head'] = str(self.fake_repo(commit))
+        now = datetime.datetime(2026, 9, 2, 0, 30, 7, tzinfo=datetime.timezone.utc)
+        self.assertEqual(self.run_tool(P1, now=now), 0, self.log)
+        m = self.manifest('2026-09-01.json')
+        self.assertEqual(m['schema'], 'selfstamp/2')
+        # A config passed as a dict has no file: its fingerprint is the
+        # sha256 of its canonical JSON (a file config hashes the file).
+        expected_cfg = hashlib.sha256(json.dumps(
+            self.cfg, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(m['commissioning'], {
+            'host': 'testbox',
+            'installed_at': '2026-09-02T00:30:07Z',
+            'fork_commit': commit,
+            'config': {'path': None, 'sha256': expected_cfg},
+        })
+        self.assertEqual(self.run_tool(P2), 0, self.log)
+        self.assertIsNone(self.manifest('2026-09-02.json')['commissioning'])
+        rows = []
+        self.assertTrue(selfstamp.verify_chain(self.state / 'manifests', log=rows.append), rows)
+        self.assertTrue(any('commissioned host=testbox' in r and commit[:12] in r for r in rows), rows)
+
+    def test_commissioning_config_hash_is_the_config_file_when_there_is_one(self):
+        cfg_path = self.root / 'config.json'
+        cfg_path.write_text(json.dumps(self.cfg, indent=1))
+        cfg = selfstamp.load_config(cfg_path)
+        self.assertEqual(cfg['config_path'], str(cfg_path))
+        self.assertEqual(selfstamp.run(cfg, period=P1, log=self.log.append), 0, self.log)
+        m = self.manifest('2026-09-01.json')
+        self.assertEqual(m['commissioning']['config'],
+                         {'path': str(cfg_path), 'sha256': sha256_hex(cfg_path)})
+        self.assertIsNone(m['commissioning']['fork_commit'])
+
+
+class Test_float(SelfstampCase):
+    """Item 7: the anchor wallet's balance, read from the calendar's own
+    status page, so a witness sees "toner low" in the chain."""
+
+    def test_manifest_records_the_balance_and_the_low_flag(self):
+        self.calendar.balance_sats = 212015
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        self.assertEqual(self.manifest('2026-09-01.json')['float'], {
+            'source': 'calendar status', 'balance_sats': 212015,
+            'low_below_sats': 100000, 'low': False})
+        self.calendar.balance_sats = 4000
+        self.assertEqual(self.run_tool(P2), 0, self.log)
+        self.assertEqual(self.manifest('2026-09-02.json')['float'], {
+            'source': 'calendar status', 'balance_sats': 4000,
+            'low_below_sats': 100000, 'low': True})
+        self.cfg['float_low_sats'] = 3000
+        self.assertEqual(self.run_tool(P3), 0, self.log)
+        self.assertEqual(self.manifest('2026-09-03.json')['float'],
+                         {'source': 'calendar status', 'balance_sats': 4000,
+                          'low_below_sats': 3000, 'low': False})
+        # One status GET per manifest built; a noop run reads nothing.
+        self.assertEqual(self.calendar.status_gets, 3)
+        self.run_tool(P3)
+        self.assertEqual(self.calendar.status_gets, 3)
+
+    def test_an_unreadable_balance_is_recorded_not_fatal(self):
+        self.calendar.balance_sats = None
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        f = self.manifest('2026-09-01.json')['float']
+        self.assertEqual(f['source'], 'calendar status')
+        self.assertEqual(f['low_below_sats'], 100000)
+        self.assertIn('error', f)
+        self.assertNotIn('balance_sats', f)
+        self.assertNotIn('low', f)
+
+
+class Test_audit_logs(SelfstampCase):
+    """Item 5: books that are large and rotating (a lab's own audit-trail
+    export): hashed in chunks, file by file, with size and mtime, symlinks
+    never followed outside the configured directory."""
+
+    def setUp(self):
+        super().setUp()
+        self.lims = self.root / 'lims'
+        self.lims.mkdir()
+        self.big = os.urandom(3 * 65536 + 17)
+        (self.lims / 'audit.log').write_bytes(self.big)
+        (self.lims / 'audit.log.1').write_bytes(b'rotated\n')
+        (self.lims / 'archive').mkdir()
+
+    def test_a_directory_is_hashed_file_by_file_with_size_and_mtime(self):
+        self.cfg['audit_logs'] = {'lims': str(self.lims)}
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        entry = self.manifest('2026-09-01.json')['audit_logs']['lims']
+        self.assertEqual(entry['dir'], str(self.lims))
+        self.assertEqual([f['name'] for f in entry['files']], ['audit.log', 'audit.log.1'])
+        self.assertEqual(entry['files'][0], {
+            'name': 'audit.log', 'sha256': hashlib.sha256(self.big).hexdigest(),
+            'bytes': len(self.big), 'mtime': iso_mtime(self.lims / 'audit.log')})
+        self.assertEqual(entry['files'][1]['bytes'], 8)
+        self.assertEqual(entry['skipped'], [{'name': 'archive', 'reason': 'not a regular file'}])
+
+    def test_symlinks_outside_the_directory_are_never_followed(self):
+        secret = self.root / 'secret.txt'
+        secret.write_bytes(b'the box must never hash this\n')
+        (self.lims / 'evil').symlink_to(secret)
+        (self.lims / 'inside-link').symlink_to(self.lims / 'audit.log')
+        self.cfg['audit_logs'] = {'lims': str(self.lims)}
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        entry = self.manifest('2026-09-01.json')['audit_logs']['lims']
+        self.assertIn({'name': 'evil', 'reason': 'symlink outside the configured dir'}, entry['skipped'])
+        by_name = {f['name']: f for f in entry['files']}
+        self.assertEqual(by_name['inside-link']['sha256'], hashlib.sha256(self.big).hexdigest())
+        raw = (self.state / 'manifests' / '2026-09-01.json').read_bytes()
+        self.assertNotIn(hashlib.sha256(secret.read_bytes()).hexdigest().encode(), raw)
+
+    def test_a_single_file_and_a_missing_path(self):
+        self.cfg['audit_logs'] = {'one': str(self.lims / 'audit.log.1'),
+                                  'gone': str(self.lims / 'nowhere')}
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        logs = self.manifest('2026-09-01.json')['audit_logs']
+        self.assertEqual(logs['one'], {
+            'path': str(self.lims / 'audit.log.1'), 'sha256': hashlib.sha256(b'rotated\n').hexdigest(),
+            'bytes': 8, 'mtime': iso_mtime(self.lims / 'audit.log.1')})
+        self.assertEqual(logs['gone'], {'path': str(self.lims / 'nowhere'), 'missing': True})
+
+    def test_unconfigured_is_null_and_books_stay_as_they_were(self):
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        m = self.manifest('2026-09-01.json')
+        self.assertIsNone(m['audit_logs'])
+        self.assertEqual(set(m['books']['receipts']), {'path', 'sha256', 'bytes'})
+
+
+class Test_witness(SelfstampCase):
+    """Item 1: witness by file drop. Box A exports its manifests (and its
+    anchored proofs) to an outbox; box B finds them in an inbox, stamps
+    each through its own lane, and folds each file's hash into its own
+    chain. How the files travel is the operator's business."""
+
+    def setUp(self):
+        super().setUp()
+        self.outbox = self.root / 'outbox'
+        self.inbox = self.root / 'inbox'
+        self.inbox.mkdir()
+        self.cfg['outbox'] = str(self.outbox)
+        self.witness_state = self.root / 'witness'
+        (self.root / 'wbooks').mkdir()
+        (self.root / 'wbooks' / 'receipts.jsonl').write_text('{"txid": "cc", "records": 1}\n')
+        self.wcfg = {
+            'state_dir': str(self.witness_state),
+            'calendar_url': self.calendar.url,
+            'host': 'witnessbox',
+            'books': {'receipts': str(self.root / 'wbooks' / 'receipts.jsonl')},
+            'journal': False,
+            'fork_head': None,
+            'inbox': str(self.inbox),
+        }
+        self.wlog = []
+
+    def run_witness(self, period):
+        return selfstamp.run(self.wcfg, period=period, log=self.wlog.append)
+
+    def a_dir(self):
+        return self.state / 'manifests'
+
+    def b_dir(self):
+        return self.witness_state / 'manifests'
+
+    def witnessed(self):
+        return sorted(p.name for p in (self.witness_state / 'witnessed').glob('*') if p.is_file())
+
+    def deliver(self):
+        """The operator's business, played here by a copy."""
+        for p in self.outbox.iterdir():
+            shutil.copy2(p, self.inbox / p.name)
+
+    def export_anchored(self):
+        """A's genesis manifest exported with its anchored proof; the fake
+        then goes back to answering pending, so the witness's own stamps
+        start pending like any fresh submission."""
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        self.calendar.mined_height = 965500
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        self.calendar.mined_height = None
+
+    def test_outbox_receives_manifests_and_anchored_proofs_only(self):
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        self.assertEqual(sorted(p.name for p in self.outbox.iterdir()), ['testbox-2026-09-01.json'])
+        self.assertEqual((self.outbox / 'testbox-2026-09-01.json').read_bytes(),
+                         (self.a_dir() / '2026-09-01.json').read_bytes())
+        self.calendar.mined_height = 965500
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        self.assertEqual(sorted(p.name for p in self.outbox.iterdir()),
+                         ['testbox-2026-09-01.json', 'testbox-2026-09-01.json.ots'])
+        exported = (self.outbox / 'testbox-2026-09-01.json.ots').read_bytes()
+        self.assertEqual(exported, (self.a_dir() / '2026-09-01.json.ots').read_bytes())
+        self.assertEqual(selfstamp.parse_ots(exported).attestation, ('bitcoin', 965500))
+        before = {p.name: p.stat().st_mtime_ns for p in self.outbox.iterdir()}
+        self.assertEqual(self.run_tool(P1), 0, self.log)
+        self.assertEqual({p.name: p.stat().st_mtime_ns for p in self.outbox.iterdir()}, before)
+
+    def test_inbox_is_consumed_exactly_once_and_stamped_through_the_lane(self):
+        self.export_anchored()
+        self.deliver()
+        a_raw = (self.a_dir() / '2026-09-01.json').read_bytes()
+        a_sha = hashlib.sha256(a_raw).hexdigest()
+        posts = self.calendar.operator_posts
+        self.assertEqual(self.run_witness(P1), 0, self.wlog)
+        self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), [])
+        name = 'testbox-2026-09-01-%s.json' % a_sha[:12]
+        self.assertEqual(self.witnessed(), [name, name + '.foreign.ots', name + '.ots'])
+        wdir = self.witness_state / 'witnessed'
+        self.assertEqual((wdir / name).read_bytes(), a_raw)
+        own = selfstamp.parse_ots((wdir / (name + '.ots')).read_bytes())
+        self.assertEqual(own.digest, bytes.fromhex(a_sha))
+        self.assertEqual(own.attestation, ('pending', URI))
+        # Two lane posts: the witness's own manifest and the witnessed file;
+        # never the counted door.
+        self.assertEqual(self.calendar.operator_posts, posts + 2)
+        self.assertEqual(self.calendar.client_posts, 0)
+        m = json.loads((self.b_dir() / '2026-09-01.json').read_text())
+        self.assertEqual(len(m['witnessed']), 1)
+        entry = m['witnessed'][0]
+        self.assertEqual({k: entry[k] for k in ('host', 'seq', 'period', 'file', 'sha256', 'foreign_proof')}, {
+            'host': 'testbox', 'seq': 1, 'period': '2026-09-01', 'file': name,
+            'sha256': a_sha, 'foreign_proof': 'bitcoin height=965500'})
+        self.assertRegex(entry['witnessed_at'], r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+        self.assertTrue(any('witnessed host=testbox seq=1' in line for line in self.wlog), self.wlog)
+        # Consumed exactly once: a second run stamps nothing and folds nothing new.
+        self.assertEqual(self.run_witness(P1), 0, self.wlog)
+        self.assertEqual(self.calendar.operator_posts, posts + 2)
+        self.assertEqual(self.run_witness(P2), 0, self.wlog)
+        self.assertEqual(json.loads((self.b_dir() / '2026-09-02.json').read_text())['witnessed'], [])
+        self.assertEqual(self.calendar.operator_posts, posts + 3)
+
+    def test_witnessed_chain_verifies_and_names_what_it_vouches_for(self):
+        self.export_anchored()
+        self.deliver()
+        self.assertEqual(self.run_witness(P1), 0, self.wlog)
+        self.assertEqual(self.run_witness(P2), 0, self.wlog)
+        rows = []
+        self.assertTrue(selfstamp.verify_chain(self.b_dir(), log=rows.append), rows)
+        a_sha = sha256_hex(self.a_dir() / '2026-09-01.json')
+        self.assertTrue(any('vouches for host=testbox seq=1 period=2026-09-01 sha256=%s' % a_sha in r
+                            and 'copy=ok' in r and 'proof=pending' in r for r in rows), rows)
+        # The witness's proof of the foreign file anchors like any other.
+        self.calendar.mined_height = 965600
+        self.assertEqual(self.run_witness(P2), 0, self.wlog)
+        rows = []
+        self.assertTrue(selfstamp.verify_chain(self.b_dir(), log=rows.append), rows)
+        self.assertTrue(any('vouches for host=testbox seq=1' in r and 'proof=bitcoin height=965600' in r
+                            for r in rows), rows)
+
+    def test_a_tampered_foreign_manifest_is_caught(self):
+        self.export_anchored()
+        self.deliver()
+        self.assertEqual(self.run_witness(P1), 0, self.wlog)
+        # Cross-check A's chain against B's: intact first.
+        rows = []
+        self.assertTrue(selfstamp.verify_chain(self.a_dir(), witness=self.b_dir(), log=rows.append), rows)
+        self.assertTrue(any('witnessed by witnessbox' in r and '2026-09-01.json' in r for r in rows), rows)
+        # A's copy altered after the fact: the witness holds the old hash.
+        path = self.a_dir() / '2026-09-01.json'
+        raw = path.read_bytes()
+        path.write_bytes(raw.replace(b'"records": 3', b'"records": 4') if b'"records": 3' in raw
+                         else raw.replace(b'"seq": 1', b'"seq": 1 '))
+        self.assertNotEqual(path.read_bytes(), raw)
+        rows = []
+        self.assertFalse(selfstamp.verify_chain(self.a_dir(), witness=self.b_dir(), log=rows.append), rows)
+        self.assertTrue(any('2026-09-01.json' in r and 'different hash' in r for r in rows), rows)
+        path.write_bytes(raw)
+        self.assertTrue(selfstamp.verify_chain(self.a_dir(), witness=self.b_dir(), log=rows.append))
+        # B's own copy altered: B's chain no longer verifies.
+        wdir = self.witness_state / 'witnessed'
+        copy = next(p for p in wdir.glob('testbox-*.json'))
+        copy.write_bytes(copy.read_bytes() + b'\n')
+        rows = []
+        self.assertFalse(selfstamp.verify_chain(self.b_dir(), log=rows.append), rows)
+        self.assertTrue(any('copy=MISMATCH' in r for r in rows), rows)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(selfstamp.main(['verify', '--manifests', str(self.b_dir())]), 1)
+            self.assertEqual(selfstamp.main(['verify', '--manifests', str(self.a_dir()),
+                                             '--witness', str(self.b_dir())]), 0)
+
+    def test_duplicates_and_garbage_in_the_inbox(self):
+        self.export_anchored()
+        self.deliver()
+        self.assertEqual(self.run_witness(P1), 0, self.wlog)
+        copies = self.witnessed()
+        self.deliver()                                   # the same files again
+        (self.inbox / 'garbage.json').write_text('not a manifest\n')
+        (self.inbox / 'other.json').write_text(json.dumps({'schema': 'selfstamp/2', 'host': 'x'}) + '\n')
+        posts = self.calendar.operator_posts
+        self.assertEqual(self.run_witness(P2), 0, self.wlog)
+        self.assertEqual(self.witnessed(), copies)
+        self.assertEqual(self.calendar.operator_posts, posts + 1)   # B's own manifest only
+        self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), ['rejected'])
+        self.assertEqual(sorted(p.name for p in (self.inbox / 'rejected').iterdir()),
+                         ['garbage.json', 'other.json'])
+        self.assertEqual(json.loads((self.b_dir() / '2026-09-02.json').read_text())['witnessed'], [])
+        self.assertTrue(any('inbox duplicate' in line for line in self.wlog), self.wlog)
+        self.assertTrue(any('inbox rejected' in line and 'garbage.json' in line for line in self.wlog), self.wlog)
 
 
 if __name__ == "__main__":
