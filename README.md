@@ -717,8 +717,8 @@ the Bitcoin one and notes the other.
 ## The appliance shape
 
 One box, six parts, two repos. bitcoind runs on the host; the calendar
-runs in Docker (the py-leveldb dependency pins it to Python 3.11, so the
-image carries its own interpreter); the client adapter, the self-stamper,
+runs in Docker (its LevelDB binding is a native build, so the image
+carries its own interpreter, Python 3.13); the client adapter, the self-stamper,
 the watcher and the headers export are stdlib Python and run on whatever
 Python the host has. Nothing listens off-box: the calendar is published
 on loopback 14788, the adapter's door is wherever `LISTEN_ADDR` says, and
@@ -956,8 +956,8 @@ loopback calendar, which is where the adapter upgrades it. Should a
 reorg ever take a receipted anchor off the chain, the calendar says so
 within the hour and the watcher alarms ("Deep-reorg detector").
 
-Dependencies on the box, in full: the otsd image (`python:3.11-slim` by
-digest; `opentimestamps`, `leveldb`, `python-bitcoinlib 0.11.2`), Bitcoin
+Dependencies on the box, in full: the otsd image (`python:3.13-slim` by
+digest; `opentimestamps`, `plyvel`, `python-bitcoinlib 0.11.2`), Bitcoin
 Core, Docker, and the host's Python for three stdlib tools. Nothing else.
 
 ## Unit tests
@@ -993,13 +993,16 @@ Test modules live under `otsserver/tests/`:
   stdlib fakes: no bitcoind, no network.
 
 No test module needs a running Bitcoin node. Every module does need the
-full dependency set installed, and one dependency — `leveldb` — is a native
-build: `otsserver/calendar.py` imports it at module level, so without it every
+full dependency set installed, and one dependency — `plyvel`, the LevelDB
+binding — is a native build against the system LevelDB library:
+`otsserver/calendar.py` imports it at module level, so without it every
 module fails at collection with `ModuleNotFoundError`.
 
 Run the suite in the deployment-matched environment — the otsd image (base
-`python:3.11-slim` plus `build-essential libleveldb-dev` and
-`pip install -r requirements.txt`) — or in a Python ≤ 3.11 venv:
+`python:3.13-slim` plus `build-essential libleveldb-dev` and
+`pip install -r requirements.txt`) — or in a venv on any current Python
+with the LevelDB headers installed (`libleveldb-dev` on Debian,
+`leveldb` from Homebrew on macOS):
 
 ```
 python -m unittest discover -v                       # Ran 151 tests ... OK
@@ -1008,7 +1011,18 @@ python -m unittest discover -v                       # Ran 151 tests ... OK
 The otsd image has no pytest; where pytest is installed,
 `python -m pytest otsserver/tests -q` runs the identical set.
 
-Known limit: py-leveldb does not build on Python 3.12+ (`pip install -r
-requirements.txt` fails on the `leveldb` wheel, so nothing is importable and
-no test can run). Other platforms and Python versions have not been tried;
-treat any claim about them as unverified until you run the command above.
+The binding moved from py-leveldb to plyvel on 2026-09-14 (the same switch
+as upstream's open PR #111): py-leveldb's last release, 0.201, bundles
+LevelDB 1.19 statically and does not compile past Python 3.11, whose
+security support ends in October 2027. plyvel links the system LevelDB
+(1.23 in the image) and the on-disk format is LevelDB's either way, so a
+calendar written by the old binding opens under the new one with no
+migration. Proved by a restore drill before the switch: a calendar written
+by the deployed binding (the reference deployment's first anchored
+commitment plus 30,000 synthetic timestamps, four table files) was
+archived, restored, opened by the new image on Python 3.13, served
+byte-identically, read back in full, and its proof verified against
+Bitcoin with `ops/verify_claim.py`. Image size on arm64: 706 MB before,
+743 MB after (the base image's growth). Other platforms and Python
+versions have not been tried; treat any claim about them as unverified
+until you run the command above.

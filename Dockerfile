@@ -8,8 +8,11 @@
 # build context instead; that is the only difference. Keep the two in step:
 # the base image digest, the python-bitcoinlib pin, the CMD.
 #
-# Known-good resolved versions: opentimestamps 0.4.5, python-bitcoinlib 0.11.2.
-FROM python:3.11-slim@sha256:b27df5841f3355e9473f9a516d38a6783b6c8dfeacaf2d14a240f443b368ddb6
+# Known-good resolved versions: opentimestamps 0.4.5, plyvel 1.5.1 (built
+# from source against Debian 13's libleveldb 1.23), python-bitcoinlib 0.11.2.
+# python:3.13-slim (2026-09-14): the 3.11 pin went with py-leveldb; plyvel
+# reads the same LevelDB files, no calendar migration.
+FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
 
 RUN apt-get update -qq && apt-get install -y -qq build-essential libleveldb-dev \
     && rm -rf /var/lib/apt/lists/*
