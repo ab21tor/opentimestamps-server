@@ -19,7 +19,6 @@ import threading
 
 import bitcoin
 import bitcoin.core
-from bitcoin.wallet import CBitcoinAddress
 
 import otsserver.calendar
 import otsserver.rpc
@@ -42,13 +41,6 @@ parser.add_argument("--rpc-port", type=int,
 parser.add_argument("--rpc-address", type=str,
                     default='localhost',
                     help="RPC address (default: %(default)s)")
-
-parser.add_argument("--lightning-invoice-file", type=str,
-                    help="file containing a lightning invoice without amount for donations")
-
-parser.add_argument("--explorer-url", type=str,
-                    default='https://mempool.space',
-                    help="block explorer URL to use in the status page")
 
 parser.add_argument("--max-pending", type=int,
                     default=100000,
@@ -118,10 +110,6 @@ exit_event = threading.Event()
 
 calendar_path = os.path.expanduser(args.calendar_path)
 
-with open(calendar_path + '/donation_addr', "r") as fd:
-    donation_address = fd.read().rstrip()
-    donation_address = CBitcoinAddress(donation_address)
-
 calendar = otsserver.calendar.Calendar(calendar_path)
 aggregator = otsserver.calendar.Aggregator(calendar, exit_event)
 
@@ -137,10 +125,7 @@ calendar.stamper = stamper
 
 server = otsserver.rpc.StampServer((args.rpc_address, args.rpc_port),
                                    aggregator,
-                                   calendar,
-                                   args.lightning_invoice_file,
-                                   donation_address,
-                                   args.explorer_url)
+                                   calendar)
 
 try:
     server.serve_forever()

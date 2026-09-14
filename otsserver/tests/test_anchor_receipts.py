@@ -52,7 +52,7 @@ def make_stamper(receipts_path):
     """A Stamper with just the state the confirmation-save path touches
 
     Stamper.__init__ starts the stamping thread, so skip it and set the
-    fields directly, as test_rpc_homepage does with SimpleNamespace.
+    fields directly, as test_rpc_status does with SimpleNamespace.
     """
     stamper = Stamper.__new__(Stamper)
     stamper.calendar = mock.Mock()

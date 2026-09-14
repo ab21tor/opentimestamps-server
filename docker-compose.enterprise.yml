@@ -8,8 +8,8 @@
 # Needs beside it: .env (BITCOIN_RPC_SERVICE_URL, and optionally
 # ANCHOR_INTERVAL_SECONDS, OTSD_CALENDAR_DIR — see .env.enterprise.example),
 # a synced bitcoind on this host whose RPC binds the docker0 address and
-# allows the subnet pinned below, and the three calendar identity files
-# (README, "The appliance shape", step 3). Receipts land in ./receipts on
+# allows the subnet pinned below, and the two calendar identity files
+# (README, "The appliance shape", step 2). Receipts land in ./receipts on
 # the host (gitignored): the box's logbook, read by the watcher and hashed
 # daily by selfstamp.
 #

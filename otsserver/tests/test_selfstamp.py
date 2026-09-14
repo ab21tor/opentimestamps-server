@@ -136,12 +136,12 @@ class FakeCalendar:
 
             def do_GET(self):
                 if self.path == '/':
-                    # The homepage as JSON (rpc.py do_GET with Accept:
-                    # application/json): balance rendered with commas, as
-                    # str_sat does. The one status the float reader uses.
+                    # The status line (rpc.py get_status). The real one
+                    # sends balance as an int; the old page rendered it with
+                    # commas, and the float reader still accepts both.
                     cal.status_gets += 1
                     if cal.balance_sats is None:
-                        return self._reply(500, b'homepage failed', 'text/plain')
+                        return self._reply(500, b'status failed', 'text/plain')
                     body = json.dumps({'best_block': '00' * 32, 'anchor_receipts': 'on',
                                        'balance': '{:,}'.format(cal.balance_sats),
                                        'pending_commitments': '3', 'most_recent_tx': 'None'})

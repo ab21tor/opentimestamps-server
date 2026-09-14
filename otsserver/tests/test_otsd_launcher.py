@@ -16,7 +16,7 @@ elsewhere — a stray dotdir in whatever $HOME the daemon ran under. The mkdir m
 default calendar path is actually in use.
 
 Driven via subprocess: otsd is a script, and both runs exit early at
-calendar-identity loading (donation_addr missing) — which is AFTER the
+calendar-identity loading (the calendar's uri missing) — which is AFTER the
 mkdir — so the dotdir's presence is fully decided by exit time either way.
 """
 

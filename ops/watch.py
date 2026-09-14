@@ -56,8 +56,10 @@ DEFAULTS = {
     "HEALTH_URL": "http://127.0.0.1:8000/health",
     # Appliance shape: the calendar's JSON status on loopback. Empty = skipped.
     # The check fails when the calendar does not answer, is Bitcoin-blind (no
-    # best_block), is not writing receipts, or its confirmed anchor-wallet
-    # balance is below CAL_MIN_SATS (the gateway's float alarm: five fee caps).
+    # best_block), reports an anchor needing attention (its deep-reorg
+    # detector: a receipted anchor left the chain), is not writing receipts,
+    # or its confirmed anchor-wallet balance is below CAL_MIN_SATS (the
+    # gateway's float alarm: five fee caps).
     "CALENDAR_URL": "", "CAL_MIN_SATS": "100000",
     "CONTAINERS": "gateway-gateway-1,gateway-otsd-1,gateway-tor-1",
     "UNITS_SYSTEM": "kiosk.service,bitcoind.service,docker.service,nftables.service",
@@ -309,6 +311,8 @@ def evaluate(o, cfg):
         c["calendar"] = (False, "no answer from the calendar")
     elif not isinstance(cal, dict) or not cal.get("best_block"):
         c["calendar"] = (False, "calendar is Bitcoin-blind")
+    elif cal.get("needs_attention"):
+        c["calendar"] = (False, "calendar needs attention: " + "; ".join(str(f) for f in cal["needs_attention"]))
     elif cal.get("anchor_receipts") != "on":
         c["calendar"] = (False, "calendar anchor receipts %s" % cal.get("anchor_receipts"))
     else:

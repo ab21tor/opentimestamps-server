@@ -343,7 +343,52 @@ class Calendar:
             logging.error('HMAC secret key not set; %r does not exist' % hmac_key_path)
             sys.exit(1)
 
+        # The stamper, set by otsd once both exist: its view of the chain is
+        # where the not-before bound below comes from.
+        self.stamper = None
+
+    # Warn once while submissions go out without a not-before bound (no
+    # block known yet: startup, or bitcoind unreachable); INFO once when
+    # the bound returns.
+    not_before_missing_warned = False
+
+    def best_block_hash(self):
+        """The newest block the stamper has seen, in display byte order
+
+        None until the stamper has seen a block. Display order (the hex an
+        explorer shows, as bytes) so the operand in a proof can be pasted
+        into any block explorer as it stands.
+        """
+        stamper = self.stamper
+        if stamper is None:
+            return None
+        try:
+            block_hash = stamper.known_blocks.best_block_hash()
+        except Exception:
+            return None
+        return block_hash[::-1] if block_hash else None
+
     def submit(self, submitted_commitment, records=None):
+        # Not-before bound: append the hash of the newest block the stamper
+        # has seen, then sha256, right before the time prefix. A block hash
+        # cannot be known before its block exists, so a commitment carrying
+        # it provably formed after that block; the anchor's attestation
+        # already says before which block. The sha256 keeps the journal
+        # entry at its 44 bytes: the bound rides inside the commitment path
+        # exactly as the per-submission nonce does, and every verifier that
+        # follows append/sha256/prepend ops follows it unchanged. No block
+        # known: no bound rather than a fabricated one, warned once.
+        block_hash = self.best_block_hash()
+        if block_hash is not None:
+            submitted_commitment = submitted_commitment.ops.add(OpAppend(block_hash)).ops.add(OpSHA256())
+            if self.not_before_missing_warned:
+                self.not_before_missing_warned = False
+                logging.info("not-before bound restored: commitments carry block %s" % b2lx(block_hash[::-1]))
+        elif not self.not_before_missing_warned:
+            self.not_before_missing_warned = True
+            logging.warning("no block known yet: commitments go out without a not-before bound "
+                            "until the stamper sees one")
+
         idx = int(time.time())
 
         serialized_idx = struct.pack('>L', idx)
@@ -415,8 +460,8 @@ class Aggregator:
                 # A round that did not commit (a full disk failing the
                 # journal fsync was the reproduction) must not leave the
                 # thread dead behind a live HTTP server: every later
-                # submit() would wait forever and the homepage would still
-                # say the calendar is fine. Say so, wake the waiters with a
+                # submit() would wait forever and the status would still
+                # show a live chain. Say so, wake the waiters with a
                 # refusal, and stop the process so the supervisor restarts
                 # it. Nothing is lost that was not lost already: the round's
                 # digests were never written, and their clients get a 503.

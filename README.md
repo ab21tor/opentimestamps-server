@@ -41,7 +41,6 @@ Create the calendar:
 ```
 mkdir -p ~/.otsd/calendar/
 echo "http://127.0.0.1:14788" > ~/.otsd/calendar/uri
-echo "bitcoin donation address" > ~/.otsd/calendar/donation_addr
 dd if=/dev/random of=~/.otsd/calendar/hmac-key bs=32 count=1
 ```
 
@@ -49,10 +48,6 @@ The URI determines what is put into the URI field of pending attestations
 returned by this calendar server. For a server used for testing, the above is
 fine; for production usage the URI should be set to a stable URL that
 OpenTimestamps clients will be able to access indefinitely.
-
-The donation address needs to be a valid Bitcoin address for the type of
-network (mainnet, testnet, regtest) you're running otsd on. It's displayed on
-the calendar info page.
 
 The HMAC key should be kept secret. It's meant to allow for last-ditch calendar
 recovery from untrusted sources, although only part of the functionality is
@@ -92,10 +87,33 @@ bitcoin-cli -generate 10
 
 By default `otsd` binds to localhost; `otsd` is not designed to be exposed
 directly to the public. Never expose the calendar's HTTP port publicly: the
-homepage discloses the anchor wallet's balance and address, the pending
-queue, and the complete anchor transaction history to anyone who can reach
-it. Serve clients through the gateway; if the calendar itself must be
-reachable, put an authenticating reverse proxy in front.
+status line (`GET /`, one JSON line) discloses the anchor wallet's balance,
+the size of the pending queue and the in-flight anchor's txid to anyone
+who can reach it. Serve clients through the gateway; if the calendar itself
+must be reachable, put an authenticating reverse proxy in front.
+
+## The status line
+
+`GET /` answers one JSON line, whatever `Accept` says; upstream's donation
+homepage, with its QR codes, Lightning invoice and transaction table (and
+the `qrcode`, `pystache`, `image` and `simplejson` packages it needed), is
+gone (2026-09-14). The fields are an interface: the watcher, the
+self-stamp's float reader and the gateway's `/health` read them.
+
+- `best_block`, `block_height` — the node's tip as the calendar sees it;
+  `null` when the Bitcoin RPC path is down (logged). This is the one
+  external proof that the calendar can see Bitcoin.
+- `balance` — the anchor wallet's confirmed sats, an integer; `null` with
+  the RPC path down.
+- `anchor_receipts` — `"on"` or `"off"` ("Anchor receipts" below).
+- `needs_attention` — the deep-reorg detector's findings, a list of
+  strings, empty when every checked anchor is where its receipt says
+  ("Deep-reorg detector" below).
+- `pending_commitments`, `txs_waiting_for_confirmation`, `most_recent_tx`,
+  `prior_versions`, `tip`, `version` — the queue and the anchor in flight.
+
+The line is built in full before the response is committed, so a failure
+is a status that says so, never an empty 200.
 
 ## Anchor receipts
 
@@ -189,9 +207,10 @@ Two guarantees:
 Turning the feature off again is loud. If `OTSD_ANCHOR_RECEIPTS` is unset
 while the sidecar already exists, the stamper warns at startup that
 receipts were on before and are off now — the calendar is anchoring for
-free — and the status page's `Anchor receipts: on|off` line says which.
-The gateway's `/health` reads that line and reports `billing:
-receipts_off` while its own billing is on.
+free — and the status line's `anchor_receipts` field says which. The
+watcher reads it; the gateway's `/health` reports `billing: receipts_off`
+from the same fact while its own billing is on (its probe read the old
+page's marker and moves to this field with the gateway's next change).
 
 ## Anchor cadence
 
@@ -214,6 +233,60 @@ wallet's confirmed outputs on the next pass; the pending commitments are
 untouched and anchor once, so nothing is lost and nothing is billed
 twice. A fee cap that blocks the next transaction is likewise logged once
 on entry and once on recovery, not once per loop second.
+
+## Not-before bound
+
+Every commitment the calendar issues carries, beside its time prefix, the
+hash of the newest Bitcoin block the stamper had seen when the submission
+was aggregated: `Calendar.submit` appends the 32-byte hash (in the byte
+order an explorer shows) and applies a sha256, then prepends the time as
+before. A block hash cannot be known before its block exists, so a proof
+that carries block M's hash and is anchored in block N says: this
+commitment formed after block M and before block N — contemporaneity in
+both directions, where the anchor alone gave only "before". `ots info`
+shows the bound as an `append <block hash>` followed by `sha256`, two
+ops before the `prepend` of the time prefix; the public `ots` client, the
+opentimestamps library and the stdlib parser in `ops/selfstamp.py` (shared
+with the client adapter) follow it as they follow any op, and verify
+unchanged. The sha256 keeps the journal entry at its 44 bytes, so the
+journal format, the stamper's pipeline and existing calendars are
+untouched: older entries simply lack the bound.
+
+What it does not prove: the time of capture. The bound is the stamper's
+view of the chain at aggregation, which lags the network by the stamper's
+one-second poll and any RPC latency, and says nothing about when the
+record was made or received — only that the commitment did not exist
+before block M. A commitment aggregated while no block is known (startup,
+or bitcoind unreachable) goes out without a bound rather than with an
+invented one; the calendar warns once and says when the bound returns.
+
+## Deep-reorg detector
+
+A receipted anchor had `--btc-min-confirmations` blocks on top of it when
+its receipt was written, and the calendar saved proofs naming that block.
+A reorg deeper than that takes the block away; until 2026-09-14 the saved
+proofs went stale and nothing noticed. Now, on its first pass and every
+hour after, the stamper asks the wallet (`gettransaction`) about the last
+hundred receipted txids. A confirmation count at or below zero means the
+anchor left the chain — Bitcoin Core reports a conflicted transaction as a
+negative count and one back in the mempool as zero. A `blockheight` other
+than the receipted one means it was mined again elsewhere. Either finding
+is logged at ERROR on every check while it stands, lands in the status
+line's `needs_attention` (the watcher's `calendar` check alarms on it), and
+is never acted on: nothing is re-anchored automatically; the operator
+decides what those proofs are worth and whether to resubmit the records.
+A finding stands until the process restarts — a later re-mine does not
+repair proofs that name the old block.
+
+Limits, stated plainly. The detector reads the receipts file, so it
+runs only with anchor receipts on (both shapes have them on). It knows
+the receipted height, not the block hash, so an anchor re-mined at the
+same height after a restart passes unseen; the proofs still fail
+verification, and re-verifying anchored proofs against Bitcoin remains
+the check of last resort. A txid the wallet does not know (a rebuilt
+wallet) or an RPC failure is warned about, not counted as a finding.
+Reorgs deeper than six blocks are historically extraordinary; this makes
+one visible within an hour instead of never.
 
 ## Restart checkpoint (journal.known-good)
 
@@ -391,9 +464,8 @@ genesis without one, or a later manifest with one, as a break.
 ### The float in the manifest
 
 Each manifest records the anchor wallet's confirmed balance, read from the
-calendar's own JSON status page on loopback (`GET /` with `Accept:
-application/json`) — the same page the watcher reads — so no RPC
-credential is needed. `float.low` is `true` below `float_low_sats`
+calendar's own status line on loopback (`GET /`) — the same line the
+watcher reads — so no RPC credential is needed. `float.low` is `true` below `float_low_sats`
 (default 100,000 sats: five fee caps at the shipped 20,000-sat cap, the
 same figure as the gateway's float alarm and the watcher's
 `CAL_MIN_SATS`; keep the two equal). A witness, or anyone holding the
@@ -665,29 +737,28 @@ cp .env.enterprise.example .env && chmod 600 .env
 #       ANCHOR_INTERVAL_SECONDS (optional: the coverage tier, default 21600)
 ```
 
-First run only, the calendar's identity — three files otsd refuses to
+First run only, the calendar's identity — two files otsd refuses to
 start without. The `uri` is written into every pending attestation the
 calendar issues and is permanent; on the appliance it is the loopback
 address the adapter and the tools use, `http://127.0.0.1:14788/` (it need
 not resolve off-box: upgrades go through the adapter, or through
-`ots upgrade -c http://127.0.0.1:14788` on the box). The `donation_addr`
-is a fresh address of the anchor wallet, so the "donation" address on the
-status page is the refill address:
+`ots upgrade -c http://127.0.0.1:14788` on the box). The refill address
+is any address of the anchor wallet (step 1's `getnewaddress`):
 
 ```bash
 docker compose -f docker-compose.enterprise.yml run --rm otsd sh -c \
   'echo "http://127.0.0.1:14788/" > /calendar/uri \
-   && head -c 32 /dev/urandom > /calendar/hmac-key \
-   && echo "<a bech32 address from step 1>" > /calendar/donation_addr'
+   && head -c 32 /dev/urandom > /calendar/hmac-key'
 docker compose -f docker-compose.enterprise.yml up -d --build   # first run; plain `up -d` after a pull
 docker compose -f docker-compose.enterprise.yml logs otsd       # expect: journal opened, no RPC errors
-curl -s -H 'Accept: application/json' http://127.0.0.1:14788/ | python3 -m json.tool
+curl -s http://127.0.0.1:14788/ | python3 -m json.tool
 ```
 
-The JSON status must show `best_block` (the calendar can see Bitcoin),
-`anchor_receipts: "on"`, and the wallet `balance`. `receipts/` is created
-on the first confirmed anchor; it is gitignored, host-readable, and the
-box's logbook: one line per anchor, `records` per line.
+The status line must show `best_block` (the calendar can see Bitcoin),
+`anchor_receipts: "on"`, the wallet `balance`, and `needs_attention: []`.
+`receipts/` is created on the first confirmed anchor; it is gitignored,
+host-readable, and the box's logbook: one line per anchor, `records` per
+line.
 
 ### 3. The client adapter
 
@@ -741,8 +812,9 @@ WATCH_DIR=~/watcher python3 -B ops/watch.py --dry                   # every chec
 ```
 
 The appliance runs fifteen checks (the six whose knobs are empty neither
-fail nor count): the calendar's status — reachable, Bitcoin-visible,
-receipts on, wallet above `CAL_MIN_SATS` — the containers and units, disk,
+fail nor count): the calendar's status — reachable, Bitcoin-visible, no
+anchor needing attention, receipts on, wallet above `CAL_MIN_SATS` — the
+containers and units, disk,
 temperature, memory, the adapter's heartbeat and breaker, journal errors,
 ssh failures and unexpected logins, the age of the last confirmed anchor,
 pending reboots, refused outbound packets, bitcoind's peers. One line a
@@ -751,45 +823,50 @@ day is the heartbeat; alerts go out on transitions only.
 ### What the box then is
 
 Its health is three plain readings, no listener added for them: the
-calendar's JSON on loopback, the adapter's `heartbeat` file, the receipts
-file. When the anchor wallet runs dry the calendar keeps accepting and
+calendar's status line on loopback, the adapter's `heartbeat` file, the
+receipts file. When the anchor wallet runs dry the calendar keeps accepting and
 anchoring waits (one warning in its log; the watcher's `calendar` check
 alarms first, at five fee caps); the adapter's intake never stops and
 debts are never dropped. Refill is an on-chain payment to the wallet.
 
 An anchored proof verifies with the public client against the box's own
 node — `ots verify` — or anywhere else with a Bitcoin view; nothing in it
-names a service that must stay alive. A pending proof names the box's own
-loopback calendar, which is where the adapter upgrades it.
+names a service that must stay alive, and it carries the not-before bound
+("after block M, before block N"). A pending proof names the box's own
+loopback calendar, which is where the adapter upgrades it. Should a
+reorg ever take a receipted anchor off the chain, the calendar says so
+within the hour and the watcher alarms ("Deep-reorg detector").
 
 Dependencies on the box, in full: the otsd image (`python:3.11-slim` by
-digest; `opentimestamps`, `leveldb`, `pystache`, `qrcode`, `image`,
-`simplejson`, `python-bitcoinlib 0.11.2`), Bitcoin Core, Docker, and the
-host's Python for three stdlib tools. Nothing else.
+digest; `opentimestamps`, `leveldb`, `python-bitcoinlib 0.11.2`), Bitcoin
+Core, Docker, and the host's Python for three stdlib tools. Nothing else.
 
 ## Unit tests
 
 Test modules live under `otsserver/tests/`:
 
 - `test_calendar.py` — inherited from upstream.
-- `test_otsd_launcher.py`, `test_rpc_homepage.py`, `test_stamper_loop.py`,
+- `test_otsd_launcher.py`, `test_rpc_status.py`, `test_stamper_loop.py`,
   `test_anchor_receipts.py`, `test_receipt_marker.py`, `test_aggregator_failure.py`, `test_stamper_cadence.py`,
   `test_rpc_digest.py`, `test_anchor_records.py`,
   `test_aggregator_dedupe.py`, `test_stamper_read_errors.py`,
   `test_stamper_checkpoint.py`, `test_stamper_wallet_empty.py`,
   `test_operator_lane.py`, `test_selfstamp.py`,
   `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py`,
-  `test_watch.py` — regression
-  tests for this branch's delta (launcher flags, homepage RPC wiring and
-  the receipts status line, stamper-loop crash fixes, anchor receipts,
+  `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py` — regression
+  tests for this branch's delta (launcher flags, the status line and its
+  RPC wiring, stamper-loop crash fixes, anchor receipts,
   anchor cadence, the /digest Content-Length handling, anchor-receipt
   record counts and their close-time re-read, aggregator dedupe,
   pending-fill read-error survival, the restart checkpoint, empty-wallet
   warn-once, the operator lane and known-zero counts, the self-stamp
   tool, dead-cycle recovery, fee-cap warn-once, the receipts-off startup
-  warning, the watcher's 29 fixture scenarios and its appliance-shape
+  warning, the watcher's 30 fixture scenarios and its appliance-shape
   additions, the self-stamp's commissioning block, float, external
-  audit logs and witness by file drop). They stub everything external with `unittest.mock` or
+  audit logs and witness by file drop, the not-before bound as the
+  opentimestamps library and the stdlib parser read it, and the
+  deep-reorg detector against an in-process double of the billing
+  red-team's fake bitcoind reorg contract). They stub everything external with `unittest.mock` or
   stdlib fakes: no bitcoind, no network.
 
 No test module needs a running Bitcoin node. Every module does need the
@@ -802,7 +879,7 @@ Run the suite in the deployment-matched environment — the otsd image (base
 `pip install -r requirements.txt`) — or in a Python ≤ 3.11 venv:
 
 ```
-python -m unittest discover -v                       # Ran 113 tests ... OK
+python -m unittest discover -v                       # Ran 128 tests ... OK
 ```
 
 The otsd image has no pytest; where pytest is installed,

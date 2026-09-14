@@ -53,7 +53,7 @@ class Test_fixtures(unittest.TestCase):
     def test_every_fixture_scenario_passes(self):
         lines = []
         total, failed = watch.run_fixtures(out=lines.append)
-        self.assertGreaterEqual(total, 29)
+        self.assertGreaterEqual(total, 30)
         self.assertEqual(failed, 0, "\n".join(lines))
 
 
@@ -104,6 +104,16 @@ class Test_calendar_check(unittest.TestCase):
         self.assertEqual(self.verdict(True, dict(ok, best_block=None)), (False, "calendar is Bitcoin-blind"))
         self.assertEqual(self.verdict(True, dict(ok, anchor_receipts="off")),
                          (False, "calendar anchor receipts off"))
+        # The deep-reorg detector's finding outranks everything but reach
+        # and Bitcoin-blindness: the proofs on file name a block that no
+        # longer holds the anchor.
+        gone = "anchor 3f3f left the chain (confirmations 0, receipted at height 965866)"
+        self.assertEqual(self.verdict(True, dict(ok, needs_attention=[gone]), "20000"),
+                         (False, "calendar needs attention: " + gone))
+        self.assertEqual(self.verdict(True, dict(ok, needs_attention=[gone, "anchor 4a4a mined again"]),
+                                      "20000"),
+                         (False, "calendar needs attention: " + gone + "; anchor 4a4a mined again"))
+        self.assertEqual(self.verdict(True, dict(ok, needs_attention=[]), "20000"), (True, ""))
         self.assertEqual(self.verdict(True, ok), (False, "anchor wallet 22015 sats < 100000"))
         self.assertEqual(self.verdict(True, dict(ok, balance="lots")), (False, "calendar balance unreadable"))
 

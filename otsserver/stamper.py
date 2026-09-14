@@ -160,6 +160,10 @@ class KnownBlocks:
     def best_block_height(self):
         return self.__blocks[-1].height if self.__blocks else 0
 
+    def best_block_hash(self):
+        """The newest known block's hash (internal byte order), or None"""
+        return self.__blocks[-1].hash if self.__blocks else None
+
 
 def _get_tx_fee(tx, proxy):
     """Calculate tx fee
@@ -214,6 +218,28 @@ def _receipt_on_file(receipts_path, txid):
     except FileNotFoundError:
         pass
     return False
+
+
+def _recent_receipts(path, n):
+    """The last n receipt lines of the file at path, parsed
+
+    Unparseable lines and lines without a txid are skipped; no file is no
+    receipts.
+    """
+    try:
+        with open(path, 'rb') as fd:
+            lines = fd.readlines()
+    except FileNotFoundError:
+        return []
+    receipts = []
+    for line in lines[-n:]:
+        try:
+            receipt = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(receipt, dict) and receipt.get('txid'):
+            receipts.append(receipt)
+    return receipts
 
 
 def _append_anchor_receipt(path, receipt):
@@ -313,6 +339,16 @@ class Stamper:
     # default for the same test-double reason.
     record_counts = None
 
+    # Deep-reorg detector (check_anchors): every ANCHOR_CHECK_INTERVAL
+    # seconds the stamp loop asks the wallet about the last
+    # ANCHOR_CHECK_RECEIPTS receipted anchors. needs_attention is what the
+    # status line and the watcher read: one line per anchor whose saved
+    # proofs name a block that no longer holds it. Class-level default for
+    # the same test-double reason; the real instance owns a list.
+    ANCHOR_CHECK_INTERVAL = 3600
+    ANCHOR_CHECK_RECEIPTS = 100
+    needs_attention = ()
+
     @staticmethod
     def __create_new_timestamp_tx_template(outpoint, txout_value, change_scriptPubKey):
         """Create a new timestamp transaction template
@@ -401,6 +437,65 @@ class Stamper:
                             "be re-anchored and receipted under a new txid; nothing is owed for %s"
                             % (txid, txid))
         os.unlink(path)
+
+    def check_anchors(self, proxy=None):
+        """Deep-reorg detector: are the receipted anchors still where their receipts say?
+
+        A receipted anchor had min_confirmations when its receipt was
+        written, and the calendar saved proofs naming that block. This asks
+        the wallet (gettransaction) about the last ANCHOR_CHECK_RECEIPTS
+        receipted txids. A confirmation count at or below zero means the
+        anchor left the chain: Bitcoin Core reports a conflicted
+        transaction as a negative count and one back in the mempool as
+        zero. A blockheight other than the receipted one means it was mined
+        again elsewhere. Either way the proofs on file name a block that no
+        longer holds the anchor, so the finding is kept until the operator
+        acts: it lands in needs_attention (the status line and the watcher
+        read it), is logged at ERROR on every check while it stands, and
+        never clears itself; a later re-mine does not repair the proofs.
+        Nothing is re-anchored automatically. A txid the wallet does not
+        know (a rebuilt wallet) or an RPC failure is a warning, not a
+        finding. Runs hourly from the stamp loop and must never break it.
+        Returns the findings.
+        """
+        if not self.anchor_receipts_path:
+            return []
+        receipts = _recent_receipts(self.anchor_receipts_path, self.ANCHOR_CHECK_RECEIPTS)
+        if not receipts:
+            return []
+        findings = getattr(self, 'anchor_findings', None)
+        if findings is None:
+            findings = self.anchor_findings = {}
+        try:
+            if proxy is None:
+                proxy = make_proxy()
+            for receipt in receipts:
+                txid = receipt['txid']
+                try:
+                    r = proxy._call('gettransaction', txid)
+                    confirmations = r['confirmations']
+                    height = r.get('blockheight')
+                except Exception as exp:
+                    logging.warning("anchor check: cannot ask the wallet about anchor %s: %r" % (txid, exp))
+                    continue
+                if not isinstance(confirmations, int):
+                    logging.warning("anchor check: no confirmation count for anchor %s: %r" % (txid, r))
+                    continue
+                if confirmations <= 0:
+                    findings[txid] = ("anchor %s left the chain (confirmations %d, receipted at height %s)"
+                                      % (txid, confirmations, receipt.get('confirmed_height')))
+                elif isinstance(height, int) and height != receipt.get('confirmed_height'):
+                    findings[txid] = ("anchor %s mined again at height %d, receipted at height %s"
+                                      % (txid, height, receipt.get('confirmed_height')))
+        except Exception as exp:
+            logging.warning("anchor check failed: %r; next check in %ds" % (exp, self.ANCHOR_CHECK_INTERVAL))
+
+        self.needs_attention = list(findings.values())
+        if findings:
+            logging.error("NEEDS ATTENTION: %d receipted anchor(s) no longer where the proofs say; "
+                          "nothing is re-anchored automatically: %s"
+                          % (len(findings), "; ".join(findings.values())))
+        return self.needs_attention
 
     def __save_confirmed_timestamp_tx(self, confirmed_tx):
         """Save a fully confirmed timestamp to disk, then receipt it
@@ -881,6 +976,9 @@ class Stamper:
 
             try:
                 self.__do_bitcoin()
+                if time.time() >= self.next_anchor_check:
+                    self.next_anchor_check = time.time() + self.ANCHOR_CHECK_INTERVAL
+                    self.check_anchors()
             except bitcoin.rpc.InWarmupError as warmuperr:
                 logging.info("Bitcoincore is warming up: %r" % warmuperr)
                 time.sleep(5)
@@ -976,6 +1074,12 @@ class Stamper:
         # restart fire a broadcast within seconds.
         self.next_timestamp_tx = time.time() + (self.min_tx_interval * random.uniform(1, 2))
         self.journal_cursor = None
+
+        # The deep-reorg detector: first check on the first pass, then
+        # hourly; findings by txid, kept until the operator acts.
+        self.next_anchor_check = 0
+        self.anchor_findings = {}
+        self.needs_attention = []
 
         self.thread = threading.Thread(target=self.__loop)
         self.thread.start()
