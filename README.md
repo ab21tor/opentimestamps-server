@@ -608,15 +608,121 @@ record-count sidecar. The unit tests drive the tool against a stdlib fake
 of the calendar protocol and cross-check the proof bytes with the
 opentimestamps library.
 
+## The claim kit
+
+One folder per exhibit, verified by an opposing expert with `python3` and
+nothing else: no network, no package to install, no account, no service
+of ours that has to answer. The folder holds the exhibit, its proof
+(`<exhibit>.ots`), `headers.bin` (every Bitcoin block header the box's own
+node holds, 80 bytes each from genesis, about 77 MB, exported daily) and
+`verify_claim.py` (this tree's `ops/verify_claim.py`, standard library
+only, ~450 lines the expert can read).
+
+What the expert runs:
+
+```bash
+sha256sum EXHIBIT                                   # the digest the proof must be about
+python3 verify_claim.py EXHIBIT EXHIBIT.ots headers.bin
+python3 verify_claim.py EXHIBIT EXHIBIT.ots headers.bin --checkpoint 959450:00000000000000000001b119c6848c6db6e8cbc2ce908d73891581a1345c984c
+```
+
+The verifier prints every step and exits 0 only if all of them hold:
+
+1. the exhibit's sha256 is the digest the proof is about;
+2. every operation in the proof is replayed from that digest: the
+   aggregator's nonce, the calendar's commitment (the not-before bound
+   and the calendar's clock are named as such), the anchor transaction
+   (its txid is printed), the block's merkle path, to the merkle root the
+   Bitcoin attestation names;
+3. the block at the attested height, read from `headers.bin`, carries
+   exactly that merkle root, and its own timestamp is printed;
+4. `headers.bin` is one chain: every header links to the previous one's
+   hash, meets the proof-of-work target its own bits field encodes, and
+   keeps the difficulty rule (bits unchanged between retargets; at every
+   retarget, Bitcoin's adjustment recomputed from the period's
+   timestamps), from the genesis block, whose hash is hardcoded, or from
+   a checkpoint.
+
+Then a `TRUST` block states what the verdict rests on. Verified from
+genesis, that is proof of work alone: nothing about the file's origin is
+assumed. Verified from a checkpoint (`--checkpoint HEIGHT:HASH`, which
+saves the expert the full chain), the checkpoint is the one thing the
+tool cannot check, so it prints it for comparison with any public source;
+a file that does not start at genesis and is given no checkpoint is
+verified from its first header, which the tool names as an UNSTATED
+CHECKPOINT and tells the expert to compare. A checkpoint that does not
+match the file is reported as `CHECKPOINT MISMATCH` with both hashes,
+never hidden. The headers file's origin (the box's node, via
+`ops/export_headers.py`) is not evidence and the tool says so; the chain
+check is.
+
+What the verdict proves: the exhibit's bytes existed before the attested
+block was mined, and, when the proof carries a not-before bound, after
+the bound's block (the tool finds that block in the chain and says so:
+"after block M, before block N"). What it does not prove: when the
+exhibit was made, captured or received, and nothing about its truth. The
+block timestamps printed are the miners' clocks, accurate to a couple of
+hours by consensus rule; the calendar's own clock in the proof is
+labelled "not evidence".
+
+Building a kit, on the box (the operator's side):
+
+```bash
+mkdir -p ~/claim-kit && cp ops/systemd/headers.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now headers.timer
+python3 ops/export_headers.py --env ~/opentimestamps-server/.env --rpc-host 127.0.0.1 --out ~/claim-kit/headers.bin   # first run: the whole chain, minutes
+mkdir ~/claim-kit/<exhibit-name> && cp EXHIBIT EXHIBIT.ots ~/claim-kit/headers.bin ops/verify_claim.py ~/claim-kit/<exhibit-name>/
+python3 ~/claim-kit/<exhibit-name>/verify_claim.py EXHIBIT EXHIBIT.ots headers.bin      # the same run the expert will make
+```
+
+`ops/export_headers.py` uses the calendar's own node access
+(`BITCOIN_RPC_SERVICE_URL` from the compose `.env`, on loopback; the
+three RPCs it needs are in the whitelist of step 1) and appends what the
+node has beyond the file. Before anything is written each new header must
+link to the last one on file and meet its proof-of-work target; a header
+that fails is refused and the run exits 1 with the file untouched. A tail
+the node no longer agrees with (a reorg) is cut back to the last common
+header and re-exported, logged. The timer runs it daily at 01:00 UTC into
+`~/claim-kit/export.log`. Which chain the file is, the exporter does not
+judge: the verifier's genesis check and the expert's checkpoint do.
+
+The worked example is the notary's own diary: a selfstamp manifest
+("Operator lane and self-stamp" above) is an exhibit like any other, and
+its proof is beside it.
+
+```bash
+D=~/claim-kit/diary-2026-09-07 && mkdir -p $D
+cp ~/selfstamp/manifests/2026-09-07.json ~/selfstamp/manifests/2026-09-07.json.ots ~/claim-kit/headers.bin ops/verify_claim.py $D/
+cd $D && python3 verify_claim.py 2026-09-07.json 2026-09-07.json.ots headers.bin
+```
+
+The verifier recognises the manifest and names its host, period and
+seq; the chain of manifests (`prev.sha256`) and the witness vouches are
+checked by `ops/selfstamp.py verify`, offline too. Handing over every
+manifest with its proof and one `headers.bin` gives the expert the whole
+diary, each day anchored, verifiable with `python3` alone. The unit
+tests build exactly this kit (a manifest stamped through the real
+calendar, so the proof carries the not-before bound, anchored into a
+chain mined in the test from a stated checkpoint) and then tamper with
+the exhibit, the proof, a header and the chain's links, each caught; the
+two real proofs from the reference deployment (blocks 959459 and 960458)
+verify against real mainnet headers pinned under `ops/tests/claim/`, and
+the difficulty rule reproduces mainnet's retarget at 965664.
+
+A proof still `pending` has no Bitcoin attestation and the verifier says
+so (step 2 fails: upgrade it first). Proofs the ots client upgraded keep
+their pending attestation beside the Bitcoin path; the verifier follows
+the Bitcoin one and notes the other.
+
 ## The appliance shape
 
-One box, five parts, two repos. bitcoind runs on the host; the calendar
+One box, six parts, two repos. bitcoind runs on the host; the calendar
 runs in Docker (the py-leveldb dependency pins it to Python 3.11, so the
-image carries its own interpreter); the client adapter, the self-stamper
-and the watcher are stdlib Python and run on whatever Python the host has.
-Nothing listens off-box: the calendar is published on loopback 14788, the
-adapter's door is wherever `LISTEN_ADDR` says, and the three tools have no
-listener at all. What the box does not have: a gateway, Tor, phoenixd, a
+image carries its own interpreter); the client adapter, the self-stamper,
+the watcher and the headers export are stdlib Python and run on whatever
+Python the host has. Nothing listens off-box: the calendar is published
+on loopback 14788, the adapter's door is wherever `LISTEN_ADDR` says, and
+the four tools have no listener at all. What the box does not have: a gateway, Tor, phoenixd, a
 payer, an L402 secret, a bills token.
 
 | Part | Where it runs | Reads | Writes | Listens |
@@ -626,6 +732,7 @@ payer, an L402 secret, a bills token.
 | api-endpoint (`CALENDAR_URL` mode) | host, user unit | the calendar on loopback | `DATA_DIR`: `debts/`, `proofs/`, `pending/`, `heartbeat`, `log` | `LISTEN_ADDR` (the one route, `POST /record`) |
 | `ops/selfstamp.py` | host, user timer, 00:30 UTC | the books, `journalctl`, the calendar's operator lane | `~/selfstamp/manifests/` | none |
 | `ops/watch.py` | host, user timer, every 5 min | the calendar's JSON status, units, containers, files, the journal | `~/watcher/status`, `state.json`, `watch.log`, ntfy (optional) | none |
+| `ops/export_headers.py` | host, user timer, 01:00 UTC | bitcoind RPC on loopback (the calendar's credentials) | `~/claim-kit/headers.bin`, `export.log` | none |
 
 The steps below assume an operator account (here `appliance`) with its
 home at `/home/appliance`, the two clones at `~/opentimestamps-server` and
@@ -820,6 +927,18 @@ ssh failures and unexpected logins, the age of the last confirmed anchor,
 pending reboots, refused outbound packets, bitcoind's peers. One line a
 day is the heartbeat; alerts go out on transitions only.
 
+### 6. The claim kit
+
+```bash
+mkdir -p ~/claim-kit && cp ops/systemd/headers.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now headers.timer
+python3 ops/export_headers.py --env ~/opentimestamps-server/.env --rpc-host 127.0.0.1 --out ~/claim-kit/headers.bin
+```
+
+The first run exports the whole chain (about 77 MB); the timer appends
+each day's blocks. A kit is a folder: the exhibit, its proof, a copy of
+`headers.bin`, a copy of `ops/verify_claim.py` ("The claim kit" above).
+
 ### What the box then is
 
 Its health is three plain readings, no listener added for them: the
@@ -853,7 +972,8 @@ Test modules live under `otsserver/tests/`:
   `test_stamper_checkpoint.py`, `test_stamper_wallet_empty.py`,
   `test_operator_lane.py`, `test_selfstamp.py`,
   `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py`,
-  `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py` — regression
+  `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py`,
+  `test_claim_kit.py` — regression
   tests for this branch's delta (launcher flags, the status line and its
   RPC wiring, stamper-loop crash fixes, anchor receipts,
   anchor cadence, the /digest Content-Length handling, anchor-receipt
@@ -866,7 +986,10 @@ Test modules live under `otsserver/tests/`:
   audit logs and witness by file drop, the not-before bound as the
   opentimestamps library and the stdlib parser read it, and the
   deep-reorg detector against an in-process double of the billing
-  red-team's fake bitcoind reorg contract). They stub everything external with `unittest.mock` or
+  red-team's fake bitcoind reorg contract, and the claim kit: two real
+  anchored proofs against pinned mainnet headers, the retarget at
+  965664, the diary kit built and tampered with, and the headers export
+  against a fake node). They stub everything external with `unittest.mock` or
   stdlib fakes: no bitcoind, no network.
 
 No test module needs a running Bitcoin node. Every module does need the
@@ -879,7 +1002,7 @@ Run the suite in the deployment-matched environment — the otsd image (base
 `pip install -r requirements.txt`) — or in a Python ≤ 3.11 venv:
 
 ```
-python -m unittest discover -v                       # Ran 128 tests ... OK
+python -m unittest discover -v                       # Ran 151 tests ... OK
 ```
 
 The otsd image has no pytest; where pytest is installed,

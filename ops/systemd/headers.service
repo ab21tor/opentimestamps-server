@@ -1,0 +1,13 @@
+# The claim kit's headers file: every block header the box's own node
+# holds, appended daily, verified (links, proof of work) before writing.
+# Paths assume the fork clone at ~/opentimestamps-server, its compose .env
+# beside it, and the kit directory at ~/claim-kit; edit if not. The node
+# access is the calendar's (BITCOIN_RPC_SERVICE_URL), reached on loopback.
+[Unit]
+Description=claim kit: export block headers from the box's node
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/opentimestamps-server/ops/export_headers.py --env %h/opentimestamps-server/.env --rpc-host 127.0.0.1 --out %h/claim-kit/headers.bin
+StandardOutput=append:%h/claim-kit/export.log
+StandardError=append:%h/claim-kit/export.log

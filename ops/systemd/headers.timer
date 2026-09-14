@@ -1,0 +1,14 @@
+# Daily headers export for the claim kit (ops/export_headers.py), a user
+# unit (systemctl --user). 01:00 UTC, after the self-stamp's 00:30 run.
+# Persistent=true fires a missed run at the next boot; the exporter only
+# ever appends what is new.
+[Unit]
+Description=claim kit: daily block-headers export (01:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 01:00:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
