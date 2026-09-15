@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import queue
+import secrets
 import struct
 import sys
 import threading
@@ -124,6 +125,51 @@ class JournalWriter(Journal):
                 logging.warning("Failed to write record count for journal entry %d: %r" % (idx, exp))
 
 
+def read_checkpoint(path):
+    """journal.known-good: None when absent, else (journal index, database
+    generation as 32 hex chars, or None for a file from before generations).
+
+    A v1 file (upstream's, and this fork's before 2026-09-15) holds the
+    index alone; a v2 file holds 'INDEX GENERATION'. Anything else raises
+    ValueError: a malformed checkpoint is refused, never guessed at, and
+    the caller stops the whole service.
+    """
+    try:
+        with open(path, 'r') as fd:
+            text = fd.read()
+    except FileNotFoundError:
+        return None
+    parts = text.split()
+    if not parts or len(parts) > 2 or not parts[0].isdigit():
+        raise ValueError('not "INDEX" or "INDEX GENERATION": %r' % text[:80])
+    generation = None
+    if len(parts) == 2:
+        generation = parts[1].lower()
+        if len(generation) != 32 or any(c not in '0123456789abcdef' for c in generation):
+            raise ValueError('generation is not 32 hex characters: %r' % text[:80])
+    return int(parts[0]), generation
+
+
+def fsync_dir(path):
+    """fsync the directory holding path, so a rename or a new entry is durable"""
+    fd = os.open(os.path.dirname(os.path.abspath(path)) or '.', os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_checkpoint(path, idx, generation=None):
+    """Write journal.known-good atomically: tmp, fsync, rename, fsync dir"""
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as fd:
+        fd.write('%d %s\n' % (idx, generation) if generation else '%d\n' % idx)
+        fd.flush()
+        os.fsync(fd.fileno())
+    os.replace(tmp, path)
+    fsync_dir(path)
+
+
 class RecordCounts:
     """Read-only accessor for the journal's record-count sidecar
 
@@ -214,6 +260,20 @@ class RecordCountsWriter(RecordCounts):
         os.pwrite(self.fd, struct.pack('>L', count), idx * self.RECORD_SIZE)
         os.fsync(self.fd)
 
+# The database's own identity, under keys no commitment path can produce
+# (every stored msg is a 32-byte hash, a 44-byte journal commitment, a
+# 64-byte merkle pair or a transaction-shaped string; these are 15 and 16
+# bytes and start with a NUL). generation: 16 random bytes in hex, chosen
+# when the database is created, so a recreated or restored database is a
+# different one. watermark: the journal index below which every commitment
+# is in this database, written in the same synchronous batch as the
+# confirmed timestamps that make it true (2026-09-15 review, "storage
+# generation").
+META_PREFIX = b'\x00meta/'
+META_GENERATION = META_PREFIX + b'generation'
+META_WATERMARK = META_PREFIX + b'watermark'
+
+
 class LevelDbCalendar:
     # plyvel, not py-leveldb (2026-09-14; the same switch as upstream PR
     # #111): py-leveldb's last release (0.201) bundles LevelDB 1.19
@@ -223,13 +283,52 @@ class LevelDbCalendar:
     # README "Unit tests"). The API differences are all in this class.
     def __init__(self, path):
         self.db = plyvel.DB(path, create_if_missing=True)
+        raw = self.db.get(META_GENERATION)
+        if raw is not None:
+            self.generation = raw.decode()
+            watermark = self.db.get(META_WATERMARK)
+            self.watermark = int(watermark) if watermark else 0
+        elif self.__is_empty():
+            # A database created just now: give it its identity before
+            # anything else lands in it.
+            self.generation = None
+            self.adopt_generation(0)
+        else:
+            # A database from before generations (pre-2026-09-15): the
+            # Calendar decides, against the checkpoint on file, whether it
+            # can be adopted (verify_storage_generation).
+            self.generation = None
+            self.watermark = None
+
+    def __is_empty(self):
+        it = self.db.iterator(include_value=False)
+        try:
+            for _ in it:
+                return False
+            return True
+        finally:
+            it.close()
+
+    def adopt_generation(self, watermark):
+        """Stamp the database with a fresh generation and the given watermark,
+        in one synchronous batch: from here on the pair (generation,
+        watermark) is what a checkpoint file must agree with."""
+        generation = secrets.token_hex(16)
+        batch = self.db.write_batch(sync=True)
+        batch.put(META_GENERATION, generation.encode())
+        batch.put(META_WATERMARK, str(watermark).encode())
+        batch.write()
+        self.generation = generation
+        self.watermark = watermark
 
     def __contains__(self, msg):
+        if msg.startswith(META_PREFIX):
+            return False
         return self.db.get(msg) is not None
 
     def __get_timestamp(self, msg):
         """Get a timestamp, non-recursively"""
-        serialized_timestamp = self.db.get(msg)
+        serialized_timestamp = self.db.get(msg) if not msg.startswith(META_PREFIX) else None
         if serialized_timestamp is None:
             raise KeyError(msg)
         ctx = BytesDeserializationContext(serialized_timestamp)
@@ -303,7 +402,10 @@ class LevelDbCalendar:
 
         self.__put_timestamp(existing_timestamp, batch, batch_cache)
 
-    def add_timestamps(self, new_timestamps):
+    def add_timestamps(self, new_timestamps, watermark=None):
+        """Write the timestamps in one synchronous batch; with a watermark,
+        the journal index below which everything is now in the database
+        lands in the same batch, so it is exactly as durable as they are."""
         batch = self.db.write_batch(sync=True)
         batch_cache = {}
 
@@ -320,7 +422,11 @@ class LevelDbCalendar:
                 last = now
         del batch_cache
 
+        if watermark is not None:
+            batch.put(META_WATERMARK, str(watermark).encode())
         batch.write()
+        if watermark is not None:
+            self.watermark = watermark
         logging.debug("Done LevelDbCalendar.add_timestamps(), added %d timestamps total" % n)
 
 class Calendar:
@@ -348,9 +454,82 @@ class Calendar:
             logging.error('HMAC secret key not set; %r does not exist' % hmac_key_path)
             sys.exit(1)
 
+        # The checkpoint on file must belong to this database and lie at or
+        # below what the database durably holds; otherwise the service does
+        # not start (a lost, recreated or older-restored db/ beside a kept
+        # checkpoint would skip the journal entries the checkpoint claims).
+        self.checkpoint = self.verify_storage_generation()
+
         # The stamper, set by otsd once both exist: its view of the chain is
         # where the not-before bound below comes from.
         self.stamper = None
+
+    RECOVERY = ("Recovery: if db/ was restored from a backup or recreated, delete %s and start again: the stamper "
+                "rescans the whole journal from index 0 and re-anchors every commitment the database lacks. The "
+                "re-anchored proofs name later blocks than the originals, whose paths lived only in the lost database. "
+                "Never copy a journal.known-good from another database.")
+
+    def __refuse(self, reason, path):
+        logging.critical("CALENDAR STORAGE INCONSISTENT: %s. %s" % (reason, self.RECOVERY % path))
+        sys.exit(1)
+
+    @property
+    def generation(self):
+        return self.db.generation
+
+    def verify_storage_generation(self):
+        """Check journal.known-good against the database's generation and
+        committed watermark; returns the checkpoint index the scan may
+        start at (None: from 0), or stops the process with the recovery
+        text. Migration of a database from before generations: a v1
+        checkpoint (index alone) is adopted only if the journal entry just
+        below it is in the database; the database is then stamped with a
+        generation and that watermark, and the file rewritten as v2."""
+        path = self.path + '/journal.known-good'
+        try:
+            checkpoint = read_checkpoint(path)
+        except ValueError as exp:
+            self.__refuse('%s is malformed (%s)' % (path, exp), path)
+        if checkpoint is None:
+            if self.db.generation is None:
+                self.db.adopt_generation(0)
+                logging.info("Calendar database stamped with generation %s (no checkpoint on file; the scan starts at 0)"
+                             % self.db.generation)
+            return None
+        idx, generation = checkpoint
+        if generation is None:
+            if self.db.generation is not None:
+                self.__refuse('%s names journal index %d without a database generation, but db/ carries generation %s: '
+                              'the checkpoint predates this database (db/ was recreated, or an older checkpoint was restored)'
+                              % (path, idx, self.db.generation), path)
+            if idx > 0:
+                journal = Journal(self.path + '/journal')
+                try:
+                    entry = journal[idx - 1]
+                except KeyError:
+                    self.__refuse('%s names journal index %d, but the journal has no entry %d' % (path, idx, idx - 1), path)
+                finally:
+                    journal.read_fd.close()
+                if entry not in self.db:
+                    self.__refuse('%s names journal index %d, but the database does not hold journal entry %d: '
+                                  'db/ is older than the checkpoint' % (path, idx, idx - 1), path)
+            self.db.adopt_generation(idx)
+            write_checkpoint(path, idx, self.db.generation)
+            logging.warning("Calendar storage migrated: %s (index %d, the format before generations) adopted as the "
+                            "database's committed watermark after checking that journal entry %d is in the database; "
+                            "generation %s recorded in db/ and in the checkpoint"
+                            % (path, idx, idx - 1, self.db.generation))
+            return idx
+        if self.db.generation is None:
+            self.__refuse('%s belongs to database generation %s, but db/ carries none: db/ predates the checkpoint '
+                          '(an older backup restored beside a newer checkpoint)' % (path, generation), path)
+        if generation != self.db.generation:
+            self.__refuse('%s belongs to database generation %s, but db/ carries %s: db/ was recreated or restored '
+                          'from a different lineage' % (path, generation, self.db.generation), path)
+        if idx > self.db.watermark:
+            self.__refuse('%s names journal index %d, but the database\'s committed watermark is %d: db/ is older than '
+                          'the checkpoint (restored from an older backup?)' % (path, idx, self.db.watermark), path)
+        return idx
 
     # Warn once while submissions go out without a not-before bound (no
     # block known yet: startup, or bitcoind unreachable); INFO once when
@@ -414,9 +593,11 @@ class Calendar:
         """Get commitment timestamps(s)"""
         return self.db[commitment]
 
-    def add_commitment_timestamps(self, new_timestamps):
-        """Add timestamps"""
-        self.db.add_timestamps(new_timestamps)
+    def add_commitment_timestamps(self, new_timestamps, watermark=None):
+        """Add timestamps; watermark, when given, is the journal index below
+        which every commitment is then in the database, committed in the
+        same synchronous batch (the stamper's checkpoint after this save)."""
+        self.db.add_timestamps(new_timestamps, watermark=watermark)
 
 
 class AggregatorUnavailable(Exception):

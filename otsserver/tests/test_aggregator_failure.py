@@ -20,9 +20,18 @@ calendar was fine. Now a failed round is logged and exit_event is set so
 the process leaves (the container restarts it), submit() waits at most
 SUBMIT_TIMEOUT seconds and raises AggregatorUnavailable, and /digest
 answers 503 instead of hanging.
+
+2026-09-15 (independent review, P1 "aggregator failure stops workers but
+leaves the serving process alive"): the exit event was set but nothing
+consumed it while the listener kept serving. The launcher now runs
+otsserver.rpc.serve_until_exit, which shuts the HTTP server down, joins
+the workers and returns nonzero the moment a worker sets the event; otsd
+exits 1 and the supervisor restarts the service. The process boundary
+itself is exercised in test_otsd_launcher.
 """
 
 import hashlib
+import socket
 import threading
 import time
 import unittest
@@ -31,6 +40,7 @@ from unittest import mock
 
 import otsserver.rpc
 from otsserver.calendar import Aggregator, AggregatorUnavailable
+from otsserver.rpc import StampServer
 
 
 class RaisingCalendar:
@@ -93,6 +103,46 @@ class Test_aggregator_failure(unittest.TestCase):
         head, _, out = handler.wfile.getvalue().partition(b"\r\n\r\n")
         self.assertTrue(head.startswith(b"HTTP/1.0 503"), head[:40])
         self.assertIn(b"aggregator unavailable", out)
+
+
+class Test_launcher(unittest.TestCase):
+    def test_a_failed_aggregator_shuts_the_server_down_and_the_launcher_returns_nonzero(self):
+        exit_event = threading.Event()
+        aggregator = Aggregator(RaisingCalendar(), exit_event, commitment_interval=0.01)
+        server = StampServer(('127.0.0.1', 0), aggregator, RaisingCalendar())
+        port = server.server_address[1]
+        result = {}
+        launcher = threading.Thread(
+            target=lambda: result.setdefault('rc', otsserver.rpc.serve_until_exit(server, exit_event, [aggregator.thread])))
+        launcher.start()
+        try:
+            socket.create_connection(('127.0.0.1', port), timeout=2).close()   # serving
+            with self.assertRaises(AggregatorUnavailable):
+                aggregator.submit(hashlib.sha256(b'x').digest())
+            launcher.join(10)
+            self.assertFalse(launcher.is_alive(), 'the launcher returns once a worker has failed')
+            self.assertEqual(result.get('rc'), 1)
+            self.assertFalse(aggregator.thread.is_alive())
+            with self.assertRaises(OSError):
+                socket.create_connection(('127.0.0.1', port), timeout=1).close()
+        finally:
+            exit_event.set()
+            if launcher.is_alive():
+                server.shutdown()
+                launcher.join(5)
+
+    def test_the_launcher_returns_when_the_caller_sets_the_event(self):
+        exit_event = threading.Event()
+        aggregator = Aggregator(RaisingCalendar(), exit_event, commitment_interval=0.05)
+        server = StampServer(('127.0.0.1', 0), aggregator, RaisingCalendar())
+        result = {}
+        launcher = threading.Thread(
+            target=lambda: result.setdefault('rc', otsserver.rpc.serve_until_exit(server, exit_event, [aggregator.thread])))
+        launcher.start()
+        exit_event.set()
+        launcher.join(10)
+        self.assertFalse(launcher.is_alive())
+        self.assertFalse(aggregator.thread.is_alive())
 
 
 if __name__ == "__main__":

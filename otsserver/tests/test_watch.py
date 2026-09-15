@@ -21,8 +21,11 @@ message. Nothing here touches the network, docker, systemd or the journal.
 """
 
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
+from unittest import mock
 
 TOOL = pathlib.Path(__file__).resolve().parents[2] / 'ops' / 'watch.py'
 
@@ -149,6 +152,97 @@ class Test_names(unittest.TestCase):
         self.assertIn("wallet 22,015 sats, pending 1,204", line)
         line = watch.heartbeat_line({"delivered": []}, checks, dict(o, calendar=None), cfg)
         self.assertNotIn("wallet", line)
+
+
+class Test_outbox(unittest.TestCase):
+    """2026-09-15 review, P2 "a failed one-shot security alert is
+    permanently lost": every message is written to the outbox before the
+    journal cursor moves, delivered oldest first, retried by every later
+    run until it lands; the run exits 1 while anything is undelivered."""
+
+    ALL_OK = {name: (True, '') for name in watch.ORDER}
+    BURST = dict(ALL_OK, ssh_unexpected=(False, 'ssh accepted from unexpected source 203.0.113.7'))
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.dir = pathlib.Path(self.tmpdir.name)
+        self.state = self.dir / 'state.json'
+        self.outbox = self.dir / 'outbox.json'
+
+    def runs(self, cfg, evaluations, sends, extra=None):
+        """real_run once per evaluation; returns (exit codes, the sender mock)."""
+        patches = [mock.patch.multiple(watch, WATCH_DIR=str(self.dir), STATE=str(self.state), STATUS=str(self.dir / 'status')),
+                   mock.patch.object(watch, 'load_config', return_value=cfg),
+                   mock.patch.object(watch, 'observe', return_value={}),
+                   mock.patch.object(watch, 'evaluate', side_effect=evaluations),
+                   mock.patch.object(watch, 'log')] + (extra or [])
+        for p in patches:
+            p.start()
+        try:
+            with mock.patch.object(watch, 'send', side_effect=sends) as sent:
+                codes = [watch.real_run(False) for _ in evaluations]
+        finally:
+            for p in patches:
+                p.stop()
+        return codes, sent
+
+    def cfg(self, **over):
+        cfg = dict(watch.DEFAULTS, HEARTBEAT_HOUR='99', NAME='box', NTFY_URL='http://ntfy.invalid/box')
+        cfg.update(over)
+        return cfg
+
+    def queued(self):
+        return json.loads(self.outbox.read_text()) if self.outbox.exists() else None
+
+    def test_a_failed_alert_is_kept_and_retried_in_order(self):
+        codes, sent = self.runs(self.cfg(), [self.BURST, self.ALL_OK, self.ALL_OK],
+                                [(False, 'down'), (False, 'down'), (True, 'http 200'), (True, 'http 200')])
+        self.assertEqual(codes, [1, 1, 0])
+        self.assertEqual(sent.call_count, 4)
+        texts = [c.args[1] for c in sent.call_args_list]
+        self.assertIn('203.0.113.7', texts[0])
+        self.assertEqual(texts[0], texts[1], 'the lost burst is retried')
+        self.assertEqual(texts[2], texts[0])
+        self.assertIn('RECOVERED', texts[3])
+        self.assertEqual(self.queued(), [])
+        self.assertIn('journal', json.loads(self.state.read_text())['cursors'])
+
+    def test_the_cursor_moves_only_once_the_burst_is_on_disk(self):
+        real = watch.write_json_atomic
+
+        def outbox_fails(path, data):
+            if path == str(self.outbox):
+                raise OSError(28, 'No space left on device')
+            return real(path, data)
+        codes, sent = self.runs(self.cfg(), [self.BURST], [(False, 'down')],
+                                extra=[mock.patch.object(watch, 'write_json_atomic', side_effect=outbox_fails)])
+        self.assertEqual(codes, [1])
+        self.assertEqual(sent.call_count, 1, 'still tried directly')
+        state = json.loads(self.state.read_text())
+        self.assertNotIn('cursors', state, 'the burst is neither on disk nor delivered: the cursor stays')
+        self.assertIsNone(self.queued())
+        # Delivered directly, the cursor moves even without an outbox.
+        codes, sent = self.runs(self.cfg(), [self.BURST], [(True, 'http 200')],
+                                extra=[mock.patch.object(watch, 'write_json_atomic', side_effect=outbox_fails)])
+        self.assertEqual(codes, [0])
+        self.assertIn('journal', json.loads(self.state.read_text())['cursors'])
+
+    def test_status_only_mode_queues_nothing(self):
+        codes, sent = self.runs(self.cfg(NTFY_URL=''), [self.BURST, self.ALL_OK], [])
+        self.assertEqual(codes, [0, 0])
+        self.assertEqual(sent.call_count, 0)
+        self.assertIsNone(self.queued())
+        self.assertIn('journal', json.loads(self.state.read_text())['cursors'])
+
+    def test_the_outbox_is_bounded(self):
+        self.outbox.write_text(json.dumps([{'text': 'old %d' % i, 'queued': ''} for i in range(watch.OUTBOX_MAX + 5)]))
+        codes, sent = self.runs(self.cfg(), [self.BURST], [(False, 'down')])
+        self.assertEqual(codes, [1])
+        queued = self.queued()
+        self.assertEqual(len(queued), watch.OUTBOX_MAX)
+        self.assertIn('203.0.113.7', queued[-1]['text'])
+        self.assertEqual(queued[0]['text'], 'old 6')
 
 
 if __name__ == "__main__":

@@ -14,6 +14,18 @@ one heartbeat per UTC day. A persisting problem never re-alarms.
     watch.py --dry      real observations, print what would be sent, send nothing
     watch.py --test     fixture scenarios under tests/watch/, sender stubbed, exit 1 on any deviation
 
+Delivery (2026-09-15): every message a run decides to send is first
+written to <WATCH_DIR>/outbox.json (atomic, fsynced), and only then is
+the journal cursor advanced: a burst the journal will not show again (an
+unexpected ssh login) is on disk before it is consumed. The outbox is
+delivered oldest first, stopping at the first failure so alerts never
+reorder; what is not delivered stays and is retried by every later run,
+and the run exits 1 while anything is undelivered. With NTFY_URL empty
+(status-only mode) nothing is queued: the transition is recorded in the
+state and the log carries the text. If the outbox itself cannot be
+written the run still tries to send, and the cursor advances only when
+everything was delivered, so the next run re-observes the burst.
+
 Two shapes, one script, chosen by the config: the hosted shape (the Pi)
 sets HEALTH_URL and the demo's feeder and tor knobs; the appliance shape
 sets CALENDAR_URL and leaves what it has not got EMPTY. An empty knob skips
@@ -47,6 +59,11 @@ CONFIG = os.path.join(WATCH_DIR, "config")
 STATE = os.path.join(WATCH_DIR, "state.json")
 STATUS = os.path.join(WATCH_DIR, "status")
 FIXTURES = os.path.join(DIR, "tests", "watch")
+OUTBOX_MAX = 200    # undelivered messages kept; older ones are dropped, logged
+
+
+def outbox_path():
+    return os.path.join(WATCH_DIR, "outbox.json")
 
 DEFAULTS = {
     "NTFY_URL": "",
@@ -516,6 +533,30 @@ def log(msg):
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg, flush=True)
 
 
+def write_json_atomic(path, data):
+    """tmp, fsync, rename, fsync the directory: the file is whole or absent."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fd:
+        json.dump(data, fd, indent=1)
+        fd.flush()
+        os.fsync(fd.fileno())
+    os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def load_outbox():
+    try:
+        with open(outbox_path()) as fd:
+            data = json.load(fd)
+    except (OSError, ValueError):
+        return []
+    return [m for m in data if isinstance(m, dict) and isinstance(m.get("text"), str)] if isinstance(data, list) else []
+
+
 def real_run(dry):
     cfg = load_config()
     os.makedirs(WATCH_DIR, exist_ok=True)
@@ -541,28 +582,57 @@ def real_run(dry):
         fd.write(line + "\n")
     os.replace(STATUS + ".tmp", STATUS)
     log(line)
-    delivered_all = True
-    for m in msgs:
-        if dry:
-            log("WOULD SEND: " + m)
-            continue
-        ok, why = send(cfg, m)
-        log(("sent: " if ok else "NOT SENT (%s): " % why) + m)
-        delivered_all = delivered_all and ok
     if dry:
+        for m in msgs:
+            log("WOULD SEND: " + m)
         return 0
-    if delivered_all:
-        new_state["cursors"] = {"journal": now}
-        with open(STATE + ".tmp", "w") as fd:
-            json.dump(new_state, fd, indent=1)
-        os.replace(STATE + ".tmp", STATE)
-    else:
-        # keep the old state so the next run retries the same transition; advance only the cursor
-        state["cursors"] = {"journal": now}
-        with open(STATE + ".tmp", "w") as fd:
-            json.dump(state, fd, indent=1)
-        os.replace(STATE + ".tmp", STATE)
-    return 0
+
+    def commit(st):
+        st["cursors"] = {"journal": now}
+        write_json_atomic(STATE, st)
+
+    if not cfg.get("NTFY_URL"):
+        # Status-only mode: nothing to deliver to, so nothing is queued;
+        # the state records the transition and the log carries the text.
+        for m in msgs:
+            log("NOT SENT (no NTFY_URL): " + m)
+        commit(new_state)
+        return 0
+
+    # The burst goes to disk before the cursor moves past it.
+    queue = load_outbox() + [{"text": m, "queued": utc.strftime("%Y-%m-%dT%H:%M:%SZ")} for m in msgs]
+    if len(queue) > OUTBOX_MAX:
+        log("outbox over %d messages; dropping the oldest %d" % (OUTBOX_MAX, len(queue) - OUTBOX_MAX))
+        queue = queue[-OUTBOX_MAX:]
+    try:
+        write_json_atomic(outbox_path(), queue)
+        persisted = True
+    except OSError as e:
+        log("outbox write failed: %r; the cursor will not advance unless everything is delivered" % (e,))
+        persisted = False
+    if persisted:
+        commit(new_state)
+    # Oldest first; stop at the first failure so alerts never reorder.
+    while queue:
+        ok, why = send(cfg, queue[0]["text"])
+        if not ok:
+            log("NOT SENT (%s), kept in the outbox (%d queued): %s" % (why, len(queue), queue[0]["text"]))
+            break
+        log("sent: " + queue[0]["text"])
+        queue.pop(0)
+        if persisted:
+            try:
+                write_json_atomic(outbox_path(), queue)
+            except OSError as e:
+                log("outbox write failed after a delivery: %r" % (e,))
+    if not persisted:
+        if queue:
+            # Undelivered and not on disk: keep the old state and the old
+            # cursor, so the next run observes the same burst again.
+            write_json_atomic(STATE, state)
+        else:
+            commit(new_state)
+    return 1 if queue else 0
 
 
 def run_fixtures(fixtures_dir=FIXTURES, out=print):

@@ -10,6 +10,7 @@
 # in the LICENSE file.
 
 import collections
+import errno
 import json
 import logging
 import os
@@ -35,7 +36,7 @@ from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
 from opentimestamps.core.op import OpPrepend, OpSHA256
 from opentimestamps.core.timestamp import Timestamp, make_merkle_tree
 
-from otsserver.calendar import Journal, RecordCounts
+from otsserver.calendar import Journal, RecordCounts, fsync_dir, read_checkpoint, write_checkpoint
 
 # https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp
 DUST = 330
@@ -187,8 +188,21 @@ def marker_path(receipts_path):
     return receipts_path + '.pending'
 
 
+def _write_all(fd, data):
+    """Write every byte of data to fd: os.write may write less than it was
+    given (a full disk, a signal), and a short write taken for a whole one
+    was the 2026-09-15 review's receipt finding. No progress is an error."""
+    view = memoryview(data)
+    while len(view):
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError(errno.EIO, 'write made no progress')
+        view = view[n:]
+
+
 def _write_pending_receipt(receipts_path, body):
-    """Write the pending-receipt marker atomically (tmp + fsync + rename)
+    """Write the pending-receipt marker atomically (tmp + fsync + rename +
+    directory fsync)
 
     body is {'receipt': <the line to append later>, 'probe': <hex of one
     commitment in the anchor's tree>}: enough to settle, after a crash,
@@ -198,18 +212,24 @@ def _write_pending_receipt(receipts_path, body):
     tmp = path + '.tmp'
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
-        os.write(fd, (json.dumps(body) + '\n').encode())
+        _write_all(fd, (json.dumps(body) + '\n').encode())
         os.fsync(fd)
     finally:
         os.close(fd)
     os.rename(tmp, path)
+    fsync_dir(path)
 
 
 def _receipt_on_file(receipts_path, txid):
-    """True if a receipt line for txid is already in the receipts file"""
+    """True if a complete receipt line for txid is already in the receipts
+    file. A receipt is complete only with its newline: a last line without
+    one is an interrupted append (_recover_receipt_tail drops it), never a
+    receipt on file, however well it parses."""
     try:
         with open(receipts_path, 'rb') as fd:
             for line in fd:
+                if not line.endswith(b'\n'):
+                    continue
                 try:
                     if json.loads(line).get('txid') == txid:
                         return True
@@ -233,6 +253,8 @@ def _recent_receipts(path, n):
         return []
     receipts = []
     for line in lines[-n:]:
+        if not line.endswith(b'\n'):
+            continue   # an interrupted append, not a receipt
         try:
             receipt = json.loads(line)
         except ValueError:
@@ -242,22 +264,59 @@ def _recent_receipts(path, n):
     return receipts
 
 
+def _recover_receipt_tail(fd, path):
+    """Drop an incomplete last line (bytes after the final newline) left by
+    an interrupted append, before anything is appended after it.
+
+    A receipt is complete only with its newline, and its marker is removed
+    only after that newline is on disk (file and directory fsynced), so an
+    incomplete tail is always a receipt whose marker still stands: the
+    marker recovers it in full, and nothing complete is ever touched.
+    Returns the number of bytes dropped.
+    """
+    size = os.fstat(fd).st_size
+    if size == 0 or os.pread(fd, 1, size - 1) == b'\n':
+        return 0
+    keep = 0
+    pos = size
+    while pos > 0:
+        chunk_start = max(0, pos - 4096)
+        chunk = os.pread(fd, pos - chunk_start, chunk_start)
+        nl = chunk.rfind(b'\n')
+        if nl >= 0:
+            keep = chunk_start + nl + 1
+            break
+        pos = chunk_start
+    os.ftruncate(fd, keep)
+    os.fsync(fd)
+    logging.warning("%s ended in an incomplete receipt line (%d bytes without a newline, an interrupted append); "
+                    "dropped before appending; the receipt it held is recovered from its pending marker"
+                    % (path, size - keep))
+    return size - keep
+
+
 def _append_anchor_receipt(path, receipt):
     """Append one anchor receipt line to the JSONL file at path
 
     The line is an interface: the gateway's anchor billing parses these
     fields. See the "Anchor receipts" section of the README.
 
-    A single os.write() on an O_APPEND fd appends the whole line
-    atomically; existing bytes are never rewritten or truncated.
+    An incomplete tail from an earlier interrupted append is dropped first
+    (_recover_receipt_tail); then every byte of the line is written (a
+    checked write-all loop, never one os.write taken on trust), the file
+    is fsynced, and the directory is fsynced. Only after this returns does
+    the caller remove the marker that names the receipt. Existing complete
+    lines are never rewritten.
     """
     line = json.dumps(receipt) + '\n'
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     try:
-        os.write(fd, line.encode())
+        _recover_receipt_tail(fd, path)
+        _write_all(fd, line.encode())
         os.fsync(fd)
     finally:
         os.close(fd)
+    fsync_dir(path)
 
 
 # not using proxy.listunspent() because it tries to convert bech32 address as base58
@@ -348,6 +407,15 @@ class Stamper:
     ANCHOR_CHECK_INTERVAL = 3600
     ANCHOR_CHECK_RECEIPTS = 100
     needs_attention = ()
+
+    # Calendar-save warn-once flag, the same pattern: one ERROR when a
+    # mature tree's save fails (the tree is kept and retried every pass),
+    # one INFO when saves land again.
+    save_failed_warned = False
+
+    # Set to the reason when the stamper stopped the service (a startup it
+    # cannot complete); None while it runs. otsd reads it at exit.
+    failure = None
 
     @staticmethod
     def __create_new_timestamp_tx_template(outpoint, txout_value, change_scriptPubKey):
@@ -497,7 +565,7 @@ class Stamper:
                           % (len(findings), "; ".join(findings.values())))
         return self.needs_attention
 
-    def __save_confirmed_timestamp_tx(self, confirmed_tx):
+    def __save_confirmed_timestamp_tx(self, confirmed_tx, watermark=None):
         """Save a fully confirmed timestamp to disk, then receipt it
 
         Marker before the save, receipt after it. A crash before the save
@@ -508,6 +576,11 @@ class Stamper:
         marker whose commitments the calendar holds: the receipt is
         recovered from it. What a crash can lose is at most one receipt,
         and the marker names it; what it can never do is bill twice.
+
+        watermark, when given, is the journal checkpoint this save makes
+        true; the calendar commits it in the same synchronous batch as the
+        timestamps. A save that raises leaves the tree where it was: the
+        caller (__save_mature_trees) keeps it and retries every pass.
         """
         txid = b2lx(confirmed_tx.tx.GetTxid())
         receipt = None
@@ -529,7 +602,10 @@ class Stamper:
                 # loses the receipt silently, so say so now.
                 logging.warning("Failed to write pending anchor receipt marker for tx %s: %r" % (txid, exp))
 
-        self.calendar.add_commitment_timestamps(confirmed_tx.commitment_timestamps)
+        if watermark is None:
+            self.calendar.add_commitment_timestamps(confirmed_tx.commitment_timestamps)
+        else:
+            self.calendar.add_commitment_timestamps(confirmed_tx.commitment_timestamps, watermark=watermark)
         logging.info("tx %s fully confirmed, %d timestamps added to calendar" %
                      (txid, len(confirmed_tx.commitment_timestamps)))
 
@@ -550,34 +626,77 @@ class Stamper:
             except OSError as exp:
                 logging.warning("Failed to remove pending anchor receipt marker for tx %s: %r" % (txid, exp))
 
-    def __write_journal_checkpoint(self):
+    def __checkpoint_after(self, confirmed_tx):
+        """The journal checkpoint once confirmed_tx is saved: the lowest
+        journal index still outstanding — pending commitments plus other
+        mined-but-not-yet-deep trees, exactly what commitment_idxs holds
+        minus this tree — or the scan cursor when nothing is. Everything
+        below it is then in the calendar. None before the scan has run."""
+        saved = set(ts.msg for ts in confirmed_tx.commitment_timestamps)
+        remaining = [idx for msg, idx in self.commitment_idxs.items() if msg not in saved]
+        return min(remaining) if remaining else self.journal_cursor
+
+    def __write_journal_checkpoint(self, idx):
         """Persist journal.known-good after a confirmed anchor
 
-        The checkpoint is the lowest journal index whose commitment is not
-        yet anchored — outstanding = pending commitments plus mined-but-not-
-        yet-deep trees, exactly what commitment_idxs holds; with nothing
-        outstanding it is the scan cursor itself. Everything below it is in
-        the calendar, so a restart's scan begins there instead of at index
-        zero. Atomic via rename: a torn write can never truncate an
-        existing checkpoint. The checkpoint is a convenience: any failure
-        warns and must never break the stamp loop.
+        idx is __checkpoint_after's value, the same one the calendar just
+        committed as its watermark in the save's batch, so the file can
+        never claim more than the database durably holds. Written with the
+        database's generation, so a checkpoint kept beside a recreated or
+        older-restored database is refused at the next start
+        (Calendar.verify_storage_generation). Atomic via rename: a torn
+        write can never truncate an existing checkpoint. The checkpoint is
+        a convenience: any failure warns and must never break the stamp
+        loop.
         """
         try:
-            if self.commitment_idxs:
-                idx = min(self.commitment_idxs.values())
-            else:
-                idx = self.journal_cursor
             if idx is None:
                 return
-            path = self.calendar.path + '/journal.known-good'
-            tmp = path + '.tmp'
-            with open(tmp, 'w') as fd:
-                fd.write('%d\n' % idx)
-                fd.flush()
-                os.fsync(fd.fileno())
-            os.replace(tmp, path)
+            generation = getattr(self.calendar, 'generation', None)
+            if not isinstance(generation, str):
+                generation = None
+            write_checkpoint(self.calendar.path + '/journal.known-good', idx, generation)
         except Exception as exp:
             logging.warning("Failed to write journal checkpoint: %r" % exp)
+
+    def __save_mature_trees(self, best_height):
+        """Save every mined tree that has reached min_confirmations
+
+        A tree leaves txs_waiting_for_confirmation only after its save has
+        returned, i.e. after the calendar's synchronous write; a save that
+        raises keeps the tree, logged once, and every pass retries every
+        mature unsaved tree, whether or not a new block arrived, until it
+        lands. Only then are its record counts and journal indexes
+        released and the checkpoint advanced.
+        """
+        if not self.txs_waiting_for_confirmation:
+            return
+        due = sorted(height for height in self.txs_waiting_for_confirmation
+                     if height <= best_height - self.min_confirmations + 1)
+        for height in due:
+            confirmed_tx = self.txs_waiting_for_confirmation[height]
+            watermark = self.__checkpoint_after(confirmed_tx)
+            try:
+                self.__save_confirmed_timestamp_tx(confirmed_tx, watermark)
+            except Exception as exp:
+                if not self.save_failed_warned:
+                    logging.error("Calendar save failed for tx %s (%d timestamps): %r; the tree is kept and "
+                                  "retried every pass until it lands"
+                                  % (b2lx(confirmed_tx.tx.GetTxid()), len(confirmed_tx.commitment_timestamps), exp),
+                                  exc_info=True)
+                    self.save_failed_warned = True
+                continue
+            if self.save_failed_warned:
+                self.save_failed_warned = False
+                logging.info("Calendar saves succeeding again")
+            self.txs_waiting_for_confirmation.pop(height, None)
+            # The anchor is final: these commitments' record counts can
+            # never be summed into another tree, and their journal
+            # entries are behind the checkpoint from here on.
+            for commitment_timestamp in confirmed_tx.commitment_timestamps:
+                self.commitment_records.pop(commitment_timestamp.msg, None)
+                self.commitment_idxs.pop(commitment_timestamp.msg, None)
+            self.__write_journal_checkpoint(watermark)
 
     def __pending_to_merkle_tree(self, n):
             # Update the most recent timestamp transaction with new commitments
@@ -639,28 +758,10 @@ class Stamper:
         proxy = make_proxy()
 
         new_blocks = self.known_blocks.update_from_proxy(proxy)
-
-        # If we don't have any new blocks, and we have any unconfirmed
-        # transactions, wait for a new block because there is nothing useful we
-        # can do as the unconfirmed txs haven't been given a chance to get
-        # mined.
-        if not new_blocks and len(self.unconfirmed_txs) > 0:
-            return
+        best_height = new_blocks[-1][0] if new_blocks else self.known_blocks.best_block_height()
 
         for (block_height, block_hash) in new_blocks:
             logging.info("New block %s at height %d" % (b2lx(block_hash), block_height))
-
-            # Save commitments to disk that have reached min_confirmations
-            confirmed_tx = self.txs_waiting_for_confirmation.pop(block_height - self.min_confirmations + 1, None)
-            if confirmed_tx is not None:
-                self.__save_confirmed_timestamp_tx(confirmed_tx)
-                # The anchor is final: these commitments' record counts can
-                # never be summed into another tree, and their journal
-                # entries are behind the checkpoint from here on.
-                for commitment_timestamp in confirmed_tx.commitment_timestamps:
-                    self.commitment_records.pop(commitment_timestamp.msg, None)
-                    self.commitment_idxs.pop(commitment_timestamp.msg, None)
-                self.__write_journal_checkpoint()
 
             # If there already are txs waiting for confirmation at this
             # block_height, there was a reorg and those pending commitments now
@@ -739,6 +840,17 @@ class Stamper:
                 self.next_timestamp_tx = time.time() + (self.min_tx_interval * random.uniform(1, 2))
 
                 break
+
+        # Save every mined tree that is deep enough, including any kept back
+        # by an earlier failed save (retried on every pass, new block or not).
+        self.__save_mature_trees(best_height)
+
+        # If we don't have any new blocks, and we have any unconfirmed
+        # transactions, wait for a new block because there is nothing useful we
+        # can do as the unconfirmed txs haven't been given a chance to get
+        # mined.
+        if not new_blocks and len(self.unconfirmed_txs) > 0:
+            return
 
         # We've finished dealing with the new block(s) and any transactions
         # that have confirmed. Now we handling sending new transactions, be it
@@ -895,9 +1007,18 @@ class Stamper:
         self.unconfirmed_txs.append(UnconfirmedTimestampTx(sent_tx, tip_timestamp, len(commitment_timestamps), fee,
                                                            records))
 
-    def __loop(self):
-        logging.info("Starting stamper loop")
+    def __fail(self, reason):
+        """A start the stamper cannot complete stops the whole service: the
+        reason is logged at CRITICAL, exit_event is set (otsd shuts the HTTP
+        server down and exits nonzero, so the supervisor restarts it), and
+        the thread returns. Never a dead thread behind a live listener."""
+        self.failure = reason
+        logging.critical("Stamper cannot start: %s. The service stops." % reason)
+        self.exit_event.set()
 
+    def __open(self):
+        """Everything the loop needs before its first pass; raises on what
+        it cannot have."""
         journal = Journal(self.calendar.path + '/journal')
         record_counts = RecordCounts(self.calendar.path + '/journal.counts') \
             if self.anchor_receipts_path else None
@@ -920,11 +1041,24 @@ class Stamper:
                             "were on before and are off now; anchors will not be receipted or billed"
                             % self.calendar.path)
 
+        path = self.calendar.path + '/journal.known-good'
         try:
-            with open(self.calendar.path + '/journal.known-good', 'r') as known_good_fd:
-                idx = int(known_good_fd.read().strip())
-        except FileNotFoundError as exp:
-            idx = 0
+            checkpoint = read_checkpoint(path)
+        except ValueError as exp:
+            raise ValueError("%s is malformed (%s). Recovery: delete the file to rescan the whole journal from index 0 "
+                             "(safe: every commitment the calendar holds is skipped by its membership probe), or restore "
+                             "it from the same backup as db/" % (path, exp))
+        idx = checkpoint[0] if checkpoint else 0
+        return journal, record_counts, idx
+
+    def __loop(self):
+        logging.info("Starting stamper loop")
+
+        try:
+            journal, record_counts, idx = self.__open()
+        except Exception as exp:
+            self.__fail('%s: %s' % (type(exp).__name__, exp))
+            return
 
         read_failed = False
 

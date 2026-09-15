@@ -36,14 +36,21 @@ business: there is no network code and no listener here.
 Stdlib only. Filesystem in and out; the non-file inputs are one journalctl
 call and the calendar on loopback. No listener. Off unless a timer runs it.
 
-  run      --config C [--period YYYY-MM-DD]  heartbeat: consume the inbox,
-           write the period's manifest if absent, submit every manifest
-           (own or witnessed) lacking a proof, upgrade every proof still
-           pending, export to the outbox. Idempotent.
-  upgrade  --config C                        the upgrade pass alone.
-  verify   --manifests DIR [--witnessed DIR] [--witness DIR] | --config C
+  run      --config C [--period YYYY-MM-DD] [--lock-wait S]  heartbeat:
+           consume the inbox, write the period's manifest if absent,
+           submit every manifest (own or witnessed) lacking a proof,
+           upgrade every proof still pending, export to the outbox.
+           Idempotent. run and upgrade hold an exclusive lock on the
+           state directory (<state_dir>/.lock, across processes) for
+           their whole duration, so the timer's run and a manual one
+           never interleave; a second one waits up to --lock-wait seconds
+           (default 300), then exits 1 with 'locked'.
+  upgrade  --config C [--lock-wait S]        the upgrade pass alone.
+  verify   --manifests DIR [--witnessed DIR] [--witness DIR] [--skip-witnessed] | --config C
            offline: chain, proofs, commissioning, what this chain vouches
            for; with --witness, whether another chain vouches for this one.
+           A witnessed entry whose copy is missing is a break, unless
+           --skip-witnessed asks for the partial check, which is labelled.
 
 Manifest files live in <state_dir>/manifests/<period>.json with the proof
 beside them as <period>.json.ots; witnessed copies in <state_dir>/witnessed/.
@@ -55,7 +62,10 @@ limits.
 
 import argparse
 import collections
+import contextlib
 import datetime
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -65,6 +75,8 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -94,6 +106,42 @@ Proof = collections.namedtuple('Proof', 'digest commitment attestation ops_end')
 
 class OtsError(Exception):
     """A proof this tool cannot read or must not write"""
+
+
+class Locked(Exception):
+    """Another run or upgrade holds the state directory's lock"""
+
+
+# How long a run or upgrade waits for the lock before giving up (seconds).
+LOCK_WAIT = 300.0
+
+
+@contextlib.contextmanager
+def state_lock(state_dir, wait=LOCK_WAIT):
+    """An exclusive lock over the state directory for the whole of a run or
+    an upgrade, across processes (flock on <state_dir>/.lock): the timer's
+    run and a manual one can no longer interleave their manifest, proof
+    and export writes (2026-09-15 review: two overlapping first runs left
+    a manifest with the other run's proof). Waits up to `wait` seconds for
+    the holder, then raises Locked. The lock goes with the descriptor: a
+    run that dies releases it."""
+    state = pathlib.Path(state_dir)
+    state.mkdir(parents=True, exist_ok=True)
+    path = state / '.lock'
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exp:
+                if exp.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK) or time.monotonic() >= deadline:
+                    raise Locked('%s is held by another run' % path)
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(fd)
 
 
 # --- serialization -----------------------------------------------------------
@@ -438,13 +486,36 @@ def load_config(path):
     return cfg
 
 
+def _fsync_dir(directory):
+    fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_atomic(path, data):
-    tmp = path.with_name(path.name + '.tmp')
-    with open(tmp, 'wb') as fd:
-        fd.write(data)
-        fd.flush()
-        os.fsync(fd.fileno())
-    os.replace(tmp, path)
+    """A unique temporary name in the target's directory (two writers can
+    never share one), fsync, rename, then fsync the directory so the new
+    name is durable too."""
+    path = pathlib.Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix='.' + path.name + '.')
+    try:
+        umask = os.umask(0)
+        os.umask(umask)
+        os.fchmod(fd, 0o666 & ~umask)
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(path.parent)
 
 
 def proof_path(manifest_path):
@@ -591,6 +662,33 @@ def _remove(path):
         pass
 
 
+def _store_foreign_proof(copy, companion, digest, log):
+    """A proof delivered beside a manifest, at its first delivery or at a
+    later one for a copy already held (the source exports the manifest at
+    once and the proof only once anchored, so the proof normally arrives
+    on a later pass), is kept as <copy>.foreign.ots when it is a proof of
+    exactly those bytes and says more than what is held: nothing held, or
+    held pending and this one anchored. Returns the state kept, or None."""
+    if not companion.exists():
+        return None
+    foreign_raw = companion.read_bytes()
+    try:
+        proof = _check_foreign_proof(foreign_raw, digest)
+    except OtsError as exp:
+        log('%s inbox foreign proof rejected file=%s reason=%s' % (_stamp(), companion.name, exp))
+        return None
+    target = copy.with_name(copy.name + '.foreign.ots')
+    if target.exists():
+        try:
+            held = parse_ots(target.read_bytes())
+            if held.attestation[0] == 'bitcoin' or proof.attestation[0] != 'bitcoin':
+                return 'held ' + proof_state(held)
+        except OtsError:
+            pass   # an unreadable held proof is replaced
+    write_atomic(target, foreign_raw)
+    return proof_state(proof)
+
+
 def witness_inbox(cfg, witnessed_dir, log):
     """Consume the inbox: every *.json that parses as a selfstamp manifest
     is copied to witnessed/<host>-<period>-<sha12>.json (a proof that came
@@ -598,8 +696,11 @@ def witness_inbox(cfg, witnessed_dir, log):
     the inbox file is removed. The copy is the record: the submit pass
     stamps it through the operator lane like a manifest of our own, the
     next manifest lists it, and verify re-hashes it. A duplicate (bytes
-    already held) is simply removed; a file that is not a manifest goes
-    to <inbox>/rejected/. Nothing is read from anywhere but the inbox."""
+    already held) is removed, but a proof delivered beside it is stored
+    first (_store_foreign_proof): the source's anchored proof normally
+    arrives on a later pass than its manifest. A file that is not a
+    manifest goes to <inbox>/rejected/. Nothing is read from anywhere but
+    the inbox."""
     inbox = cfg.get('inbox')
     if not inbox:
         return 0
@@ -625,19 +726,12 @@ def witness_inbox(cfg, witnessed_dir, log):
         name = '%s-%s-%s.json' % (safe_name(m['host']), safe_name(m['period']), digest.hex()[:12])
         copy = witnessed_dir / name
         if copy.exists() and copy.read_bytes() == raw:
-            log('%s inbox duplicate file=%s already=%s' % (_stamp(), path.name, name))
+            foreign = _store_foreign_proof(copy, companion, digest, log)
+            log('%s inbox duplicate file=%s already=%s foreign_proof=%s' % (_stamp(), path.name, name, foreign))
             _remove(path)
             _remove(companion)
             continue
-        foreign = None
-        if companion.exists():
-            foreign_raw = companion.read_bytes()
-            try:
-                foreign = proof_state(_check_foreign_proof(foreign_raw, digest))
-                write_atomic(copy.with_name(name + '.foreign.ots'), foreign_raw)
-            except OtsError as exp:
-                log('%s inbox foreign proof rejected file=%s reason=%s'
-                    % (_stamp(), companion.name, exp))
+        foreign = _store_foreign_proof(copy, companion, digest, log)
         write_atomic(copy, raw)
         _remove(path)
         _remove(companion)
@@ -744,9 +838,20 @@ def _dirs(cfg):
     return state / 'manifests', state / 'witnessed'
 
 
-def run(cfg, period=None, now=None, log=None):
-    """The heartbeat. Returns the process exit code."""
+def run(cfg, period=None, now=None, log=None, lock_wait=LOCK_WAIT):
+    """The heartbeat, under the state directory's lock. Returns the process
+    exit code: 1 when the lock could not be had within lock_wait seconds
+    (logged 'locked'), else the passes' verdict."""
     log = log or print
+    try:
+        with state_lock(cfg['state_dir'], lock_wait):
+            return _run_locked(cfg, period, now, log)
+    except Locked as exp:
+        log('%s locked %s' % (_stamp(), exp))
+        return 1
+
+
+def _run_locked(cfg, period, now, log):
     now = now or _now_utc()
     period = period or (now.date() - datetime.timedelta(days=1))
     manifests_dir, witnessed_dir = _dirs(cfg)
@@ -784,13 +889,18 @@ def run(cfg, period=None, now=None, log=None):
     return rc
 
 
-def upgrade(cfg, log=None):
+def upgrade(cfg, log=None, lock_wait=LOCK_WAIT):
     log = log or print
-    failures = 0
-    for directory in _dirs(cfg):
-        if directory.is_dir():
-            failures += _upgrade_pass(cfg, directory, log)
-    return 1 if failures else 0
+    try:
+        with state_lock(cfg['state_dir'], lock_wait):
+            failures = 0
+            for directory in _dirs(cfg):
+                if directory.is_dir():
+                    failures += _upgrade_pass(cfg, directory, log)
+            return 1 if failures else 0
+    except Locked as exp:
+        log('%s locked %s' % (_stamp(), exp))
+        return 1
 
 
 # --- verify -------------------------------------------------------------------
@@ -810,10 +920,14 @@ def _describe_proof(path, raw):
     return 'unknown attestation %s' % parsed.attestation[1], False, None
 
 
-def _verify_witnessed(entries, witnessed_dir, log):
+def _verify_witnessed(entries, witnessed_dir, log, skip_copies=False):
     """The vouches: each entry must name a copy this box holds whose bytes
     hash to the recorded sha256, and the copy's own proof (if present) must
-    be a proof of those bytes. Returns False on any break."""
+    be a proof of those bytes. A copy that is not there (the file, or the
+    whole directory) is a break: the vouch is for bytes this box claims to
+    hold (2026-09-15 review: an absent directory used to pass). With
+    skip_copies the copies are not looked for at all and every vouch is
+    labelled SKIPPED. Returns False on any break."""
     ok = True
     for entry in entries:
         if not isinstance(entry, dict):
@@ -821,10 +935,12 @@ def _verify_witnessed(entries, witnessed_dir, log):
             ok = False
             continue
         name = entry.get('file') or ''
-        copy_state, proof_text = 'unavailable', 'unavailable'
-        if witnessed_dir is not None and witnessed_dir.is_dir():
-            copy = witnessed_dir / name
-            if not name or not copy.exists():
+        foreign_now = None
+        if skip_copies:
+            copy_state, proof_text = 'SKIPPED', 'SKIPPED'
+        else:
+            copy = witnessed_dir / name if name else None
+            if copy is None or not copy.is_file():
                 copy_state, proof_text = 'missing', 'missing'
                 ok = False
             else:
@@ -836,9 +952,16 @@ def _verify_witnessed(entries, witnessed_dir, log):
                     copy_state = 'ok'
                 proof_text, proof_ok, _ = _describe_proof(proof_path(copy), raw)
                 ok = ok and proof_ok
-        log('  vouches for host=%s seq=%s period=%s sha256=%s copy=%s proof=%s foreign_proof=%s'
+                foreign_path = copy.with_name(copy.name + '.foreign.ots')
+                if foreign_path.exists():
+                    try:
+                        foreign_now = proof_state(_check_foreign_proof(foreign_path.read_bytes(), hashlib.sha256(raw).digest()))
+                    except OtsError:
+                        foreign_now = 'unreadable'
+        log('  vouches for host=%s seq=%s period=%s sha256=%s copy=%s proof=%s foreign_proof=%s%s'
             % (entry.get('host'), entry.get('seq'), entry.get('period'), entry.get('sha256'),
-               copy_state, proof_text, entry.get('foreign_proof')))
+               copy_state, proof_text, entry.get('foreign_proof'),
+               ' foreign_now=%s' % foreign_now if foreign_now is not None else ''))
     return ok
 
 
@@ -879,18 +1002,20 @@ def cross_check(manifests_dir, witness_dir, log):
     return ok
 
 
-def verify_chain(manifests_dir, log=None, witnessed=None, witness=None):
+def verify_chain(manifests_dir, log=None, witnessed=None, witness=None, skip_witnessed=False):
     """Offline check a stranger can repeat with sha256sum, jq and the ots
     client: every manifest names its predecessor by file and sha256, seq
     counts from 1 without gaps, periods increase, every proof present is a
     well-formed proof of exactly its manifest's bytes, the genesis of a
     selfstamp/2 chain carries its commissioning block, and every witnessed
     entry names a copy this box holds that hashes as recorded (copies in
-    `witnessed`, default the manifests dir's sibling). With `witness`, the
-    manifests of another chain are read to say whether they vouch for this
-    one. Returns True when the chain, every present proof and every vouch
-    hold. A missing proof is reported, not a break: a submission may be a
-    run behind. Deleting the newest days leaves a chain that still
+    `witnessed`, default the manifests dir's sibling); a copy that is not
+    there is a break, unless `skip_witnessed` asks for the partial check,
+    which every vouch line and the summary then label. With `witness`,
+    the manifests of another chain are read to say whether they vouch for
+    this one. Returns True when the chain, every present proof and every
+    vouch hold. A missing proof is reported, not a break: a submission may
+    be a run behind. Deleting the newest days leaves a chain that still
     verifies — that limit is the cadence's (and a witness's) to expose,
     not the chain's."""
     log = log or print
@@ -960,12 +1085,12 @@ def verify_chain(manifests_dir, log=None, witnessed=None, witness=None):
         entries = manifest.get('witnessed') or []
         if entries:
             vouches += len(entries)
-            if not _verify_witnessed(entries, witnessed_dir, log):
+            if not _verify_witnessed(entries, witnessed_dir, log, skip_copies=skip_witnessed):
                 ok = False
         prev_name, prev_raw, prev_period = path.name, raw, period
-    log('manifests=%d chain=%s proofs: bitcoin=%d pending=%d missing=%d vouches=%d' % (
+    log('manifests=%d chain=%s proofs: bitcoin=%d pending=%d missing=%d vouches=%d%s' % (
         len(files), 'ok' if ok else 'BROKEN', counts['bitcoin'], counts['pending'],
-        counts['missing'], vouches))
+        counts['missing'], vouches, ' (copies not checked: --skip-witnessed)' if skip_witnessed and vouches else ''))
     if witness:
         if not cross_check(manifests_dir, witness, log):
             ok = False
@@ -982,28 +1107,35 @@ def main(argv=None):
     p_run = sub.add_parser('run', help='heartbeat: inbox, manifest, submit, upgrade, outbox (idempotent)')
     p_run.add_argument('--config', default=default_config)
     p_run.add_argument('--period', help='UTC day to cover, YYYY-MM-DD (default: yesterday)')
+    p_run.add_argument('--lock-wait', type=float, default=LOCK_WAIT,
+                       help='seconds to wait for the state directory lock (default %(default)s)')
 
     p_up = sub.add_parser('upgrade', help='only the upgrade pass')
     p_up.add_argument('--config', default=default_config)
+    p_up.add_argument('--lock-wait', type=float, default=LOCK_WAIT,
+                      help='seconds to wait for the state directory lock (default %(default)s)')
 
     p_ver = sub.add_parser('verify', help='offline chain, proof, commissioning and vouch check')
     p_ver.add_argument('--config')
     p_ver.add_argument('--manifests', help='manifests directory (a stranger needs no config)')
     p_ver.add_argument('--witnessed', help='witnessed copies directory (default: beside manifests)')
     p_ver.add_argument('--witness', help="another chain's manifests directory: does it vouch for this one?")
+    p_ver.add_argument('--skip-witnessed', action='store_true',
+                       help='partial check: do not look for the witnessed copies (every vouch is labelled SKIPPED)')
 
     args = parser.parse_args(argv)
     if args.command == 'run':
         period = datetime.date.fromisoformat(args.period) if args.period else None
-        return run(load_config(args.config), period=period)
+        return run(load_config(args.config), period=period, lock_wait=args.lock_wait)
     if args.command == 'upgrade':
-        return upgrade(load_config(args.config))
+        return upgrade(load_config(args.config), lock_wait=args.lock_wait)
     if args.manifests:
         manifests_dir = args.manifests
     else:
         cfg = load_config(args.config or default_config)
         manifests_dir = os.path.join(cfg['state_dir'], 'manifests')
-    return 0 if verify_chain(manifests_dir, witnessed=args.witnessed, witness=args.witness) else 1
+    return 0 if verify_chain(manifests_dir, witnessed=args.witnessed, witness=args.witness,
+                             skip_witnessed=args.skip_witnessed) else 1
 
 
 if __name__ == '__main__':

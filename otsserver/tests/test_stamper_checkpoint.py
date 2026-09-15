@@ -29,6 +29,7 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -62,7 +63,7 @@ class Test_checkpoint_written(unittest.TestCase):
         if not os.path.exists(path):
             return None
         with open(path, 'r') as fd:
-            return int(fd.read().strip())
+            return int(fd.read().split()[0])   # 'INDEX' or 'INDEX GENERATION'
 
     def make_checkpoint_stamper(self):
         stamper = make_stamper(receipts_path=None)
@@ -180,6 +181,42 @@ class Test_checkpoint_honoured_on_restart(unittest.TestCase):
             # The honour contract: nothing below the checkpoint was probed.
             self.assertEqual(sorted(calendar.checked),
                              sorted([journal_entry(3), journal_entry(4)]))
+
+
+class Test_checkpoint_the_stamper_cannot_read(unittest.TestCase):
+    """2026-09-15 review, P2 "malformed or unreadable checkpoint kills only
+    the stamper": a start the stamper cannot complete now stops the whole
+    service (CRITICAL log, exit_event set for the launcher), never a dead
+    thread behind a live listener and never an unhandled exception."""
+
+    def start(self, path):
+        event = threading.Event()
+        with mock.patch('threading.excepthook') as hook, \
+                mock.patch.object(Stamper, '_Stamper__do_bitcoin') as bitcoin, \
+                self.assertLogs(level='CRITICAL') as logs:
+            stamper = Stamper(types.SimpleNamespace(path=path), event, 12, 1, 6, 600, 100000, 100)
+            stamper.thread.join(5)
+        self.assertFalse(stamper.thread.is_alive())
+        self.assertTrue(event.is_set(), 'the whole service must stop')
+        hook.assert_not_called()
+        bitcoin.assert_not_called()
+        self.assertIsNotNone(stamper.failure)
+        return '\n'.join(logs.output)
+
+    def test_a_malformed_checkpoint_stops_the_service(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'journal'), 'wb'):
+                pass
+            with open(os.path.join(d, 'journal.known-good'), 'w') as fd:
+                fd.write('torn-or-corrupt\n')
+            text = self.start(d)
+            self.assertIn('journal.known-good', text)
+            self.assertIn('Recovery', text)
+
+    def test_a_missing_journal_stops_the_service(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = self.start(d)
+            self.assertIn('journal', text)
 
 
 if __name__ == "__main__":

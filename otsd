@@ -127,10 +127,25 @@ server = otsserver.rpc.StampServer((args.rpc_address, args.rpc_port),
                                    aggregator,
                                    calendar)
 
+# Serve until a worker stops the service or the operator does. A worker
+# that fails past recovery (the aggregator's round did not commit, the
+# stamper cannot start) sets exit_event: the listener is shut down, the
+# workers joined, and the process exits 1 so the supervisor restarts it;
+# never a dead worker behind a live port.
 try:
-    server.serve_forever()
+    otsserver.rpc.serve_until_exit(server, exit_event, [aggregator.thread, stamper.thread])
 except KeyboardInterrupt:
     exit_event.set()
     sys.exit(0)
+
+failed = [name for name, worker in (('aggregator', aggregator), ('stamper', stamper))
+          if getattr(worker, 'failure', None) is not None]
+logging.critical("otsd: %s stopped the service; exiting 1 so the supervisor restarts it"
+                 % (' and '.join(failed) or 'a worker'))
+if any(worker.is_alive() for worker in (aggregator.thread, stamper.thread)):
+    logging.critical("otsd: a worker thread is still alive after the join timeout; forcing the exit")
+    logging.shutdown()
+    os._exit(1)
+sys.exit(1)
 
 # vim:syntax=python filetype=python

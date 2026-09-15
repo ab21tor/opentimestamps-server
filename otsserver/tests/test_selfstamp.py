@@ -39,9 +39,13 @@ import pathlib
 import shutil
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 TOOL = pathlib.Path(__file__).resolve().parents[2] / 'ops' / 'selfstamp.py'
 
@@ -847,6 +851,219 @@ class Test_witness(SelfstampCase):
         self.assertEqual(json.loads((self.b_dir() / '2026-09-02.json').read_text())['witnessed'], [])
         self.assertTrue(any('inbox duplicate' in line for line in self.wlog), self.wlog)
         self.assertTrue(any('inbox rejected' in line and 'garbage.json' in line for line in self.wlog), self.wlog)
+
+
+def proof_bytes(digest, height=None):
+    """A minimal detached proof of digest: pending (height None) or bitcoin."""
+    if height is None:
+        return selfstamp.build_ots(digest, pending_response(digest)[0])
+    payload = vu(height)
+    return MAGIC + b'\x01\x08' + digest + b'\x00' + BITCOIN_TAG + vu(len(payload)) + payload
+
+
+HOLD_SCRIPT = """
+import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location('selfstamp', sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+with m.state_lock(sys.argv[2], 0):
+    print('held', flush=True)
+    time.sleep(float(sys.argv[3]))
+"""
+
+
+class Test_state_lock(SelfstampCase):
+    """2026-09-15 review, P2 "concurrent self-stamp runs can leave an
+    irrecoverably mismatched proof": run and upgrade hold an exclusive lock
+    on the state directory for their whole duration, across processes."""
+
+    def test_two_overlapping_runs_in_one_process_leave_one_manifest_with_its_own_proof(self):
+        # Two runs for the same period, with different clocks (so their
+        # manifests would differ), both start before either has written.
+        original = selfstamp.build_manifest
+
+        def slow_build(*args, **kwargs):
+            time.sleep(0.5)
+            return original(*args, **kwargs)
+        codes, errors = [], []
+
+        def run(second):
+            try:
+                codes.append(selfstamp.run(self.cfg, period=P1, log=self.log.append,
+                                           now=datetime.datetime(2026, 9, 2, 0, 30, second, tzinfo=datetime.timezone.utc)))
+            except Exception as exc:
+                errors.append(exc)
+        with mock.patch.object(selfstamp, 'build_manifest', side_effect=slow_build):
+            threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(codes), [0, 0])
+        self.assertEqual(self.manifests(), ['2026-09-01.json'])
+        raw = (self.state / 'manifests' / '2026-09-01.json').read_bytes()
+        proof = selfstamp.parse_ots((self.state / 'manifests' / '2026-09-01.json.ots').read_bytes())
+        self.assertEqual(proof.digest, hashlib.sha256(raw).digest())
+        self.assertEqual(self.calendar.operator_posts, 1, 'one manifest, one submission')
+        self.assertTrue(any('noop' in line for line in self.log), self.log)
+        rows = []
+        self.assertTrue(selfstamp.verify_chain(self.state / 'manifests', log=rows.append), rows)
+
+    def test_a_manual_command_overlapping_the_timer_waits_or_is_refused_across_processes(self):
+        cfg_path = self.root / 'config.json'
+        cfg_path.write_text(json.dumps({'state_dir': str(self.state), 'calendar_url': self.calendar.url,
+                                        'host': 'testbox', 'books': {}}))
+        cli = [sys.executable, str(TOOL)]
+        holder = subprocess.Popen([sys.executable, '-c', HOLD_SCRIPT, str(TOOL), str(self.state), '4'],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), 'held')
+            # A short wait: refused, nothing written.
+            refused = subprocess.run(cli + ['run', '--config', str(cfg_path), '--period', '2026-09-01', '--lock-wait', '0.5'],
+                                     capture_output=True, text=True, timeout=30)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn('locked', refused.stdout)
+            self.assertEqual(self.manifests(), [])
+            refused = subprocess.run(cli + ['upgrade', '--config', str(cfg_path), '--lock-wait', '0.5'],
+                                     capture_output=True, text=True, timeout=30)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn('locked', refused.stdout)
+            # A patient one waits for the holder, then does the run.
+            waited = subprocess.run(cli + ['run', '--config', str(cfg_path), '--period', '2026-09-01', '--lock-wait', '30'],
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(waited.returncode, 0, waited.stdout + waited.stderr)
+            self.assertEqual(self.manifests(), ['2026-09-01.json'])
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_atomic_writes_use_unique_names_and_fsync_the_directory(self):
+        target = self.root / 'target'
+        synced = []
+        real = os.fsync
+
+        def record(fd):
+            synced.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+            return real(fd)
+        with mock.patch.object(selfstamp.os, 'fsync', side_effect=record):
+            threads = [threading.Thread(target=selfstamp.write_atomic, args=(target, b'%d' % i)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        self.assertIn(target.read_bytes(), [b'%d' % i for i in range(8)])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.name.startswith('.target.')), [],
+                         'no temporary file is left behind')
+        self.assertGreaterEqual(synced.count(True), 8, 'every write fsyncs the directory')
+        self.assertGreaterEqual(synced.count(False), 8)
+
+
+class Test_witnessed_copies(unittest.TestCase):
+    """2026-09-15 review: a vouch whose copy is absent (the file or the whole
+    directory) is a break, unless the partial check is asked for by name;
+    a proof delivered later for a manifest already witnessed is stored."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.root = pathlib.Path(self.tmpdir.name)
+
+    def chain_with_a_vouch(self, copies):
+        entry = {'host': 'other', 'seq': 1, 'period': '2026-09-01', 'file': 'other-2026-09-01-abcdef012345.json',
+                 'sha256': 'ab' * 32}
+        manifests = self.root / 'manifests'
+        manifests.mkdir()
+        (manifests / '2026-09-01.json').write_text(json.dumps({
+            'schema': 'selfstamp/2', 'host': 'box', 'seq': 1, 'period': '2026-09-01', 'prev': None,
+            'commissioning': {}, 'witnessed': [entry]}))
+        return manifests, self.root / copies
+
+    def test_a_missing_directory_or_copy_is_a_break(self):
+        manifests, copies = self.chain_with_a_vouch('absent')
+        rows = []
+        self.assertFalse(selfstamp.verify_chain(manifests, witnessed=copies, log=rows.append), rows)
+        self.assertTrue(any('copy=missing' in r for r in rows), rows)
+        self.assertNotIn('unavailable', '\n'.join(rows))
+        copies.mkdir()   # the directory without the copy: the same break
+        rows = []
+        self.assertFalse(selfstamp.verify_chain(manifests, witnessed=copies, log=rows.append), rows)
+        self.assertTrue(any('copy=missing' in r for r in rows), rows)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(selfstamp.main(['verify', '--manifests', str(manifests), '--witnessed', str(copies)]), 1)
+
+    def test_the_partial_check_must_be_asked_for_and_is_labelled(self):
+        manifests, copies = self.chain_with_a_vouch('absent')
+        rows = []
+        self.assertTrue(selfstamp.verify_chain(manifests, witnessed=copies, skip_witnessed=True, log=rows.append), rows)
+        self.assertTrue(any('copy=SKIPPED' in r for r in rows), rows)
+        self.assertTrue(any('copies not checked' in r for r in rows), rows)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(selfstamp.main(['verify', '--manifests', str(manifests), '--witnessed', str(copies),
+                                             '--skip-witnessed']), 0)
+        self.assertIn('SKIPPED', out.getvalue())
+
+    def test_a_later_foreign_proof_is_stored_and_a_lesser_one_never_replaces_a_better(self):
+        raw = json.dumps({'schema': 'selfstamp/2', 'host': 'other', 'seq': 1, 'period': '2026-09-01'}).encode()
+        digest = hashlib.sha256(raw).digest()
+        inbox, copies = self.root / 'inbox', self.root / 'witnessed'
+        inbox.mkdir()
+        log = []
+
+        def deliver(proof=None):
+            (inbox / 'manifest.json').write_bytes(raw)
+            if proof is not None:
+                (inbox / 'manifest.json.ots').write_bytes(proof)
+            selfstamp.witness_inbox({'inbox': str(inbox)}, copies, log.append)
+            self.assertEqual(list(inbox.iterdir()), [])
+
+        def foreign():
+            found = list(copies.glob('*.foreign.ots'))
+            return found[0].read_bytes() if found else None
+        deliver()                                    # the manifest first, as the outbox exports it
+        self.assertIsNone(foreign())
+        deliver(proof_bytes(digest))                 # a pending proof: stored
+        self.assertEqual(selfstamp.parse_ots(foreign()).attestation[0], 'pending')
+        deliver(proof_bytes(digest, 965500))         # anchored: replaces the pending one
+        self.assertEqual(selfstamp.parse_ots(foreign()).attestation, ('bitcoin', 965500))
+        deliver(proof_bytes(digest))                 # pending again: the anchored one is kept
+        self.assertEqual(selfstamp.parse_ots(foreign()).attestation, ('bitcoin', 965500))
+        deliver(proof_bytes(b'\x00' * 32, 1))        # a proof of other bytes: rejected, the held one kept
+        self.assertEqual(selfstamp.parse_ots(foreign()).attestation, ('bitcoin', 965500))
+        self.assertTrue(any('foreign proof rejected' in line for line in log), log)
+        self.assertTrue(any('inbox duplicate' in line and 'foreign_proof=bitcoin height=965500' in line for line in log), log)
+        self.assertEqual(sorted(p.name for p in copies.iterdir()),
+                         sorted(['other-2026-09-01-%s.json' % digest.hex()[:12],
+                                 'other-2026-09-01-%s.json.foreign.ots' % digest.hex()[:12]]))
+
+
+class Test_witness_delivery(Test_witness):
+    """The normal two-stage delivery: the manifest today, the anchored
+    proof on a later pass. The proof must be kept, and verify shows it."""
+
+    def test_the_source_proof_that_arrives_later_is_kept_and_shown(self):
+        self.assertEqual(self.run_tool(P1), 0, self.log)      # A: manifest exported, proof pending (not exported)
+        self.deliver()
+        self.assertEqual(self.run_witness(P1), 0, self.wlog)   # B witnesses the manifest alone
+        name = next(p.name for p in (self.witness_state / 'witnessed').glob('testbox-*.json'))
+        self.assertFalse((self.witness_state / 'witnessed' / (name + '.foreign.ots')).exists())
+        self.calendar.mined_height = 965500
+        self.assertEqual(self.run_tool(P1), 0, self.log)      # A's proof anchors and is exported
+        self.calendar.mined_height = None
+        self.deliver()                                         # manifest again, now with the proof
+        self.assertEqual(self.run_witness(P2), 0, self.wlog)
+        foreign = self.witness_state / 'witnessed' / (name + '.foreign.ots')
+        self.assertTrue(foreign.exists(), 'the later proof is stored, not deleted as a duplicate')
+        self.assertEqual(selfstamp.parse_ots(foreign.read_bytes()).attestation, ('bitcoin', 965500))
+        self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), [])
+        rows = []
+        self.assertTrue(selfstamp.verify_chain(self.b_dir(), log=rows.append), rows)
+        self.assertTrue(any('vouches for host=testbox seq=1' in r and 'foreign_now=bitcoin height=965500' in r
+                            for r in rows), rows)
+        # The manifest that witnessed it is not rewritten: its entry still
+        # records what was known at the time.
+        m = json.loads((self.b_dir() / '2026-09-01.json').read_text())
+        self.assertIsNone(m['witnessed'][0]['foreign_proof'])
 
 
 if __name__ == "__main__":

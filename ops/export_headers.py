@@ -8,11 +8,21 @@ headers.bin is every block header from genesis, 80 bytes each, height =
 offset / 80: what ops/verify_claim.py reads. One run appends what the node
 has beyond the file (a first run writes the whole chain, ~77 MB, in
 batched RPC calls); daily on a timer (ops/systemd/headers.timer). Before
-anything is written, each new header must link to the last one on file
-and meet its own proof-of-work target, and its bits must not move between
-retargets; a header that fails is refused and the run exits 1 with the
-file untouched. A tail the node no longer agrees with (a reorg) is cut
-back to the last common header and re-exported, and logged.
+anything is written, each new header must link to the last one on file,
+pass Bitcoin Core's target rules and meet its own proof-of-work target,
+and its bits must not move between retargets; a header that fails is
+refused and the run exits 1 with the file untouched. A tail the node no
+longer agrees with (a reorg) is cut back to the last common header and
+re-exported, and logged.
+
+One writer at a time: the run holds an exclusive lock (<out>.lock, flock,
+across processes) and a second run, the timer's or a manual one, is
+refused with exit 1. Every byte is written by a checked loop (os.write
+may write less than asked: a short write used to be reported as a whole
+batch), the file is fsynced after each batch and its directory after the
+run. A file that ends in part of a header (an interrupted append) is cut
+back to its last whole header and the run goes on from there, logged;
+nothing is ever repaired by hand.
 
 The node access is the calendar's own: BITCOIN_RPC_SERVICE_URL from the
 compose .env (--env), whose host.docker.internal is the container's name
@@ -26,6 +36,8 @@ check and the expert's checkpoint comparison do.
 
 import argparse
 import base64
+import errno
+import fcntl
 import json
 import os
 import sys
@@ -34,7 +46,7 @@ import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from verify_claim import HEADER_SIZE, RETARGET_INTERVAL, decode_bits, display, header_bits, header_fields, sha256d  # noqa: E402
+from verify_claim import HEADER_SIZE, NETWORKS, RETARGET_INTERVAL, check_target, display, header_bits, header_fields, sha256d  # noqa: E402
 
 
 def rpc_batch(url, calls):
@@ -82,18 +94,37 @@ def node_hashes(url, heights, batch):
     return out
 
 
-def check_header(header, height, prev_hash, prev_bits):
-    """None if the header links, is mined and keeps its bits; else the reason"""
+def write_all(fd, data):
+    """Every byte, or an error: os.write may write less than it was given."""
+    view = memoryview(data)
+    while len(view):
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError(errno.EIO, 'write made no progress')
+        view = view[n:]
+
+
+def fsync_dir(path):
+    fd = os.open(os.path.dirname(os.path.abspath(path)) or '.', os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def check_header(header, height, prev_hash, prev_bits, network='mainnet'):
+    """None if the header links, meets Bitcoin Core's target rules and its
+    own proof of work, and keeps its bits between retargets; else the reason"""
     fields = header_fields(header)
     if prev_hash is not None and fields['prev'] != prev_hash:
         return 'height %d does not link to the header before it' % height
     try:
-        target = decode_bits(fields['bits'])
+        target = check_target(fields['bits'], network)
     except ValueError as exp:
-        return 'height %d: invalid target (%s)' % (height, exp)
+        return 'height %d: invalid target (%s; bits 0x%08x)' % (height, exp, fields['bits'])
     if int.from_bytes(sha256d(header), 'little') > target:
         return 'height %d fails proof of work' % height
-    if prev_bits is not None and height % RETARGET_INTERVAL and fields['bits'] != prev_bits:
+    if NETWORKS[network]['retarget'] and prev_bits is not None and height % RETARGET_INTERVAL and fields['bits'] != prev_bits:
         return 'height %d changes bits between retargets' % height
     return None
 
@@ -111,6 +142,8 @@ def main(argv=None, out=None):
     parser.add_argument('--env', help='compose .env holding BITCOIN_RPC_SERVICE_URL')
     parser.add_argument('--rpc-host', help='replace the URL\'s host (host.docker.internal -> 127.0.0.1 on the host)')
     parser.add_argument('--batch', type=int, default=500, help='RPC calls per batch (default 500)')
+    parser.add_argument('--network', choices=sorted(NETWORKS), default='mainnet',
+                        help='the chain the node is on (default mainnet); regtest only for easy-difficulty test chains')
     args = parser.parse_args(argv)
     if bool(args.rpc_url) == bool(args.env):
         parser.error('give --rpc-url or --env')
@@ -120,11 +153,34 @@ def main(argv=None, out=None):
         url = urllib.parse.urlunsplit((split.scheme, split.netloc.replace(split.hostname, args.rpc_host),
                                        split.path, split.query, split.fragment))
 
-    # What is on file, and whether the node still agrees with its tail.
+    # One writer at a time, across processes: the lock goes with the
+    # descriptor, so a run that dies releases it.
+    lock_path = args.out + '.lock'
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log('refused: another export holds %s' % lock_path)
+            return 1
+        return _export(args, url, log)
+    finally:
+        os.close(lock_fd)
+
+
+def _export(args, url, log):
+    # What is on file, and whether the node still agrees with its tail. A
+    # file that ends in part of a header (an interrupted append) is cut
+    # back to its last whole header first.
     have = os.path.getsize(args.out) // HEADER_SIZE if os.path.exists(args.out) else 0
     if os.path.exists(args.out) and os.path.getsize(args.out) % HEADER_SIZE:
-        log('refused: %s is not a whole number of headers; repair it by hand' % args.out)
-        return 1
+        over = os.path.getsize(args.out) % HEADER_SIZE
+        with open(args.out, 'r+b') as trunc:
+            trunc.truncate(have * HEADER_SIZE)
+            trunc.flush()
+            os.fsync(trunc.fileno())
+        log('recovered: %s held %d bytes of an incomplete header after %d whole ones (an interrupted append); dropped'
+            % (args.out, over, have))
     tip, = rpc_batch(url, [('getblockcount', [])])
     prev_hash = None
     prev_bits = None
@@ -145,6 +201,8 @@ def main(argv=None, out=None):
                 fd.close()
                 with open(args.out, 'r+b') as trunc:
                     trunc.truncate(keep * HEADER_SIZE)
+                    trunc.flush()
+                    os.fsync(trunc.fileno())
                 have = keep
             if have:
                 with open(args.out, 'rb') as fd2:
@@ -165,7 +223,7 @@ def main(argv=None, out=None):
             if len(header) != HEADER_SIZE:
                 log('refused: the node answered %d bytes for height %d' % (len(header), h))
                 return 1
-            reason = check_header(header, h, prev_hash, prev_bits)
+            reason = check_header(header, h, prev_hash, prev_bits, args.network)
             if reason:
                 log('refused: %s; nothing from this batch written' % reason)
                 return 1
@@ -174,12 +232,18 @@ def main(argv=None, out=None):
             prev_bits = header_bits(header)
         fd = os.open(args.out, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
-            os.write(fd, bytes(chunk))
+            write_all(fd, bytes(chunk))
             os.fsync(fd)
+        except OSError as exp:
+            log('refused: writing %d headers to %s failed (%s); the file may end in an incomplete header, which the '
+                'next run cuts back' % (len(heights), args.out, exp))
+            return 1
         finally:
             os.close(fd)
         appended += len(heights)
         height = heights[-1] + 1
+    if appended:
+        fsync_dir(args.out)
     log('appended %d headers to %s; tip height %d hash %s; %d headers on file'
         % (appended, args.out, tip, display(prev_hash) if prev_hash else '-', os.path.getsize(args.out) // HEADER_SIZE))
     return 0

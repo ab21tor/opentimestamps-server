@@ -64,16 +64,23 @@ Each rule below is made by the code described in the section it names.
   seen; while no block is known it carries none rather than an invented
   one ("Not-before bound").
 - Exactly one receipt is written per confirmed anchor, after the calendar
-  save. A crash loses at most one receipt, named in a marker, and never
-  writes two receipts for the same records. Record counts err low, with
-  one bounded exception ("Anchor receipts").
+  save. Every byte of the receipt is checked onto disk, file and
+  directory fsynced, before its marker goes; a crash loses at most one
+  receipt, named in that marker and recovered from it, and never writes
+  two receipts for the same records. Record counts err low, with one
+  bounded exception ("Anchor receipts").
 - A digest submitted through the operator lane is aggregated and anchored
   like any other and is never counted as a record ("Operator lane").
 - A receipted anchor found off the chain is reported and is never
   re-anchored automatically ("Deep-reorg detector").
 - The receipts, the counts, the checkpoint, the marker, the bound and the
   detector never stop anchoring or intake: each failure is logged and the
-  loop continues.
+  loop continues. A confirmed tree whose calendar save fails is kept and
+  retried every pass until it lands. Two failures do stop the service,
+  loudly, with a nonzero exit so the supervisor restarts it: an aggregator
+  round that does not commit, and a stamper that cannot start (a
+  checkpoint it cannot read, or one that disagrees with the database:
+  "Restart checkpoint"). A dead worker never sits behind a live port.
 - The tools under `ops/` open no listener. Their inputs beyond the
   filesystem are the calendar on loopback, one `journalctl` call
   (self-stamp), bitcoind RPC (headers export) and, for the watcher, the
@@ -457,12 +464,24 @@ Two rules the code keeps:
 - A receipt write failure never breaks anchoring. The stamper logs one
   warning and continues; the calendar save always happens, and the
   receipt stays in the pending marker until it can be written.
+- A confirmed tree leaves memory only once its calendar save has
+  returned (LevelDB's synchronous write). A save that fails is logged
+  once, the tree is kept, and every pass, new block or not, retries every
+  mature unsaved tree until it lands; nothing accepted is dropped.
 - No crash writes two receipts for the same records, and a crash loses at
   most one receipt, named. The receipt is written after the calendar
   save, guarded by a marker: before the save the stamper writes
   `<receipts file>.pending`, the receipt line plus one commitment of the
-  anchor's tree, atomically; after the save it appends the receipt and
-  removes the marker. A marker still present at the next start, or when
+  anchor's tree, atomically (fsynced, with its directory); after the save
+  it appends the receipt, every byte checked (a short write is completed,
+  never taken for a whole line), fsyncs the file and its directory, and
+  only then removes the marker. An incomplete last line left by an
+  interrupted append is dropped before the next append and its receipt
+  recovered from the marker, so no completed receipt is ever duplicated
+  and no outstanding marker discarded. What the tests inject is the
+  failure at the write boundary (short writes, errors, a stop between the
+  steps); a power cut is not simulated, and the fsyncs are what a power
+  cut relies on. A marker still present at the next start, or when
   the next anchor confirms, is settled by asking the calendar whether it
   holds that commitment. If it does, the save completed and the receipt
   is appended unless its txid is already on file (`recovered from the
@@ -561,6 +580,28 @@ the calendar once per entry, a cost that grows with all history; with it,
 a restart's catch-up is one anchor window. Deleting the file is safe and
 restores the full rescan. There is no configuration.
 
+The file is tied to the database it describes. `db/` carries a
+generation (16 random bytes, chosen when the database is created) and a
+committed watermark: the checkpoint index, written in the same
+synchronous LevelDB batch as the confirmed timestamps that make it true,
+so the file can never claim more than the database durably holds. The
+file reads `INDEX GENERATION`, and at every start the calendar checks the
+pair before serving: a checkpoint whose generation is not the database's
+(`db/` recreated, or restored from another lineage), or whose index is
+above the database's watermark (`db/` restored from an older backup than
+the checkpoint), or that cannot be read at all, stops the service with
+`CALENDAR STORAGE INCONSISTENT` and the recovery text, exit 1. Nothing in
+this check reads a file's timestamp. Recovery is to delete the checkpoint
+and start again: the stamper rescans from index 0 and re-anchors every
+commitment the database lacks ("Recover" for what that costs). Migration
+of a calendar from before this (a file holding the index alone, a
+database without a generation): at the first start the checkpoint is
+adopted only if the journal entry just below it is in the database; the
+database is then stamped with a generation and that watermark and the
+file rewritten in the new form, logged at WARNING; otherwise the start is
+refused with the same recovery text. To skip the adoption, delete the
+checkpoint before the first start: one full rescan.
+
 ### Operator lane
 
 With `OTSD_OPERATOR_LANE=1` in the calendar's environment the server
@@ -611,7 +652,13 @@ python3 ops/selfstamp.py verify  --manifests ~/selfstamp/manifests  # offline, n
 `run` is idempotent per period: a manifest that exists is left alone (a
 second run the same day writes nothing), a manifest without a proof is
 resubmitted rather than rewritten, a pending proof is asked about once
-per run, a complete proof is never touched again. The trigger is the
+per run, a complete proof is never touched again. `run` and `upgrade`
+hold an exclusive lock on the state directory (`<state_dir>/.lock`,
+across processes) for their whole duration, so the timer's run and a
+manual one never interleave their writes: the second waits up to
+`--lock-wait` seconds (default 300), then exits 1 with `locked`. Every
+file is written under a unique temporary name, fsynced, renamed, and its
+directory fsynced. The trigger is the
 clock and only the clock: an anchor confirming, which appends a receipt
 line (including for the anchor that carried this manifest), never causes
 a manifest; the next day's manifest records the new receipts hash. Missed
@@ -766,8 +813,12 @@ those bytes, stamps the copy's sha256 through its own operator lane
 (never the counted door: a witnessed file is not a record and never
 reaches a receipt), upgrades that proof on later runs like its own, and
 removes the inbox file. The copy is the record, so a run interrupted
-anywhere converges: a file already held is a duplicate and is removed; a
-file that is not a manifest is moved to `<inbox>/rejected/` and logged.
+anywhere converges: a file already held is a duplicate and is removed,
+after any proof delivered beside it is kept (the source exports its
+proof only once it is anchored, so the proof normally arrives on a later
+pass than its manifest; a later proof replaces a pending one and never
+an anchored one, and `verify` prints what is held now as `foreign_now`);
+a file that is not a manifest is moved to `<inbox>/rejected/` and logged.
 The witness's next manifest lists every copy no earlier manifest listed,
 as a `witnessed` entry naming the source `host`, `seq`, `period`, the
 copy's file name and sha256, when it was witnessed, and what the foreign
@@ -789,7 +840,11 @@ every 5 minutes), standard library only, no listener. It reads the
 calendar's status line on loopback, unit and container states, files and
 the journal, writes `~/watcher/status`, `state.json` and `watch.log`, and
 alerts through ntfy (optional) on transitions only; one line a day is the
-heartbeat. Config: `<WATCH_DIR>/config` (`ops/watch.config.example`); a
+heartbeat. Every message is written to `~/watcher/outbox.json` before
+the journal cursor moves past what produced it, delivered oldest first,
+and kept and retried by every later run until it is delivered (the run
+exits 1 while anything is undelivered); with `NTFY_URL` empty nothing is
+queued and the log carries the text. Config: `<WATCH_DIR>/config` (`ops/watch.config.example`); a
 knob left empty skips its check, so it neither fails nor counts. With the
 single-host config that is fifteen checks: the calendar's status
 (reachable, `best_block` set, no anchor needing attention, receipts on,
@@ -808,10 +863,16 @@ verifier. It uses the calendar's own node access
 127.0.0.1` on the host; the three RPCs it needs are in the whitelist of
 step 1) and appends what the node has beyond the file; the first run
 exports the whole chain. Before anything is written each new header must
-link to the last one on file and meet the proof-of-work target its own
-bits field encodes; a header that fails is refused and the run exits 1
-with the file untouched. A tail the node no longer agrees with (a reorg) is
-cut back to the last common header and re-exported, logged. The timer
+link to the last one on file, pass Bitcoin Core's target rules (a
+negative, zero, overflowing or above-powLimit bits field is refused) and
+meet the proof-of-work target its own bits field encodes; a header that
+fails is refused and the run exits 1 with the file untouched. A tail the node no longer agrees with (a reorg) is
+cut back to the last common header and re-exported, logged. One writer
+at a time: the run holds `headers.bin.lock` (across processes) and a
+second run is refused with exit 1; every byte is written by a checked
+loop and fsynced, and a file that ends in part of a header (an
+interrupted append) is cut back to its last whole header and the run
+goes on, logged `recovered`. The timer
 (`ops/systemd/headers.timer`, 01:00 UTC) runs it daily into
 `~/claim-kit/export.log`. Which chain the file is, the exporter does not
 judge: the verifier's genesis check and a stated checkpoint do.
@@ -851,7 +912,9 @@ python3 verify_claim.py EXHIBIT EXHIBIT.ots headers.bin
 python3 verify_claim.py EXHIBIT EXHIBIT.ots headers.bin --checkpoint 959450:00000000000000000001b119c6848c6db6e8cbc2ce908d73891581a1345c984c
 ```
 
-The verifier prints every step and exits 0 only if all of them hold:
+The verifier prints every step and exits 0 only if all of them hold: 1
+when any check fails, 2 when every check that could run passed but
+nothing ties the headers file to Bitcoin (`INCOMPLETE`, below):
 
 1. the exhibit's sha256 is the digest the proof is about;
 2. every operation in the proof is replayed from that digest: the
@@ -861,34 +924,53 @@ The verifier prints every step and exits 0 only if all of them hold:
    Bitcoin attestation names;
 3. the block at the attested height, read from `headers.bin`, carries
    exactly that merkle root, and its own timestamp is printed;
-4. `headers.bin` is one chain: every header links to the previous one's
-   hash, meets the proof-of-work target its own bits field encodes, and
-   keeps the difficulty rule (bits unchanged between retargets; at every
+4. `headers.bin` is one chain, checked whole: every header passes
+   Bitcoin Core's target rules (a negative, zero, overflowing or
+   above-powLimit bits field is refused), meets the proof-of-work target
+   its bits field encodes, links to the previous header's hash, and keeps
+   the difficulty rule (bits unchanged between retargets; at every
    retarget, Bitcoin's adjustment recomputed from the period's
-   timestamps), from the genesis block, whose hash is hardcoded, or from
-   a checkpoint.
+   timestamps). Nothing is skipped: the attested block, and the block a
+   not-before bound rests on, are checked like every other;
+5. what ties that chain to Bitcoin: the genesis block, whose hash is
+   hardcoded, when the file starts at height 0; or the checkpoint stated
+   with `--checkpoint HEIGHT:HASH`, which must be in the file and match.
+   A checkpoint anywhere in the file pins every header in it: those
+   before it by the links back from it (each header's bytes are the
+   preimage of the next header's previous-hash field), those after it by
+   the links forward. The checkpoint may therefore be later than the
+   anchor (the newest header the expert compared), and the anchor block
+   is authenticated all the same.
 
 Then a `TRUST` block states what the verdict rests on. Verified from
 genesis, that is proof of work alone; nothing about the file's origin is
-assumed. Verified from a checkpoint (`--checkpoint HEIGHT:HASH`, which
-spares the full-chain check), the checkpoint is the one thing the tool
-cannot check, so it prints it for comparison with any public source; a
-file that does not start at genesis and is given no checkpoint is
-verified from its first header, which the tool names as an UNSTATED
-CHECKPOINT to compare. A checkpoint that does not match the file is
-reported as `CHECKPOINT MISMATCH` with both hashes. The headers file's
-origin is not evidence and the tool says so; the chain check is.
+assumed. Verified from a checkpoint, the checkpoint is the one thing the
+tool cannot check, so it prints it for comparison with any public source.
+A file that does not start at genesis and is given no checkpoint is tied
+to nothing: every check that can run still runs, and the verdict is
+`INCOMPLETE` (exit 2), never `HOLDS`; the tool names the file's first
+header for the expert to compare to a public source and then state. A
+checkpoint that does not match the file is reported as `CHECKPOINT
+MISMATCH` with both hashes. The headers file's origin is not evidence and
+the tool says so; the chain check is. `--network regtest` exists for
+chains mined at an easy difficulty (the test suite's), must be asked for
+by name, and is printed as `NOT Bitcoin`: the default, mainnet, is the
+only network an expert is ever handed.
 
 What the verdict states: the exhibit's bytes existed before the attested
-block was mined, and, when the proof carries a not-before bound, after
-the bound's block (the tool finds that block in the chain and says so:
-"after block M, before block N"). The block timestamps printed are the
-miners' clocks, accurate to a couple of hours by consensus rule; the
-calendar's own clock in the proof is labelled "not evidence". A proof
-still `pending` has no Bitcoin attestation and the verifier says so (step
-2 fails: upgrade it first). Proofs the ots client upgraded keep their
-pending attestation beside the Bitcoin path; the verifier follows the
-Bitcoin one and notes the other.
+block was mined; and, when the proof carries a not-before bound, that the
+calendar's commitment to the exhibit was constructed after the bound's
+block (the tool finds that block in the checked chain and says so). The
+lower bound dates the construction of the commitment, not the creation
+of the record: a record can be older than its bound. The block
+timestamps printed are the miners' clocks: by consensus rule a block's
+time may run at most about two hours ahead of the network's clocks and
+must exceed the median of the previous eleven blocks, so it can lag more
+than it can lead. The calendar's own clock in the proof is labelled "not
+evidence". A proof still `pending` has no Bitcoin attestation and the
+verifier says so (step 2 fails: upgrade it first). Proofs the ots client
+upgraded keep their pending attestation beside the Bitcoin path; the
+verifier follows the Bitcoin one and notes the other.
 
 ### The self-stamp chain
 
@@ -902,8 +984,11 @@ names a copy this host holds (by default in the `witnessed` directory
 beside `manifests`; `--witnessed DIR` names another) that hashes to the
 recorded sha256, whose own proof, if present, is a proof of those bytes.
 Each vouch is printed as `vouches for host=… seq=… period=… sha256=…
-copy=ok|missing|MISMATCH proof=…`; a missing or altered copy is a break.
-It exits 1 on any break.
+copy=ok|missing|MISMATCH proof=…`; a missing or altered copy is a break,
+and so is a missing `witnessed` directory: a vouch is for bytes this host
+claims to hold. `--skip-witnessed` asks for the partial check without the
+copies; every vouch is then labelled `SKIPPED` and the summary says
+`copies not checked`. It exits 1 on any break.
 
 With `--witness WITNESS_MANIFESTS_DIR` it reads another chain's manifests
 and says for each manifest here whether the witness holds its hash
@@ -934,11 +1019,18 @@ each day anchored, verifiable with `python3` alone.
 
 ## Recover
 
-What to back up: the calendar directory, with the journal above the
-LevelDB, `receipts/`, the adapter's `DATA_DIR`, `~/selfstamp/manifests`,
-the compose `.env`; encrypted, off-host.
+What to back up: the calendar directory as one coherent snapshot (`db/`,
+`journal`, `journal.counts` and `journal.known-good` taken together, with
+the calendar stopped or from a filesystem snapshot: a `db/` from one
+moment beside a checkpoint from another is refused at the next start,
+"Restart checkpoint"), `receipts/`, the adapter's `DATA_DIR`,
+`~/selfstamp` whole (`manifests/` and `witnessed/`: a witnessed entry
+whose copy is missing is a verification break), the compose `.env`;
+encrypted, off-host.
 
-At every start the stamper re-reads the journal from `journal.known-good`
+At every start the calendar checks that `journal.known-good` belongs to
+`db/` and lies within what it durably holds, and stops with the recovery
+text if not; then the stamper re-reads the journal from the checkpoint
 (or from the beginning without it) and anchors every entry the calendar
 does not hold ("Restart checkpoint"). A pending-receipt marker left by a
 stop is settled before anything else ("Anchor receipts"); the
@@ -947,9 +1039,16 @@ without `OTSD_ANCHOR_RECEIPTS`; the deep-reorg detector's first check
 runs on the first pass; the not-before bound returns with the first block
 the stamper sees.
 
+What a rebuild cannot give back: a commitment re-anchored after `db/`
+was lost gets a proof naming a later block than its original anchor; the
+original merkle path lived only in the database. Fully anchored proofs
+already handed to clients stay valid on their own; pending proofs whose
+calendar branch was lost upgrade to the later anchor.
+
 The on-disk format of `db/` is LevelDB's. A calendar written under the
 previous binding (py-leveldb, before the move to plyvel) opens under the
-current one unchanged; nothing is migrated.
+current one unchanged; the generation and watermark are added at the
+first start ("Restart checkpoint"), nothing else is migrated.
 
 When the anchor wallet runs dry the calendar keeps accepting and
 anchoring waits (one error in its log; the watcher's `calendar` check
@@ -1002,7 +1101,8 @@ Test modules live under `otsserver/tests/`:
   `test_operator_lane.py`, `test_selfstamp.py`,
   `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py`,
   `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py`,
-  `test_claim_kit.py`: regression tests for this branch's delta
+  `test_claim_kit.py`, `test_stamper_save_retry.py`,
+  `test_rpc_privacy.py`: regression tests for this branch's delta
   (launcher flags, the status line and its RPC wiring, stamper-loop
   crash fixes, anchor receipts, anchor cadence, the `/digest`
   Content-Length handling, anchor-receipt record counts and their
@@ -1023,6 +1123,25 @@ Test modules live under `otsserver/tests/`:
   headers export against a fake node). They stub everything external
   with `unittest.mock` or standard-library fakes: no bitcoind, no
   network.
+
+  The 2026-09-15 review's findings each have a regression that fails on
+  the code before the fix: the hostile claim kit, Bitcoin Core's target
+  rules and the `INCOMPLETE` verdict (`test_claim_kit.py`); the mature
+  tree kept until its save is durable and retried every pass
+  (`test_stamper_save_retry.py`); the receipt write-all loop, tail
+  recovery and directory fsync (`test_receipt_marker.py`); the storage
+  generation, the committed watermark and an older database restored
+  beside a newer checkpoint (`test_calendar.py`); a stamper that cannot
+  start and an aggregator that fails stopping the whole service, in
+  process and at the process boundary with the real `otsd`
+  (`test_stamper_checkpoint.py`, `test_aggregator_failure.py`,
+  `test_otsd_launcher.py`); no peer address or request line in any log,
+  over a real socket (`test_rpc_privacy.py`); the self-stamp lock across
+  processes, unique temporary names, missing witnessed copies and later
+  foreign proofs (`test_selfstamp.py`); the exporter's lock, write-all
+  loop and tail recovery (`test_claim_kit.py`); the watcher's outbox
+  (`test_watch.py`). Every durability test injects failures at the write
+  boundary or kills the process; none simulates a power cut.
 
 No test module needs a running Bitcoin node. Every module does need the
 full dependency set installed, and `plyvel` is a native build:

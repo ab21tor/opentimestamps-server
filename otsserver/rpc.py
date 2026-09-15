@@ -15,6 +15,9 @@ import json
 import logging
 import os
 import socketserver
+import sys
+import threading
+from http import HTTPStatus
 
 from bitcoin.core import b2lx, b2x
 
@@ -42,6 +45,40 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
     timeout = 60
 
     digest_queue = None
+
+    # What the calendar logs about a request: a fixed route token and the
+    # status code, never the peer's address and never the request line
+    # (2026-09-15 review, P2 "privacy promise fails on error paths"). The
+    # base class writes both to stderr, where docker/journald keeps them;
+    # an unknown path can carry record content, a peer address is a client
+    # identity. log_message is the base class's one sink, so every path
+    # through it (log_request from send_response, log_error from
+    # send_error on a malformed request, the timeout message) is closed.
+    ROUTES = {'/': 'status', '/digest': 'digest', '/operator/digest': 'operator-digest', '/tip': 'tip'}
+
+    def route_name(self):
+        path = (getattr(self, 'path', '') or '').split('?', 1)[0]
+        if path.startswith('/timestamp/'):
+            return 'timestamp'
+        return self.ROUTES.get(path, 'other')
+
+    def log_request(self, code='-', size='-'):
+        if isinstance(code, HTTPStatus):
+            code = code.value
+        line = "request route=%s status=%s" % (self.route_name(), code)
+        if isinstance(code, int) and code >= 400:
+            logging.info(line)
+        else:
+            logging.debug(line)
+
+    def log_error(self, format, *args):
+        # send_error's message quotes the request ("Bad request version
+        # (%r)"): only the status code is kept.
+        code = next((a.value if isinstance(a, HTTPStatus) else a for a in args if isinstance(a, int)), '-')
+        logging.info("request refused route=%s status=%s" % (self.route_name(), code))
+
+    def log_message(self, format, *args):
+        pass
 
     def post_digest(self, counted=True):
         """Aggregate one digest; counted=False is the operator lane (do_POST)"""
@@ -285,6 +322,10 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 class StampServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    # Handler threads are daemons: a shutdown on a worker failure
+    # (serve_until_exit) must not wait on a request that is mid-flight.
+    daemon_threads = True
+
     def __init__(self, server_address, aggregator, calendar):
 
         class rpc_request_handler(RPCRequestHandler):
@@ -294,6 +335,39 @@ class StampServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
         super().__init__(server_address, rpc_request_handler)
 
+    def handle_error(self, request, client_address):
+        # The base class prints "Exception occurred during processing of
+        # request from ('IP', port)" and a traceback to stderr. Never the
+        # peer: the exception class alone.
+        exc = sys.exc_info()[1]
+        logging.error("request handler failed: %s" % type(exc).__name__)
+
     def serve_forever(self):
         super().serve_forever()
+
+
+def serve_until_exit(server, exit_event, workers=(), poll=0.5, join_timeout=10):
+    """Serve HTTP until exit_event is set, then shut the server down
+
+    A worker (the aggregator, the stamper) that fails past recovery sets
+    exit_event; before 2026-09-15 nothing consumed it while the listener
+    kept serving, so a dead worker sat behind a live port and the
+    supervisor saw nothing to restart. Now the listener stops, the socket
+    closes, the workers are joined (bounded) and 1 is returned: the
+    process exits nonzero and the supervisor restarts it. A
+    KeyboardInterrupt performs the same shutdown and propagates to the
+    caller (otsd exits 0 on it).
+    """
+    thread = threading.Thread(target=server.serve_forever, name='http', daemon=True)
+    thread.start()
+    try:
+        while not exit_event.wait(poll):
+            pass
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(join_timeout)
+        for worker in workers:
+            worker.join(join_timeout)
+    return 1
 
