@@ -30,12 +30,20 @@ Fails on the pre-change code: neither tool exists.
 
 2026-09-15 (independent review, P1 "fabricated evidence receives a valid
 verdict" and P2 "impossible targets accepted"): the chain is checked whole,
-a checkpoint anywhere pins every header before and after it, Bitcoin
-Core's target rules are enforced, easy-difficulty chains need --network
-regtest by name, and a file tied to neither genesis nor a stated checkpoint
-is INCOMPLETE (exit 2), never HOLDS. The hostile kit the review built (a
-genuine later checkpoint over an unmined, substituted block-1 header) is
-the regression Test_hostile_kits keeps.
+Bitcoin Core's target rules are enforced, easy-difficulty chains need
+--network regtest by name, and a file tied to neither genesis nor a stated
+checkpoint is INCOMPLETE (exit 2), never HOLDS. The hostile kit the review
+built (a genuine later checkpoint over an unmined, substituted block-1
+header) is the regression Test_hostile_kits keeps.
+
+Carried from the same review (fixed in this session): a checkpoint pins
+only the headers at or below it — headers above it are chained forward
+only, and a chain that follows the rules is not thereby Bitcoin's chain.
+So the stated checkpoint must be at or after the attested block, and a
+kit without one is INCOMPLETE. Test_incompatible_forks builds two regtest
+forks off one common prefix, each anchoring a different exhibit at the
+same height, and shows that a checkpoint on the common prefix lets neither
+HOLD, while a checkpoint at the fork's own tip lets exactly one.
 """
 
 import datetime
@@ -252,17 +260,30 @@ class Test_real_proofs(unittest.TestCase):
         self.assertIn('[5]', out)
         self.assertIn('nothing ties', out)
         self.assertIn(rows[0][1], out)    # the file's first header, named for comparison
-        self.assertIn('--checkpoint %s:%s' % (rows[0][0], rows[0][1]), out)
+        # The tool proposes the file's LAST header (at or after the anchor).
+        self.assertIn('--checkpoint %s:%s' % (rows[-1][0], rows[-1][1]), out)
         # --digest mode says the exhibit itself was not hashed here.
         self.assertIn('exhibit not hashed', out)
         self.assertIn('TRUST', out)
-        # Stated, the same file HOLDS.
+        # A checkpoint on the file's first header, BELOW the anchor, pins
+        # nothing above itself: still INCOMPLETE, and the tool says why.
         code, out = run_verifier('--digest', 'e7783786ddd776a96d7dbc2fcc628b38c0e9fd758fb5c9be08d162a1a79c96e5',
                                  FIXTURES / 'gateway-959459.ots', headers, '--start-height', start,
                                  '--checkpoint', '%s:%s' % (rows[0][0], rows[0][1]))
+        self.assertEqual(code, 2, out)
+        self.assertIn('VERDICT: INCOMPLETE', out)
+        self.assertNotIn('VERDICT: HOLDS', out)
+        self.assertIn('BELOW the attested block 959459', out)
+        self.assertIn('not thereby mainnet\'s chain', out)
+        self.assertIn('--checkpoint %s:%s' % (rows[-1][0], rows[-1][1]), out)
+        # Stated at or after the anchor, the same file HOLDS.
+        code, out = run_verifier('--digest', 'e7783786ddd776a96d7dbc2fcc628b38c0e9fd758fb5c9be08d162a1a79c96e5',
+                                 FIXTURES / 'gateway-959459.ots', headers, '--start-height', start,
+                                 '--checkpoint', '%s:%s' % (rows[9][0], rows[9][1]))
         self.assertEqual(code, 0, out)
+        self.assertEqual(rows[9][0], '959459')
         self.assertIn('VERDICT: HOLDS', out)
-        self.assertIn('block 959459', out)
+        self.assertIn('block 959459 is at the checkpoint', out)
         self.assertIn('2b39ee255a38f17547d3267f9b6ef34fe8f22a9ccce20e969977bab345ff25b7', out)
         self.assertIn('8b558dfc958ea43d563d5b2777e3aec3b443d935cd77cb662e01d4ec1ec05273', out)
         self.assertIn('all 16 headers checked', out)
@@ -281,17 +302,24 @@ class Test_real_proofs(unittest.TestCase):
         self.assertIn('all 16 headers checked', out)
         self.assertIn('heights 959450..959464 by the links back from it', out)
         self.assertIn('block 959459 is below the checkpoint', out)
+        self.assertIn('Headers above it are chained forward only and prove nothing', out)
 
     def test_record_proof_960458_holds_with_the_right_checkpoint(self):
         start, headers, rows = self.headers_file('mainnet-960450-960465.txt')
-        checkpoint = '%s:%s' % (rows[0][0], rows[0][1])
+        checkpoint = '%s:%s' % (rows[-1][0], rows[-1][1])
         code, out = run_verifier('--digest', '5dfa4389213eac0fbfff5261f0ba2263a71b9616847e221970258bfc9e27e22e',
                                  FIXTURES / 'record-960458.ots', headers, '--start-height', start,
                                  '--checkpoint', checkpoint)
         self.assertEqual(code, 0, out)
         self.assertIn('VERDICT: HOLDS', out)
-        self.assertIn('checkpoint 960450', out)
+        self.assertIn('checkpoint 960465', out)
         self.assertIn('4553df11e0f654429af4293cfb2ac072cd1419e5e493e547c74c565bea6a61c4', out)
+        # The file's first header as the checkpoint is below the anchor: INCOMPLETE.
+        code, out = run_verifier('--digest', '5dfa4389213eac0fbfff5261f0ba2263a71b9616847e221970258bfc9e27e22e',
+                                 FIXTURES / 'record-960458.ots', headers, '--start-height', start,
+                                 '--checkpoint', '%s:%s' % (rows[0][0], rows[0][1]))
+        self.assertEqual(code, 2, out)
+        self.assertIn('VERDICT: INCOMPLETE', out)
 
     def test_checkpoint_mismatch_is_reported_not_hidden(self):
         start, headers, rows = self.headers_file('mainnet-960450-960465.txt')
@@ -330,6 +358,7 @@ class Test_headers_chain(unittest.TestCase):
         result = verify_claim.verify_chain(raw, 0)
         self.assertTrue(result.ok, result.problems)
         self.assertEqual(result.trust, 'genesis')
+        self.assertEqual(result.authenticated_height, 0)   # genesis pins nothing above itself
         self.assertEqual(verify_claim.display(result.first_hash), verify_claim.GENESIS_HASH)
         self.assertEqual(result.checked, 6)
         # The same file from height 1, tied to nothing: sound, not trusted.
@@ -343,6 +372,10 @@ class Test_headers_chain(unittest.TestCase):
         self.assertTrue(result.ok, result.problems)
         self.assertEqual(result.trust, 'checkpoint')
         self.assertEqual(result.checked, 5)
+        self.assertEqual(result.authenticated_height, 5)
+        # Genesis plus a checkpoint: the checkpoint's height is what is pinned.
+        result = verify_claim.verify_chain(raw, 0, checkpoint=(3, bytes.fromhex(rows[3][1])[::-1]))
+        self.assertEqual((result.trust, result.authenticated_height), ('genesis', 3))
         # Any other first header is not Bitcoin.
         tampered = bytearray(raw)
         tampered[76] ^= 1
@@ -420,12 +453,14 @@ class Test_worked_example(unittest.TestCase):
 
     def verify(self, exhibit=None, proof=None, headers=None, *extra, checkpoint=True, network='regtest'):
         """The kit's chain is mined at an easy difficulty, so it is checked
-        as regtest (by name: as mainnet it fails the powLimit rule), from
-        its stated checkpoint (without one the verdict is INCOMPLETE)."""
+        as regtest (by name: as mainnet it fails the powLimit rule), with
+        its tip stated as the checkpoint — at or after the anchor, as the
+        rule requires (without one the verdict is INCOMPLETE)."""
         k = self.kit
+        tip = k['anchor_height'] + 6
         args = ['--start-height', k['checkpoint'], '--network', network]
         if checkpoint:
-            args += ['--checkpoint', '%d:%s' % (k['checkpoint'], k['chain'].display(k['checkpoint']))]
+            args += ['--checkpoint', '%d:%s' % (tip, k['chain'].display(tip))]
         return run_verifier(exhibit or k['exhibit'], proof or k['proof'], headers or k['headers'], *args, *extra)
 
     def copy(self, path, mutate):
@@ -445,7 +480,7 @@ class Test_worked_example(unittest.TestCase):
                        'NETWORK   : regtest', 'never evidence'):
             self.assertIn(needle, out)
         self.assertIn('checkpoint', out.lower())
-        self.assertIn(k['chain'].display(k['checkpoint']), out)
+        self.assertIn(k['chain'].display(k['anchor_height'] + 6), out)
         # The lower bound dates the construction of the commitment, never
         # the creation of the exhibit, and the verdict says so in words.
         self.assertIn("the calendar's commitment was constructed after it", out)
@@ -460,7 +495,8 @@ class Test_worked_example(unittest.TestCase):
         self.assertNotIn('VERDICT: HOLDS', out)
         self.assertIn('[4]', out)   # the chain itself was checked whole ...
         self.assertIn('INCOMPLETE', out.split('[5]')[1])   # ... but nothing ties it
-        self.assertIn('--checkpoint %d:%s' % (self.kit['checkpoint'], self.kit['chain'].display(self.kit['checkpoint'])), out)
+        tip = self.kit['anchor_height'] + 6
+        self.assertIn('--checkpoint %d:%s' % (tip, self.kit['chain'].display(tip)), out)
 
     def test_an_easy_chain_is_refused_as_mainnet(self):
         # The default network is mainnet; the kit's easy targets are above
@@ -493,12 +529,28 @@ class Test_worked_example(unittest.TestCase):
         self.assertIn('%d' % k['anchor_height'], out)
         self.assertTrue('proof of work' in out or 'merkle root' in out, out)
 
-    def test_the_diary_verifies_as_a_stated_checkpoint(self):
+    def test_a_checkpoint_below_the_anchor_is_incomplete_not_holds(self):
+        # The file's first header stated as the checkpoint: below the anchor,
+        # so it pins nothing about it. Every check still runs; the verdict
+        # is INCOMPLETE and names the rule and the header to state instead.
         k = self.kit
-        code, out = self.verify(None, None, None, '--checkpoint',
-                                '%d:%s' % (k['checkpoint'], k['chain'].display(k['checkpoint'])))
+        code, out = self.verify(None, None, None, checkpoint=False)
+        self.assertEqual(code, 2, out)
+        code, out = run_verifier(k['exhibit'], k['proof'], k['headers'], '--start-height', k['checkpoint'],
+                                 '--network', 'regtest',
+                                 '--checkpoint', '%d:%s' % (k['checkpoint'], k['chain'].display(k['checkpoint'])))
+        self.assertEqual(code, 2, out)
+        self.assertIn('VERDICT: INCOMPLETE', out)
+        self.assertNotIn('VERDICT: HOLDS', out)
+        self.assertIn('[4]', out)
+        self.assertIn('BELOW the attested block %d' % k['anchor_height'], out)
+        self.assertIn('not thereby regtest\'s chain', out)
+        # At the anchor itself is enough.
+        code, out = run_verifier(k['exhibit'], k['proof'], k['headers'], '--start-height', k['checkpoint'],
+                                 '--network', 'regtest',
+                                 '--checkpoint', '%d:%s' % (k['anchor_height'], k['chain'].display(k['anchor_height'])))
         self.assertEqual(code, 0, out)
-        self.assertIn('checkpoint %d' % k['checkpoint'], out)
+        self.assertIn('block %d is at the checkpoint' % k['anchor_height'], out)
 
     def test_tampered_exhibit_fails_at_step_one(self):
         def flip(data):
@@ -749,6 +801,102 @@ class Test_export_headers(unittest.TestCase):
         result = verify_claim.verify_chain(raw[80:], 1, checkpoint=(3, self.chain.hash(3)))
         self.assertFalse(result.ok)
         self.assertTrue(any('powLimit' in p for p in result.problems), result.problems)
+
+
+def bare_proof(digest, height):
+    """A proof with no ops: the attested merkle root is the digest itself"""
+    payload = selfstamp.varuint(height)
+    return verify_claim.MAGIC + b'\x01\x08' + digest + b'\x00' + verify_claim.BITCOIN_TAG + selfstamp.varuint(len(payload)) + payload
+
+
+class Test_incompatible_forks(unittest.TestCase):
+    """Two regtest forks off one common prefix (heights 100..103), each
+    mined on past it with its own exhibit anchored at height 105. Both are
+    sound proof-of-work chains; at most one can be the chain the expert's
+    public source shows. A checkpoint on the common prefix cannot tell
+    them apart, so it must not let either HOLD (before this fix it let
+    both); a checkpoint at a fork's own tip lets exactly that fork's
+    exhibit HOLD and fails the other with CHECKPOINT MISMATCH."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.dir = pathlib.Path(self.tmpdir.name)
+        common = SyntheticChain(100, 4)
+        self.kits = {}
+        for name in ('a', 'b'):
+            exhibit = self.dir / ('exhibit-' + name)
+            exhibit.write_bytes(b'exhibit %s, written during the test' % name.encode())
+            digest = hashlib.sha256(exhibit.read_bytes()).digest()
+            fork = SyntheticChain(100, 0)
+            fork.headers = list(common.headers)
+            fork.extend(hashlib.sha256(b'fork %s 104' % name.encode()).digest())   # 104: the forks diverge here
+            fork.extend(digest)                                                    # 105: the anchor block
+            fork.extend(hashlib.sha256(b'fork %s 106' % name.encode()).digest())   # 106: the tip
+            (self.dir / ('headers-%s.bin' % name)).write_bytes(fork.raw())
+            (self.dir / ('proof-%s.ots' % name)).write_bytes(bare_proof(digest, 105))
+            self.kits[name] = fork
+        self.assertNotEqual(self.kits['a'].hash(104), self.kits['b'].hash(104))
+        self.assertEqual(self.kits['a'].hash(103), self.kits['b'].hash(103))
+
+    def verify(self, name, headers_of, checkpoint_height, checkpoint_of=None):
+        checkpoint_of = checkpoint_of or headers_of
+        return run_verifier(self.dir / ('exhibit-' + name), self.dir / ('proof-%s.ots' % name),
+                            self.dir / ('headers-%s.bin' % headers_of), '--start-height', 100, '--network', 'regtest',
+                            '--checkpoint', '%d:%s' % (checkpoint_height, self.kits[checkpoint_of].display(checkpoint_height)))
+
+    def test_a_checkpoint_on_the_common_prefix_lets_neither_fork_hold(self):
+        for name in ('a', 'b'):
+            code, out = self.verify(name, name, 103)
+            self.assertEqual(code, 2, out)
+            self.assertIn('VERDICT: INCOMPLETE', out)
+            self.assertNotIn('HOLDS', out)
+            self.assertIn('[4]', out)                       # the chain itself is sound ...
+            self.assertIn('BELOW the attested block 105', out)   # ... but the checkpoint pins nothing above 103
+            self.assertIn('anyone can extend a fork past a checkpoint', out)
+            self.assertIn('--checkpoint 106:%s' % self.kits[name].display(106), out)
+
+    def test_a_checkpoint_at_a_forks_tip_authenticates_that_fork_alone(self):
+        for height in (105, 106):
+            code, out = self.verify('a', 'a', height)
+            self.assertEqual(code, 0, out)
+            self.assertIn('VERDICT: HOLDS', out)
+            # The other fork's exhibit against fork A's checkpoint: its
+            # file disagrees at the checkpoint height.
+            code, out = self.verify('b', 'b', height, checkpoint_of='a')
+            self.assertEqual(code, 1, out)
+            self.assertIn('CHECKPOINT MISMATCH', out)
+            self.assertNotIn('HOLDS', out)
+        # And with fork B's headers under fork A's proof, the merkle root is
+        # not there at all: FAILS at step 3.
+        code, out = self.verify('a', 'b', 106)
+        self.assertEqual(code, 1, out)
+        self.assertIn('[3]', out)
+        self.assertIn('FAIL', out)
+
+    def test_genesis_alone_does_not_authenticate_a_later_block(self):
+        # A regtest chain from its real genesis, no checkpoint: the file is
+        # tied to regtest at height 0 and nothing above, so an anchor at
+        # height 1 is INCOMPLETE — the rule is the same as for mainnet.
+        genesis_hash = bytes.fromhex(verify_claim.NETWORKS['regtest']['genesis'])[::-1]
+        exhibit = self.dir / 'exhibit-g'
+        exhibit.write_bytes(b'anchored right after genesis')
+        digest = hashlib.sha256(exhibit.read_bytes()).digest()
+        header1 = mine(genesis_hash, digest, 1296688702 + 600)
+        # The real regtest genesis header, from python-bitcoinlib's chain params.
+        from bitcoin.core import CoreRegTestParams
+        genesis = CoreRegTestParams.GENESIS_BLOCK.get_header().serialize()
+        self.assertEqual(sha256d(genesis), genesis_hash)
+        (self.dir / 'headers-g.bin').write_bytes(genesis + header1)
+        (self.dir / 'proof-g.ots').write_bytes(bare_proof(digest, 1))
+        code, out = run_verifier(exhibit, self.dir / 'proof-g.ots', self.dir / 'headers-g.bin', '--network', 'regtest')
+        self.assertEqual(code, 2, out)
+        self.assertIn('VERDICT: INCOMPLETE', out)
+        self.assertIn('the genesis block is BELOW the attested block 1', out)
+        code, out = run_verifier(exhibit, self.dir / 'proof-g.ots', self.dir / 'headers-g.bin', '--network', 'regtest',
+                                 '--checkpoint', '1:' + verify_claim.display(sha256d(header1)))
+        self.assertEqual(code, 0, out)
+        self.assertIn('the genesis block also matched', out)
 
 
 class Test_hostile_kits(unittest.TestCase):

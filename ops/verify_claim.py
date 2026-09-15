@@ -19,18 +19,24 @@ Steps, every one printed:
       between retargets; at each retarget, Bitcoin's adjustment from the
       period's timestamps). Nothing is skipped: the attested block and the
       block a not-before bound rests on are checked like every other;
-  [5] what ties that chain to Bitcoin: the genesis block, whose hash is
-      hardcoded here, when the file starts at height 0; or a checkpoint the
-      expert states and this tool prints for comparison with any public
-      source. A checkpoint anywhere in the file pins every header in it:
-      those before it by the links back from it (each header's bytes are
-      the preimage of the next header's previous-hash field), those after
-      it by the links forward. A file that starts after genesis with no
-      checkpoint stated is tied to nothing, and the verdict is INCOMPLETE.
+  [5] what ties the attested block to Bitcoin: a checkpoint the expert
+      states (--checkpoint HEIGHT:HASH, compared by them to a public
+      source) at or after the attested height. A checkpoint pins every
+      header BEFORE it: each header's bytes are the preimage of the next
+      header's previous-hash field, so the links back from the checkpoint
+      authenticate the attested block. Headers AFTER a checkpoint are tied
+      to it only by following links forward, and a chain that follows the
+      rules is not thereby Bitcoin's chain: anyone can extend a fork past
+      a checkpoint (at real difficulty a miner; at regtest difficulty
+      anyone), so a checkpoint below the attested block authenticates
+      nothing about it. The genesis block, hardcoded here, is a checkpoint
+      at height 0 and pins nothing above it. A file with no checkpoint at
+      or after the attested height yields INCOMPLETE, never HOLDS.
 Exit 0 only if everything holds; 1 when any check fails; 2 when every check
-that could run passed but nothing ties the headers file to Bitcoin (state a
-checkpoint). No network, no third-party modules. The trust the verdict
-relies on is printed with it.
+that could run passed but nothing ties the attested block to Bitcoin (state
+a checkpoint at or after it). No network, no third-party modules. The trust
+the verdict relies on is printed with it. Verification against a node
+(`ots verify` with bitcoind) is the other path and needs no checkpoint.
 
 What the verdict means: the exhibit's bytes existed before the attested
 block was mined. With a not-before bound, the calendar's commitment to the
@@ -101,7 +107,7 @@ Attestation = collections.namedtuple('Attestation', 'kind height uri msg path')
 Parsed = collections.namedtuple('Parsed', 'digest attestations')
 # trust: 'genesis' or 'checkpoint' when the chain is tied to the network,
 # None when it is internally sound but tied to nothing.
-ChainResult = collections.namedtuple('ChainResult', 'ok problems checked first_hash last_hash retargets notes trust')
+ChainResult = collections.namedtuple('ChainResult', 'ok problems checked first_hash last_hash retargets notes trust authenticated_height')
 
 
 def read_varuint(data, pos):
@@ -271,14 +277,16 @@ def verify_chain(raw, start_height, checkpoint=None, wanted_hashes=(), network='
     link to the header before it, the difficulty rule (mainnet). Then the
     tie: the network's genesis block when the file starts at height 0, or
     the stated checkpoint = (height, hash bytes), which must be in the file
-    and match. A checkpoint anywhere in the file pins every header in it:
-    those before it by the links back from it, those after it by the links
-    forward; the attested block is never skipped, whichever side of the
-    checkpoint it is on. Returns ChainResult; ok says the file is one sound
-    chain, trust ('genesis', 'checkpoint' or None) says whether it is tied
-    to the network, and a caller must never call a verdict complete on a
-    chain tied to nothing. wanted_hashes: hashes to look for on the way (the
-    not-before bound); found ones land in notes."""
+    and match. Returns ChainResult; ok says the file is one sound chain,
+    trust ('genesis', 'checkpoint' or None) says whether it is tied to the
+    network at all, and authenticated_height says up to which height that
+    tie authenticates headers: the checkpoint's height (headers at or below
+    it are pinned by the links back from it), 0 for genesis alone, None for
+    no tie. Headers above authenticated_height are only chained forward —
+    a sound chain, not thereby Bitcoin's — and a caller must never call a
+    verdict complete on an attested block above it. wanted_hashes: hashes
+    to look for on the way (the not-before bound); found ones land in
+    notes."""
     params = NETWORKS[network]
     problems = []
     notes = {}
@@ -287,7 +295,7 @@ def verify_chain(raw, start_height, checkpoint=None, wanted_hashes=(), network='
         problems.append('headers file is not a whole number of 80-byte headers (%d bytes over)' % (len(raw) % HEADER_SIZE))
     if count == 0:
         problems.append('headers file is empty')
-        return ChainResult(False, problems, 0, None, None, 0, notes, None)
+        return ChainResult(False, problems, 0, None, None, 0, notes, None, None)
 
     trust = None
     if checkpoint is not None:
@@ -295,13 +303,13 @@ def verify_chain(raw, start_height, checkpoint=None, wanted_hashes=(), network='
         if not start_height <= cp_height < start_height + count:
             problems.append('checkpoint height %d is not in the headers file (heights %d..%d)'
                             % (cp_height, start_height, start_height + count - 1))
-            return ChainResult(False, problems, 0, None, None, 0, notes, None)
+            return ChainResult(False, problems, 0, None, None, 0, notes, None, None)
         cp_index = cp_height - start_height
         actual = sha256d(raw[cp_index * HEADER_SIZE:(cp_index + 1) * HEADER_SIZE])
         if actual != cp_hash:
             problems.append('CHECKPOINT MISMATCH at height %d: the headers file holds %s, the checkpoint says %s'
                             % (cp_height, display(actual), display(cp_hash)))
-            return ChainResult(False, problems, 0, None, None, 0, notes, None)
+            return ChainResult(False, problems, 0, None, None, 0, notes, None, None)
         trust = 'checkpoint'
 
     wanted = set(wanted_hashes)
@@ -360,7 +368,15 @@ def verify_chain(raw, start_height, checkpoint=None, wanted_hashes=(), network='
         prev_bits = fields['bits']
         checked += 1
     ok = not problems
-    return ChainResult(ok, problems, checked, first_hash, prev_hash, retargets, notes, trust if ok else None)
+    authenticated = None
+    if ok and trust is not None:
+        # The checkpoint pins everything at or below it; genesis alone pins
+        # height 0. With both, the higher of the two.
+        authenticated = 0
+        if checkpoint is not None:
+            authenticated = max(authenticated, checkpoint[0])
+    return ChainResult(ok, problems, checked, first_hash, prev_hash, retargets, notes,
+                       trust if ok else None, authenticated)
 
 
 # --- the verdict ------------------------------------------------------------------
@@ -430,7 +446,7 @@ def main(argv=None, out=None):
     parser.add_argument('--start-height', type=int, default=0,
                         help='height of the first header in the file (default 0: from genesis)')
     parser.add_argument('--checkpoint', help='HEIGHT:HASH of one header in the file, compared to a public source by you; '
-                                             'pins every header in the file, before it and after it')
+                                             'pins every header at or below it, so it must be at or after the attested block')
     parser.add_argument('--network', choices=sorted(NETWORKS), default='mainnet',
                         help='the chain the headers are from (default mainnet). regtest is for chains mined at an '
                              'easy difficulty, never for evidence')
@@ -549,32 +565,38 @@ def main(argv=None, out=None):
         detail = '; '.join(result.problems)
     step(4, result.ok, 'the headers file is one chain, checked whole (block %d included)' % height, detail)
 
-    # [5] what ties the chain to the network
+    # [5] what ties the attested block to the network
     incomplete = None
     if result.ok:
-        if result.trust == 'genesis':
-            step(5, True, 'the chain is tied to %s' % network,
-                 'by the genesis block %s, hardcoded here%s'
-                 % (NETWORKS[network]['genesis'],
-                    '; the checkpoint you stated, %d = %s, also matched' % (checkpoint[0], display(checkpoint[1])) if checkpoint else ''))
-        elif result.trust == 'checkpoint':
+        tip_hash = display(result.last_hash)
+        if result.authenticated_height is None:
+            incomplete = ('nothing ties the headers file to %s: it starts at height %d, not genesis, and no --checkpoint was stated. '
+                          'Compare a header at or after block %d to any public source — the file\'s last, height %d = %s, '
+                          'is the natural one — then state it: --checkpoint %d:%s'
+                          % (network, args.start_height, height, last_height, tip_hash, last_height, tip_hash))
+        elif result.authenticated_height < height:
+            what = ('the genesis block' if result.trust == 'genesis' and checkpoint is None
+                    else 'the checkpoint you stated, %d = %s' % (checkpoint[0], display(checkpoint[1])))
+            incomplete = ('%s is BELOW the attested block %d, so it does not authenticate it: headers above a checkpoint are tied '
+                          'to it only by following links forward, and a chain that follows the rules is not thereby %s\'s chain '
+                          '(anyone can extend a fork past a checkpoint). State a checkpoint at or after height %d, compared to a '
+                          'public source — the file\'s last header, height %d = %s, is the natural one: --checkpoint %d:%s'
+                          % (what, height, network, height, last_height, tip_hash, last_height, tip_hash))
+        if incomplete:
+            write('[5] block %d is tied to %s ... INCOMPLETE' % (height, network))
+            write('      ' + incomplete)
+        elif result.trust == 'genesis' and checkpoint is None:
+            step(5, True, 'block %d is tied to %s' % (height, network),
+                 'by the genesis block %s, hardcoded here: block %d is height 0 itself' % (NETWORKS[network]['genesis'], height))
+        else:
             cp_height = checkpoint[0]
             before = ('heights %d..%d by the links back from it' % (args.start_height, cp_height - 1)
                       if cp_height > args.start_height else 'nothing before it')
-            after = ('heights %d..%d by the links forward' % (cp_height + 1, last_height)
-                     if cp_height < last_height else 'nothing after it')
-            step(5, True, 'the chain is tied to %s' % network,
-                 'by the checkpoint you stated, %d = %s: %s, %s; block %d is %s the checkpoint and was checked like every other'
-                 % (cp_height, display(checkpoint[1]), before, after, height,
-                    'below' if height < cp_height else 'above' if height > cp_height else 'at'))
-        else:
-            incomplete = ('nothing ties the headers file to %s: it starts at height %d, not genesis, and no --checkpoint was stated. '
-                          'Its first header is height %d = %s; compare that height and hash to any public source, then state it: '
-                          '--checkpoint %d:%s'
-                          % (network, args.start_height, args.start_height, display(result.first_hash),
-                             args.start_height, display(result.first_hash)))
-            write('[5] the chain is tied to %s ... INCOMPLETE' % network)
-            write('      ' + incomplete)
+            step(5, True, 'block %d is tied to %s' % (height, network),
+                 'by the checkpoint you stated, %d = %s: it pins %s; block %d is %s the checkpoint and was checked like every other%s'
+                 % (cp_height, display(checkpoint[1]), before, height,
+                    'below' if height < cp_height else 'at',
+                    '; the genesis block also matched' if result.trust == 'genesis' else ''))
     if bound:
         found = result.notes.get('found', {}).get(bound)
         if found and result.ok:
@@ -585,28 +607,27 @@ def main(argv=None, out=None):
             write('      not-before bound: block %s is not in the checked chain (no bound established)' % display(bound))
 
     # trust
-    write('TRUST: this verdict relies on the headers file being the %s chain, which the tool checks by' % network)
-    if result.trust == 'genesis':
-        write('       target rules, proof of work and links over every header from the genesis block %s, hardcoded here.'
-              % NETWORKS[network]['genesis'])
-    elif result.trust == 'checkpoint':
+    write('TRUST: this verdict relies on the attested block being in the %s chain, which the tool checks by' % network)
+    if result.ok and not incomplete and checkpoint is not None:
         write('       target rules, proof of work and links over every header, pinned by checkpoint %d = %s, which you'
               % (checkpoint[0], display(checkpoint[1])))
-        write('       stated: compare it to any public source. Headers before it are the preimages of the links back from it;')
-        write('       headers after it follow the links forward. Nothing in the file is taken on faith.')
+        write('       stated: compare it to any public source. Every header at or below it is a preimage on the links back')
+        write('       from it, the attested block included. Headers above it are chained forward only and prove nothing.')
+    elif result.ok and not incomplete:
+        write('       target rules, proof of work and links from the genesis block %s, hardcoded here, which is block %d itself.'
+              % (NETWORKS[network]['genesis'], height))
     elif result.ok:
-        write('       NOTHING YET: the file is one sound chain, but no genesis and no stated checkpoint ties it to %s.' % network)
-        write('       Compare its first header (height %d = %s) to any public source, then state it with --checkpoint.'
-              % (args.start_height, display(result.first_hash)))
+        write('       NOTHING YET: the file is one sound chain, but nothing stated pins the attested block %d to %s.' % (height, network))
+        write('       A sound proof-of-work chain is not Bitcoin\'s chain; state a checkpoint at or after block %d.' % height)
     write('       The file\'s origin (the box\'s own node, ops/export_headers.py) is not evidence; the chain check is.')
-    write('       Nothing else: no network, no third-party code.')
+    write('       Nothing else: no network, no third-party code. Verification against a node (ots verify) needs no checkpoint.')
 
     if failures:
         write('VERDICT: FAILS (%s)' % '; '.join(failures))
         return 1
     if incomplete:
-        write('VERDICT: INCOMPLETE: every check that could run passed, but nothing ties the headers file to %s;' % network)
-        write('         state --checkpoint HEIGHT:HASH after comparing it to a public source. Exit 2.')
+        write('VERDICT: INCOMPLETE: every check that could run passed, but nothing ties the attested block %d to %s;' % (height, network))
+        write('         state --checkpoint HEIGHT:HASH at or after block %d, compared to a public source. Exit 2.' % height)
         return 2
     found = result.notes.get('found', {}).get(bound) if bound else None
     write('VERDICT: HOLDS: the exhibit\'s bytes existed before Bitcoin block %d was mined (%s by the miner\'s clock)%s.'

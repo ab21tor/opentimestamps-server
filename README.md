@@ -909,7 +909,7 @@ Verifying one, anywhere:
 ```bash
 sha256sum EXHIBIT                                   # the digest the proof must be about
 python3 verify_claim.py EXHIBIT EXHIBIT.ots headers.bin
-python3 verify_claim.py EXHIBIT EXHIBIT.ots headers.bin --checkpoint 959450:00000000000000000001b119c6848c6db6e8cbc2ce908d73891581a1345c984c
+python3 verify_claim.py EXHIBIT EXHIBIT.ots headers.bin --checkpoint 959465:00000000000000000001af7d70e3b5f90888b2e3081bfbc108b47a73ad36fea8   # at or after the attested block
 ```
 
 The verifier prints every step and exits 0 only if all of them hold: 1
@@ -932,30 +932,38 @@ nothing ties the headers file to Bitcoin (`INCOMPLETE`, below):
    retarget, Bitcoin's adjustment recomputed from the period's
    timestamps). Nothing is skipped: the attested block, and the block a
    not-before bound rests on, are checked like every other;
-5. what ties that chain to Bitcoin: the genesis block, whose hash is
-   hardcoded, when the file starts at height 0; or the checkpoint stated
-   with `--checkpoint HEIGHT:HASH`, which must be in the file and match.
-   A checkpoint anywhere in the file pins every header in it: those
-   before it by the links back from it (each header's bytes are the
-   preimage of the next header's previous-hash field), those after it by
-   the links forward. The checkpoint may therefore be later than the
-   anchor (the newest header the expert compared), and the anchor block
-   is authenticated all the same.
+5. what ties the attested block to Bitcoin: the checkpoint stated with
+   `--checkpoint HEIGHT:HASH`, which must be in the file, match, and be
+   **at or after the attested block**. A checkpoint pins every header at
+   or below it: each header's bytes are the preimage of the next header's
+   previous-hash field, so the links back from the checkpoint
+   authenticate the attested block. Headers above a checkpoint are tied
+   to it only by following links forward, and a chain that follows the
+   rules is not thereby Bitcoin's chain: anyone can extend a fork past a
+   checkpoint (a miner at real difficulty; anyone at an easy one), so a
+   checkpoint below the attested block authenticates nothing about it.
+   The genesis block, hardcoded, is a checkpoint at height 0 and pins
+   nothing above itself. The natural checkpoint is the newest header the
+   expert compared to a public source, typically the file's last.
 
-Then a `TRUST` block states what the verdict rests on. Verified from
-genesis, that is proof of work alone; nothing about the file's origin is
-assumed. Verified from a checkpoint, the checkpoint is the one thing the
-tool cannot check, so it prints it for comparison with any public source.
-A file that does not start at genesis and is given no checkpoint is tied
-to nothing: every check that can run still runs, and the verdict is
-`INCOMPLETE` (exit 2), never `HOLDS`; the tool names the file's first
-header for the expert to compare to a public source and then state. A
-checkpoint that does not match the file is reported as `CHECKPOINT
-MISMATCH` with both hashes. The headers file's origin is not evidence and
-the tool says so; the chain check is. `--network regtest` exists for
+Then a `TRUST` block states what the verdict rests on: the checkpoint is
+the one thing the tool cannot check, so it prints it for comparison with
+any public source. A file given no checkpoint at or after the attested
+block — none at all, or one below it — is tied to nothing that
+authenticates that block: every check that can run still runs, and the
+verdict is `INCOMPLETE` (exit 2), never `HOLDS`; the tool names the
+header to compare and state (the file's last). A checkpoint that does not
+match the file is reported as `CHECKPOINT MISMATCH` with both hashes.
+The headers file's origin is not evidence and the tool says so; the
+chain check is. Verification against a node (`ots verify` with bitcoind)
+is the other path and needs no checkpoint. `--network regtest` exists for
 chains mined at an easy difficulty (the test suite's), must be asked for
 by name, and is printed as `NOT Bitcoin`: the default, mainnet, is the
-only network an expert is ever handed.
+only network an expert is ever handed. The test suite's
+`Test_incompatible_forks` builds two regtest forks off one prefix, each
+anchoring a different exhibit at the same height, and shows a checkpoint
+on the prefix lets neither hold while one at a fork's tip lets exactly
+one.
 
 What the verdict states: the exhibit's bytes existed before the attested
 block was mined; and, when the proof carries a not-before bound, that the
