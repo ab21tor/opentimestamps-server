@@ -1,0 +1,29 @@
+{
+  "audit_logs": null,
+  "books": {
+    "receipts": {
+      "bytes": 29,
+      "path": "wbooks/receipts.jsonl",
+      "sha256": "d4716d5a2608bd4617a7fc4a1cf9ec18cb1eb002e30cd44a1c2b6b4141417c0b"
+    }
+  },
+  "commissioning": null,
+  "created_at": "2026-09-03T01:00:00Z",
+  "float": {
+    "balance_sats": 212015,
+    "low": false,
+    "low_below_sats": 100000,
+    "source": "calendar status"
+  },
+  "fork_head": null,
+  "host": "oldwitness",
+  "journal": null,
+  "period": "2026-09-02",
+  "prev": {
+    "file": "2026-09-01.json",
+    "sha256": "33ed6be02724691413925722d92dd54e91b6eed49ee18837b7e2bd45b8b1afc4"
+  },
+  "schema": "selfstamp/2",
+  "seq": 2,
+  "witnessed": []
+}

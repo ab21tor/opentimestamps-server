@@ -1,0 +1,52 @@
+{
+  "audit_logs": {
+    "lims": {
+      "dir": "lims",
+      "files": [
+        {
+          "bytes": 12,
+          "mtime": "2026-09-16T10:56:07Z",
+          "name": "audit.log",
+          "sha256": "8bd4bd6a828ca31cd2c9266e39d132ad0b2a3cfcacb8fc8132bc1bc0cffc0a42"
+        },
+        {
+          "bytes": 8,
+          "mtime": "2026-09-16T10:56:07Z",
+          "name": "audit.log.1",
+          "sha256": "dcc0366721e7f48bbab60fec60e1504898812604ceadd3d21852d64b8e3b6320"
+        }
+      ],
+      "skipped": []
+    }
+  },
+  "books": {
+    "absent": {
+      "missing": true,
+      "path": "books/not-there"
+    },
+    "receipts": {
+      "bytes": 58,
+      "path": "books/receipts.jsonl",
+      "sha256": "e3c07b48ede97c6d4282189c9cbe5c50ed3a8bb4967d58395668d87d4d287ce1"
+    }
+  },
+  "commissioning": null,
+  "created_at": "2026-09-03T00:30:09Z",
+  "float": {
+    "balance_sats": 212015,
+    "low": false,
+    "low_below_sats": 100000,
+    "source": "calendar status"
+  },
+  "fork_head": null,
+  "host": "legacybox",
+  "journal": null,
+  "period": "2026-09-02",
+  "prev": {
+    "file": "2026-09-01.json",
+    "sha256": "c2b94001ab02b4ab3115a7296ef56647c4efe4a7c12047cf9ca7d75fed0f6701"
+  },
+  "schema": "selfstamp/2",
+  "seq": 2,
+  "witnessed": []
+}

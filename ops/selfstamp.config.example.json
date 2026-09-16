@@ -1,7 +1,6 @@
 {
   "state_dir": "~/selfstamp",
   "calendar_url": "http://127.0.0.1:14788",
-  "host": null,
   "books": {
     "receipts": "~/gateway/receipts/anchor-receipts.jsonl",
     "payer_log": "~/auto-anchor/logs/payer.log",

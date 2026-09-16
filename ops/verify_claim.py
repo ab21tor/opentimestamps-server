@@ -530,8 +530,10 @@ def main(argv=None, out=None):
         write('exhibit   : %s (%d bytes) sha256 %s' % (args.exhibit, size, digest.hex()))
         manifest = selfstamp_manifest(args.exhibit, size)
         if manifest:
-            write('            a selfstamp manifest (the notary\'s own diary): host %s, period %s, seq %s'
-                  % (manifest.get('host'), manifest.get('period'), manifest.get('seq')))
+            # selfstamp/3 names a chain by an opaque label; older manifests named a host.
+            named = ('chain %s' % manifest['chain']) if manifest.get('chain') else ('host %s' % manifest.get('host'))
+            write('            a selfstamp manifest (the notary\'s own diary): %s, period %s, seq %s'
+                  % (named, manifest.get('period'), manifest.get('seq')))
         step(1, digest == parsed.digest, 'the exhibit\'s sha256 is the digest the proof is about',
              None if digest == parsed.digest else 'the proof is about %s' % parsed.digest.hex())
     else:

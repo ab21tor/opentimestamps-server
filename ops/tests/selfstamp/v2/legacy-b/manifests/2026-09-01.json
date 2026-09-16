@@ -1,0 +1,53 @@
+{
+  "audit_logs": null,
+  "books": {
+    "receipts": {
+      "bytes": 29,
+      "path": "wbooks/receipts.jsonl",
+      "sha256": "d4716d5a2608bd4617a7fc4a1cf9ec18cb1eb002e30cd44a1c2b6b4141417c0b"
+    }
+  },
+  "commissioning": {
+    "config": {
+      "path": null,
+      "sha256": "ac6ecb8d3ff370aee78ff6d1698d3e24e1d5e13d7bb6d668e43394517508353f"
+    },
+    "fork_commit": null,
+    "host": "oldwitness",
+    "installed_at": "2026-09-02T01:00:00Z"
+  },
+  "created_at": "2026-09-02T01:00:00Z",
+  "float": {
+    "balance_sats": 212015,
+    "low": false,
+    "low_below_sats": 100000,
+    "source": "calendar status"
+  },
+  "fork_head": null,
+  "host": "oldwitness",
+  "journal": null,
+  "period": "2026-09-01",
+  "prev": null,
+  "schema": "selfstamp/2",
+  "seq": 1,
+  "witnessed": [
+    {
+      "file": "legacybox-2026-09-01-c2b94001ab02.json",
+      "foreign_proof": "bitcoin height=965500",
+      "host": "legacybox",
+      "period": "2026-09-01",
+      "seq": 1,
+      "sha256": "c2b94001ab02b4ab3115a7296ef56647c4efe4a7c12047cf9ca7d75fed0f6701",
+      "witnessed_at": "2026-09-16T10:56:07Z"
+    },
+    {
+      "file": "legacybox-2026-09-02-d2fa62b2157d.json",
+      "foreign_proof": null,
+      "host": "legacybox",
+      "period": "2026-09-02",
+      "seq": 2,
+      "sha256": "d2fa62b2157df0a830d07f0191a01479c8a1df995282f1690b8778604d72dd0f",
+      "witnessed_at": "2026-09-16T10:56:07Z"
+    }
+  ]
+}

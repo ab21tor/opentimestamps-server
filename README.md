@@ -88,9 +88,10 @@ Each rule below is made by the code described in the section it names.
   (self-stamp), bitcoind RPC (headers export) and, for the watcher, the
   host's own commands; the watcher's one output off-host is an optional
   ntfy post.
-- A manifest holds paths, hashes, sizes, times, counts and host names,
-  never the contents of a file it hashes, and leaves the host only through
-  the configured outbox or by hand ("The self-stamp").
+- A manifest holds hashes, sizes, times, counts and an opaque chain
+  label, never the contents of a file it hashes and, since `selfstamp/3`,
+  no host name, path or file name; it leaves the host only through the
+  configured outbox or by hand ("The self-stamp").
 
 ## Requirements
 
@@ -667,7 +668,9 @@ operator lane. The proof rides whatever anchor the calendar sends next;
 the tool never forces an anchor. The next run upgrades the proof to a
 Bitcoin attestation with one `GET /timestamp/<commitment>`. Standard
 library only, filesystem in and out, no listener; the inputs beyond files
-are one `journalctl` call and the calendar on loopback.
+are one `journalctl` call and the calendar on loopback. Every step, and
+who owns the work between two steps, is in `docs/contracts.md`,
+"Workflow 2".
 
 ```
 python3 ops/selfstamp.py run     --config ~/selfstamp/config.json   # heartbeat, idempotent
@@ -678,17 +681,31 @@ python3 ops/selfstamp.py verify  --manifests ~/selfstamp/manifests  # offline, n
 `run` is idempotent per period: a manifest that exists is left alone (a
 second run the same day writes nothing), a manifest without a proof is
 resubmitted rather than rewritten, a pending proof is asked about once
-per run, a complete proof is never touched again. `run` and `upgrade`
-hold an exclusive lock on the state directory (`<state_dir>/.lock`,
-across processes) for their whole duration, so the timer's run and a
-manual one never interleave their writes: the second waits up to
-`--lock-wait` seconds (default 300), then exits 1 with `locked`. Every
-file is written under a unique temporary name, fsynced, renamed, and its
-directory fsynced. The trigger is the
-clock and only the clock: an anchor confirming, which appends a receipt
-line (including for the anchor that carried this manifest), never causes
-a manifest; the next day's manifest records the new receipts hash. Missed
-days are not backfilled; the chain links across the gap.
+per run, a complete proof is never touched again. The period is the UTC
+day before the run's clock; `--period` names another finished day, and
+is refused for a day not yet over or one not after the newest manifest.
+Missed days are not backfilled: a run after an outage covers the day
+before it, and the chain links across the gap. A manifest written late
+says when it looked (`created_at`) and never claims an observation it
+did not make. `run` and `upgrade` hold an exclusive lock on the state
+directory (`<state_dir>/.lock`, across processes) for their whole
+duration, so the timer's run and a manual one never interleave their
+writes: the second waits up to `--lock-wait` seconds (default 300), then
+exits 1 with `locked`. Every file is written under a unique temporary
+name, fsynced, renamed, and its directory fsynced, so `verify` and any
+other reader need no lock. The trigger is the clock and only the clock:
+an anchor confirming, which appends a receipt line (including for the
+anchor that carried this manifest), never causes a manifest; the next
+day's manifest records the new receipts hash.
+
+Each run ends with one `summary` line: how many manifests and copies are
+held, how many proofs are `bitcoin`, `pending`, `missing`, `malformed` or
+`mismatch`, and how many steps failed. The exit code is about this run's
+own work: 0 when every step is done, 1 when a step failed and is left for
+the next run or the operator (the calendar did not answer a submission or
+an upgrade, an inbox file could not be read, a proof is not of the file
+beside it). A proof still pending is not a failure and has no deadline:
+it stays in the summary until its anchor confirms.
 
 Config (`ops/selfstamp.config.example.json`; `~` is expanded):
 
@@ -696,7 +713,6 @@ Config (`ops/selfstamp.config.example.json`; `~` is expanded):
 {
   "state_dir": "~/selfstamp",
   "calendar_url": "http://127.0.0.1:14788",
-  "host": null,
   "books": {
     "receipts": "~/gateway/receipts/anchor-receipts.jsonl",
     "payer_log": "~/auto-anchor/logs/payer.log",
@@ -715,71 +731,105 @@ Config (`ops/selfstamp.config.example.json`; `~` is expanded):
 
 `audit_logs`, `outbox` and `inbox` are each off when empty;
 `float_low_sats` is the balance below which `float.low` is true. Each is
-described below.
+described below. A `host` key from an older config is ignored, and the
+run says so in its log.
 
 State: `<state_dir>/manifests/<period>.json` with the proof beside it as
-`<period>.json.ots`; witnessed copies under `<state_dir>/witnessed/`; the
-unit's log in `<state_dir>/selfstamp.log`.
+`<period>.json.ots`; witnessed copies under `<state_dir>/witnessed/`;
+files the inbox could not use under `<inbox>/rejected/`; the unit's log
+in `<state_dir>/selfstamp.log`.
 
 The manifest is JSON with sorted keys, two-space indent and a trailing
 newline, exactly `json.dumps(m, sort_keys=True, indent=2) + "\n"`, so the
-stamped bytes can be re-derived. Fields (`"schema": "selfstamp/2"`;
-`verify` also reads a chain begun under `selfstamp/1`, whose manifests
-lack the last four):
+stamped bytes can be re-derived. Fields (`"schema": "selfstamp/3"`; what
+each discloses and is for, field by field, is in `docs/contracts.md`):
 
-- `host`: the host's hostname, or the configured name.
-- `period`: the UTC day covered, `YYYY-MM-DD`; also the file name.
-- `created_at`: when the manifest was written, UTC.
+- `chain`: the chain's label, 32 hex digits drawn at random when the
+  chain began and the same on every manifest after. It names the chain
+  and nothing else.
+- `period`: the UTC day covered, `YYYY-MM-DD`; also the file name. It is
+  the journal window, not when the books were looked at.
+- `created_at`: the run's clock when the manifest was begun, UTC; every
+  observation in it was made after that instant, within the run.
 - `seq`: 1 for the first manifest, then +1 per manifest, no gaps.
 - `prev`: `null` for the first manifest; otherwise `{"file", "sha256"}`,
   the previous manifest's file name and the sha256 of its bytes. This is
   the chain link, and the same digest that manifest's proof stamps.
-- `books`: one entry per configured book, `{"path", "sha256", "bytes"}`
-  over the exact file bytes, or `{"path", "missing": true}` if the file
-  is absent (recorded, not fatal).
+- `config`: `{"sha256"}` of the configuration the run used: the config
+  file's bytes as they were read at the start of the run, never a later
+  reread (a config handed over as a dict hashes its canonical JSON).
+- `books`: one entry per configured key: `{"sha256", "bytes"}` over the
+  exact file bytes; `{"missing": true}` if the file is absent;
+  `{"unstable": why}` if it changed while being read ("What a digest
+  promises"); `{"error": class and errno}` if it could not be read.
+  Recorded, never fatal, and never a path.
 - `journal`: `null` when off; otherwise `{"since", "until", "command",
   "sha256", "bytes"}` over `journalctl --since '<period> 00:00:00 UTC'
-  --until '<next day> 00:00:00 UTC' -o export -q`. Reproducible by anyone
-  holding that day's journal, which needs the journal to be persistent
-  and still to retain the day (`SystemMaxUse` caps it), or an export.
-- `fork_head`: `null` when off; otherwise `{"path", "ref", "commit"}`
-  read from `.git/HEAD` by file.
+  --until '<next day> 00:00:00 UTC' -o export -q`, or the same with
+  `error` in place of the digest when the call failed. Reproducible by
+  anyone holding that day's journal, which needs the journal to be
+  persistent and still to retain the day (`SystemMaxUse` caps it), or an
+  export.
+- `fork_head`: `null` when off; otherwise `{"ref", "commit"}` read from
+  `.git/HEAD` by file, or `{"missing": true}`.
 - `audit_logs`: `null` when none is configured; otherwise one entry per
-  configured name: a file as `{"path", "sha256", "bytes", "mtime"}`, a
-  directory as `{"dir", "files": [{"name", "sha256", "bytes", "mtime"}…],
-  "skipped": [{"name", "reason"}…]}` ("External audit logs").
+  configured key: a file as `{"sha256", "bytes", "mtime"}`, a directory
+  as `{"files": [{"sha256", "bytes", "mtime"}…], "skipped": {reason:
+  count}}`, with `unstable` beside them when the listing changed during
+  the pass ("External audit logs").
 - `float`: the anchor wallet, `{"source": "calendar status",
   "balance_sats", "low_below_sats", "low"}`, or `{"source",
   "low_below_sats", "error"}` when the calendar did not answer ("The
   float").
-- `commissioning`: on the first manifest (`seq` 1) `{"host",
-  "installed_at", "fork_commit", "config": {"path", "sha256"}}`; `null`
-  on every later one ("The commissioning block").
 - `witnessed`: a list, usually empty, of the foreign manifests this host
-  vouches for since its previous manifest, each `{"host", "seq",
+  vouches for since its previous manifest, each `{"chain", "seq",
   "period", "file", "sha256", "witnessed_at", "foreign_proof"}`
   ("Witness by file drop").
 
-The books and audit logs are hashes of files; the manifest holds paths,
-hashes, sizes, times, counts and host names, never the contents of a file.
-It leaves the host only through the configured outbox, or by hand.
+A manifest holds hashes, sizes, times, counts, state words and the chain
+label: never the contents of a file it hashes, and no host name, path or
+file name of anything on the host or in an audit directory, because any
+of those can name a client. The same rule holds for the outbox's file
+names, the copies' names and the log. Manifests written under
+`selfstamp/1` and `/2` carried `host`, a `path` in every book entry, the
+directory path and file names under `audit_logs`, and (`/2`) a
+`commissioning` block; `verify` reads them as they are, nothing rewrites
+them, and what they disclosed stays disclosed ("Commissioning" and
+"Witness by file drop" say how such chains continue and are witnessed).
 
-#### The commissioning block
+#### What a digest promises
 
-The first manifest of a chain (`seq` 1) carries a `commissioning` block:
-the host's name, the moment the chain began (`installed_at`, the same
-instant as that manifest's `created_at`), the calendar fork's commit, and
-the sha256 of the self-stamp config file (or, for a config handed over as
-a dict, of its canonical JSON). Stamped and anchored like any manifest, it
-records that a host of this name, running this calendar code under this
-configuration, began its chain at this time, and every later manifest
-links back to it. It records nothing about the firmware, the operating
-system, the hardware, or the files the host later hashes. A chain begun
-under `selfstamp/1` has a first manifest without the block; its `host`
-and `fork_head` fields carry the same names without a hash of the config.
-`verify` prints the block as a `commissioned host=… fork=… config=… at=…`
-line and treats a `selfstamp/2` first manifest without one, or a later
-manifest with one, as a break.
+A book is read once, in chunks. The entry carries a digest only if the
+file held still: the path still names the same file afterwards, and its
+size, mtime and ctime from the open descriptor agree before and after the
+read with the bytes counted. A file that was appended to, truncated,
+rewritten in place, replaced under its path or removed while it was read
+gets `{"unstable": why}` and no digest that day: a prefix of a growing
+file is not the file, and a mix of two versions is nothing. Unchanged
+metadata does not prove an atomic snapshot (a rewrite inside one
+timestamp tick is not seen), and files that each held still do not prove
+a coherent directory: a directory's entry says `unstable` only when its
+listing changed during the pass. Point the tool at immutable exports, or
+at files with a snapshot boundary you control; a live log is recorded
+when it holds still and named unstable when it does not.
+
+#### Commissioning
+
+The first manifest of a chain (`seq` 1, `prev` null) is its commissioning
+record. It carries what every manifest carries: the chain's label, the
+calendar fork's commit, and the fingerprint of the configuration the run
+used. Its `created_at` is the box's own clock when the chain began, an
+observation; the block named by its proof's Bitcoin attestation is the
+proven bound (the manifest existed before that block); nothing records
+or proves when the software was installed. `verify` prints the record as
+`genesis chain=… at=… fork=… config=…`. Every later manifest carries the
+fork's commit and the config fingerprint too, so a change of either shows
+on the next manifest. A chain begun under `selfstamp/2` has instead a
+`commissioning` block on its genesis (`host`, `installed_at`, the fork
+commit, the config's path and hash); `verify` prints it as `commissioned
+host=… fork=… config=… at=…` and treats a `/2` genesis without it, or a
+later `/2` manifest with one, as a break. A chain begun under `/1` has
+neither.
 
 #### The float
 
@@ -791,31 +841,34 @@ files' 20,000-sat cap, the same figure as the gateway's float alarm and
 the watcher's `CAL_MIN_SATS`; keep the two equal). The host never pauses
 on it: anchoring waits when the wallet is empty, intake continues. A
 status line that does not answer, or answers without a readable balance,
-is recorded as `{"error": …}` and never stops the run.
+is recorded as `{"error": …}` with no balance and no `low` (an unknown
+float is neither zero nor healthy) and never stops the run.
 
 #### External audit logs
 
 `audit_logs` points the manifest at files the host does not own: an
 application's audit-trail export, an append-only log, a rotating file
-set. Each configured name is a file or a directory. A file is hashed in
+set. Each configured key is a file or a directory. A file is hashed in
 64 KiB chunks (memory stays flat whatever the size) and recorded with its
-size and mtime as read from the open descriptor. A directory is hashed
-file by file, its regular files, sorted by name, not recursed, with the
-same three fields each; entries that are not regular files are listed as
-skipped, and a symlink is followed only if it resolves inside the
-configured directory, else it is listed as skipped and never read
-(`symlink outside the configured dir`). Rotation needs no rule: the files
-are hashed as they are at the run, and the next day's manifest shows what
-was renamed, truncated or added. A missing path is recorded as
-`{"missing": true}`, never fatal.
+size and mtime as read from the open descriptor, under the same stability
+rule as a book. A directory is hashed file by file, its regular files,
+not recursed, and listed by digest, size and mtime, sorted, without the
+file names: a name in someone else's audit directory can name a client.
+Entries that are not regular files are counted under their reason, and a
+symlink is followed only if it resolves inside the configured directory
+(else counted as `symlink outside the configured dir`, never read).
+Rotation needs no rule: the files are hashed as they are at the run, and
+the next day's manifest shows what changed; a listing that changed during
+the pass makes the entry `unstable` beside the files that held still. A
+missing path is recorded as `{"missing": true}`, never fatal.
 
 Each daily manifest then carries the sha256 of each file as it stood that
-day, anchored in Bitcoin within the next anchor window. A later copy of
-the file that differs from the recorded hash has changed since; whether
-the trail was complete or truthful when written, and what happened
-between two daily hashes, the manifest does not record. The host reads
-the files and keeps their hashes; it never copies them, never serves
-them, and the manifest never quotes a line of them.
+day, anchored in Bitcoin within the next anchor window. A file you hold
+that hashes to a recorded digest stood in that directory that day;
+whether the trail was complete or truthful when written, and what
+happened between two daily hashes, the manifest does not record. The host
+reads the files and keeps their hashes; it never copies them, never
+serves them, and the manifest never quotes a line or a name of them.
 
 #### Witness by file drop
 
@@ -824,40 +877,84 @@ show its own tail, and it ends with the host. A second host running this
 tool can hold the tail for it, with plain files and nothing else.
 
 On the host being witnessed, set `outbox` to a directory. After every run
-the tool writes each manifest there as `<host>-<period>.json` and, once
-its proof carries a Bitcoin attestation, the proof as
-`<host>-<period>.json.ots` (a pending proof names a loopback calendar
-nobody else can reach, so it is not exported). Files already there with
-identical bytes are left untouched.
+the tool writes each manifest there as `<chain>-<period>.json` and, once
+its proof is a proof of the manifest's bytes carrying a Bitcoin
+attestation, the proof as `<chain>-<period>.json.ots` (a pending proof
+names a loopback calendar nobody else can reach, so it is not exported; a
+proof of other bytes, or one this reader cannot parse, is withheld and
+named in the log as `export withheld`). Files already there with
+identical bytes are left untouched; each is written whole, so a reader
+may copy any file it sees, except dotted names, which are temporaries.
+Manifests written under an older schema keep the `<host>-<period>` names
+their exports already have.
 
-On the witness, set `inbox` to a directory. Each run consumes every
-`*.json` there that parses as a selfstamp manifest (schema, `host`,
-`seq`, `period`): it keeps a copy under `<state_dir>/witnessed/` as
-`<host>-<period>-<first 12 hex of its sha256>.json`, keeps a proof that
-came beside it as `<copy>.foreign.ots` if that proof is a proof of exactly
-those bytes, stamps the copy's sha256 through its own operator lane
-(never the counted door: a witnessed file is not a record and never
-reaches a receipt), upgrades that proof on later runs like its own, and
-removes the inbox file. The copy is the record, so a run interrupted
-anywhere converges: a file already held is a duplicate and is removed,
-after any proof delivered beside it is kept (the source exports its
-proof only once it is anchored, so the proof normally arrives on a later
-pass than its manifest; a later proof replaces a pending one and never
-an anchored one, and `verify` prints what is held now as `foreign_now`);
-a file that is not a manifest is moved to `<inbox>/rejected/` and logged.
+On the witness, set `inbox` to a directory. How the files travel (`scp`
+on a timer, a USB stick, a shared mount) is the operator's choice: there
+is no network code and no listener in this tool on either host, and the
+witness needs nothing from the source but the files. The tool's lock does
+not cover the deliverer, so delivery has one rule: write into the inbox
+under a name the tool ignores (a leading dot, or any suffix but `.json`
+and `.json.ots`), then rename into place. Names beginning with `.claim-`
+are the tool's own and a deliverer never writes one. A name may be used
+again: before a run reads anything it renames every delivery under a
+final name to `.claim-<8 hex>-<name>`, atomically, so a file renamed over
+a name the run is holding is a new delivery for the next run and is never
+removed under it; a claim left by a run that died is finished by the next
+one. A file copied in place under its final name is read whenever the run
+comes; caught half written, it is quarantined as malformed and must be
+delivered again.
+
+Each run consumes every claimed `*.json` that parses as a selfstamp
+manifest (schema, `seq`, `period`, and its label, 32 hex digits, or a
+host name under an older schema): it keeps a copy under
+`<state_dir>/witnessed/` as `<chain>-<period>-<first 12 hex of its
+sha256>.json` (`legacy-<period>-…` for a source under an older schema,
+whose host name is not made into a file name here), stamps the copy's
+sha256 through its own operator lane (never the counted door: a
+witnessed file is not a record and never reaches a receipt), upgrades
+that proof on later runs like its own, and removes the claim. The copy
+is written before anything is removed, so a run interrupted anywhere
+converges: a file whose bytes are already held (by content, whatever the
+copy's name) is a duplicate and is removed after any proof delivered
+beside it is kept. A proof delivered beside a manifest, or alone later as
+`<name>.json.ots`, is kept as `<copy>.foreign.ots` if it is a proof of
+exactly those bytes and says more than what is held: the source exports
+its proof only once it is anchored, so the proof normally arrives on a
+later pass than its manifest; a later proof replaces a pending one and
+never an anchored one, and `verify` prints what is held now as
+`foreign_now`. What is held counts only if it is itself a proof of the
+copy: a held file that is not is set aside beside the copy as
+`<copy>.foreign.ots.rejected-<12 hex>` and logged, and never outranks a
+proof that is. A proof of no copy held is left as a claim and named in
+the log every run (`awaiting its manifest`); there is no timeout, unless
+the manifest of its name has already been quarantined, in which case it
+joins it. A file that is not a manifest, or a companion that is not a
+proof of its manifest, is moved to `<inbox>/rejected/<12 hex of its
+sha256>-<its delivered name>` and logged, its bytes fsynced before the
+rename and both directories after it, so the quarantine is durable before
+it is acknowledged: kept, never deleted, and two bad deliveries under one
+name are both kept. An inbox file or directory that cannot be read is
+logged (by error class, never by path) and counted (exit 1) and stops
+nothing else. Two different manifests claiming one chain and seq are
+both copied and both vouched for; `verify --witness` says so.
+
 The witness's next manifest lists every copy no earlier manifest listed,
-as a `witnessed` entry naming the source `host`, `seq`, `period`, the
-copy's file name and sha256, when it was witnessed, and what the foreign
-proof said (`bitcoin height=N`, `pending`, or `null` when none came).
-From that manifest on, the witness's chain vouches for that exact foreign
-file.
+as a `witnessed` entry naming the source `chain` (`null` for a source
+under an older schema), `seq`, `period`, the copy's file name and sha256,
+when it was witnessed, and what the foreign proof said at that moment
+(`bitcoin height=N`, `pending`, or `null` when none came). `bitcoin
+height=N` says an attestation is present in the bytes; nothing here
+checks it against Bitcoin ("Verify"). From that manifest on, the
+witness's chain vouches for that exact foreign file. A copy that cannot
+be read or no longer parses when the manifest is built is named in the
+log, counted, and tried again next run.
 
-How the files travel (`scp` on a timer, a USB stick, a shared mount) is
-the operator's choice: there is no network code and no listener in this
-tool on either host, and the witness needs nothing from the source but
-the files. A host can be witness and witnessed at once (both keys set),
-and two hosts can witness each other; neither reads anything of the other
-but the files, and Bitcoin orders both chains.
+A host can be witness and witnessed at once (both keys set), and two
+hosts can witness each other; neither reads anything of the other but
+the files, and Bitcoin orders both chains. A witness running an older
+version of this tool refuses a `selfstamp/3` manifest by schema and moves
+it to its `rejected/`, losing nothing: both hosts run this version or
+newer.
 
 ### The watcher
 
@@ -1019,28 +1116,56 @@ verifier follows the Bitcoin one and notes the other.
 ### The self-stamp chain
 
 `ops/selfstamp.py verify --manifests DIR` checks, offline: for each
-manifest newest to oldest, `prev.sha256` equals the sha256 of the file it
-names, `seq` steps down by one, `period` steps back, the first manifest
-has `prev: null`; every proof present is a well-formed proof of exactly
-its manifest's bytes; a `selfstamp/2` first manifest carries its
-commissioning block and no later one does; and every `witnessed` entry
-names a copy this host holds (by default in the `witnessed` directory
-beside `manifests`; `--witnessed DIR` names another) that hashes to the
-recorded sha256, whose own proof, if present, is a proof of those bytes.
-Each vouch is printed as `vouches for host=… seq=… period=… sha256=…
-copy=ok|missing|MISMATCH proof=…`; a missing or altered copy is a break,
-and so is a missing `witnessed` directory: a vouch is for bytes this host
-claims to hold. `--skip-witnessed` asks for the partial check without the
-copies; every vouch is then labelled `SKIPPED` and the summary says
-`copies not checked`. It exits 1 on any break.
+manifest oldest to newest, `prev.sha256` equals the sha256 of the file it
+names, `seq` steps up by one, `period` steps forward and matches the file
+name, the first manifest has `prev: null`; the chain label, once a
+manifest has one, is the same on every later one; every proof present is
+a well-formed proof of exactly its manifest's bytes; a `selfstamp/2`
+first manifest carries its commissioning block and no later one does; and
+every `witnessed` entry names a copy this host holds (by default in the
+`witnessed` directory beside `manifests`; `--witnessed DIR` names
+another) that hashes to the recorded sha256, whose own proof, if present,
+is a proof of those bytes. Each manifest is printed as `<file> seq=N
+chain=ok|BROKEN … proof=<state>`, a `selfstamp/3` genesis with its
+`genesis chain=… at=… fork=… config=…` line, and each vouch as `vouches
+for chain=… seq=… period=… sha256=… copy=ok|missing|unreadable|MISMATCH
+proof=<state> foreign_proof=<as recorded> foreign_now=<as held>`. The
+proof states are `missing`, `pending`, `bitcoin height=N`, `malformed`,
+`mismatch`, `unknown` and `unreadable`; `missing` and `pending` are
+reported and are not breaks, every other state but `bitcoin` is. A copy,
+proof or manifest that cannot be read is a break, and so is a missing
+`witnessed` directory: a vouch is for bytes this host claims to hold.
+Every manifest is read by the same validator the inbox and the chain's
+continuation use (a schema this tool reads, an integer `seq` from 1, a
+date for `period`, a 32-hex label under `selfstamp/3` or a host under an
+older schema); a file that fails it is `BROKEN` with the reason.
+`--skip-witnessed` asks for the partial check without the copies; every
+vouch is then labelled `SKIPPED` and the summary says `copies not
+checked`. Every report ends by saying that an attestation present is not
+checked against Bitcoin here: `bitcoin height=N` is a fact about the
+bytes, and `verify_claim.py` (or the ots client against a node) is the
+check against the chain. It exits 1 on any break, and 0 with any number
+of proofs pending or missing.
 
 With `--witness WITNESS_MANIFESTS_DIR` it reads another chain's manifests
 and says for each manifest here whether the witness holds its hash
-(`witnessed by <host> seq=N`), holds a different one (`WITNESS MISMATCH`,
-a break: the file changed after it was witnessed, or the witness saw a
-different version), or never saw it. Two manifest directories and
+(`witnessed by <chain> seq=N`), holds a different one under the same
+identity, or never saw it (`not witnessed`). The identity is the label
+and seq, and another hash under it is `WITNESS MISMATCH`, a break: the
+file changed after it was witnessed, or the witness saw a different
+version. For a manifest without a label (an older schema) the identity
+is seq and period alone, and another hash under it is `WITNESS
+AMBIGUOUS`, reported and not a break: another version of this manifest,
+or another unlabelled chain that began the same day, and only a label
+tells them apart. Several versions held under one identity are said (`N
+versions held for this seq`). A witness manifest that cannot be read or
+is not a manifest is named, the rest are still used, and the check is
+incomplete, which is exit 1: an absence found in evidence that could not
+all be read is not established. A witness directory that is not there is
+a break: nothing was checked. The check ends with its own line, `witness
+check=ok|BROKEN|incomplete` and the counts. Two manifest directories and
 `sha256sum` suffice: the vouched hash is in the witness's manifest, the
-file is in the witnessed host's.
+file is in the witnessed host's. No line of the report names a path.
 
 The same chain checks can be made with `sha256sum` and `jq`, and each
 proof with the ots client as above. Altering any byte of a past manifest
@@ -1057,7 +1182,8 @@ cp ~/selfstamp/manifests/2026-09-07.json ~/selfstamp/manifests/2026-09-07.json.o
 cd $D && python3 verify_claim.py 2026-09-07.json 2026-09-07.json.ots headers.bin
 ```
 
-The verifier recognises a manifest and names its host, period and seq.
+The verifier recognises a manifest and names its chain (or, for a
+manifest under an older schema, its host), period and seq.
 Every manifest with its proof and one `headers.bin` is the whole chain,
 each day anchored, verifiable with `python3` alone.
 
@@ -1070,7 +1196,8 @@ moment beside a checkpoint from another is refused at the next start,
 "Restart checkpoint"), `receipts/`, the adapter's `DATA_DIR`,
 `~/selfstamp` whole (`manifests/` and `witnessed/`: a witnessed entry
 whose copy is missing is a verification break), the compose `.env`;
-encrypted, off-host.
+encrypted, off-host. The inbox's `rejected/` holds what a witness could
+not use, for the operator to look at; it is not part of the chain.
 
 At every start the calendar checks that `journal.known-good` belongs to
 `db/`, lies within what it durably holds, and describes the journal that
@@ -1102,6 +1229,24 @@ anchoring waits (one error in its log; the watcher's `calendar` check
 alarms first, at five fee caps); the adapter's intake never stops. Refill
 is an on-chain payment to any address of the wallet.
 
+The self-stamp needs nothing after an interrupted run: the next run
+finishes from the files (a manifest without a proof is submitted, a copy
+no manifest lists is listed, a delivery half consumed is a duplicate). Two
+states are the operator's. A proof that `run` and `verify` report as
+`mismatch` (a proof, not of the file beside it) or `malformed` (this
+reader cannot parse it) is reported every run with exit 1 and never
+touched, because only the operator can say whether the manifest or the
+proof is the damaged one: the successor's `prev.sha256` says whether the
+manifest's bytes changed, and a proof upgraded with the ots client
+against several calendars is `malformed` to this reader and valid. Move
+the proof aside; the next run stamps the manifest as it is now, under a
+later block. A copy or inbox file that cannot be read is named in the log
+every run until it can; fix the permission and the next run folds or
+consumes it. A `.claim-…` file in a witness's inbox is a delivery the tool
+took into its keeping and will finish next run; leave it. Nothing in the
+tool rewrites, renames or removes a manifest, a copy or a quarantined
+file.
+
 ## What it does not do
 
 - Nothing here states when a record was made, captured or received. The
@@ -1119,7 +1264,24 @@ is an on-chain payment to any address of the wallet.
   every day; `seq` should reach today), off-host copies and a witness
   expose the tail, not the chain.
 - A witness vouches for bytes, not for truth, and holds only what
-  arrived.
+  arrived; a foreign proof it holds is an attestation present in the
+  bytes, not a check against Bitcoin.
+- A manifest records a book as it was when it held still. A book that
+  changes under the reader has no digest that day (`unstable`), unchanged
+  metadata is not an atomic snapshot, and files that each held still are
+  not a coherent directory ("What a digest promises"). Immutable exports,
+  or a snapshot boundary the operator controls, are the remedy.
+- The self-stamp's lock covers its own processes. Whoever delivers files
+  into a witness's inbox follows the naming convention ("Witness by file
+  drop"); a file copied in place under its final name and caught half
+  written is quarantined as malformed, kept, and must be delivered again.
+- A manifest written under `selfstamp/1` or `/2` keeps the host name,
+  paths and file names it carried. Nothing rewrites anchored history; the
+  naming rule holds from `selfstamp/3` on, and a witness records such a
+  source without its host name. The price: a cross-check of such a chain
+  can say `witnessed by`, `not witnessed` or `WITNESS AMBIGUOUS`, never
+  `MISMATCH`, because without a label a witness cannot tell another
+  version of a manifest from another chain that began the same day.
 - The self-stamp does not cover the gateway's own database
   (`obligations.db`, in the gateway's root-owned data volume, whose bills
   endpoint has side effects when polled); the receipts file is the
@@ -1149,7 +1311,8 @@ Test modules live under `otsserver/tests/`:
   `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py`,
   `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py`,
   `test_claim_kit.py`, `test_stamper_save_retry.py`,
-  `test_rpc_privacy.py`, `test_proof_corpus.py`: regression tests for this branch's delta
+  `test_rpc_privacy.py`, `test_proof_corpus.py`,
+  `test_selfstamp_workflow.py`: regression tests for this branch's delta
   (launcher flags, the status line and its RPC wiring, stamper-loop
   crash fixes, anchor receipts, anchor cadence, the `/digest`
   Content-Length handling, anchor-receipt record counts and their
@@ -1201,6 +1364,37 @@ Test modules live under `otsserver/tests/`:
   Every durability test injects failures at the write boundary or kills
   the process; none simulates a power cut.
 
+  The self-stamp sitting of 2026-09-16 (workflow two, `docs/contracts.md`
+  section 9) adds `test_selfstamp_workflow.py`: the transitions S1–S9
+  with their failure cases, each class naming its fault model. A hook
+  inside the tool's read loop plays a writer touching a book (append,
+  truncation, rewrite, replacement, removal); the n-th rename, replace,
+  unlink or fsync of a fresh run raises, swept from n = 1 until a fresh
+  run has no n-th call, every case from a fresh fixture, every injection
+  asserted to have fired and every recovery interrupted once more, for a
+  run with one delivery pair and one with a bad pair; a deliverer renames
+  a second file over a name the run is holding; a child process is
+  paused at a named boundary and killed with SIGKILL (after the manifest,
+  after the calendar's answer, after a copy); the fake calendar commits a
+  digest and drops the answer, or cuts an upgrade short; permission
+  faults come from `chmod`; the syscalls of a quarantine are recorded in
+  order; and the `selfstamp/2` corpus under `ops/tests/selfstamp/v2/`
+  (written by the tool at 3961a1f) is verified, continued and witnessed
+  under the new code. Each defect's regression fails on the code before
+  the fix: an unstable book given a digest, the config fingerprint
+  reread, host names and paths in manifests, exports, copy names and
+  logs, a rejected companion deleted, a proof arriving after its manifest
+  ignored, an unreadable inbox file or copy ending the run, a mismatched
+  proof upgraded in silence, a missing witness directory passing, an
+  unreadable copy ending `verify` with a traceback, a half-delivered file
+  consumed, a day not yet over accepted; and, from the sitting's gate
+  review, a delivery replaced under its name lost, a held proof of other
+  bytes outranking a right one, a proof of other bytes exported,
+  unreadable witness evidence read as success, unrelated legacy chains
+  called a mismatch, paths in messages, a label that is not 32 hex
+  accepted, a predecessor with an unknown schema accepted, a quarantine
+  acknowledged before it was durable.
+
 No test module needs a running Bitcoin node. Every module does need the
 full dependency set installed, and `plyvel` is a native build:
 `otsserver/calendar.py` imports it at module level, so without it every
@@ -1213,7 +1407,7 @@ with the LevelDB headers installed (`libleveldb-dev` on Debian, `leveldb`
 from Homebrew on macOS):
 
 ```
-python -m unittest discover -v                       # Ran 234 tests ... OK
+python -m unittest discover -v                       # Ran 293 tests ... OK
 ```
 
 The otsd image has no pytest; where pytest is installed,

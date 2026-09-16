@@ -2,8 +2,9 @@
 
 > **Fork note.** This tree is a fork (`0.7.1+fork`) carrying anchor
 > receipts, record counts, aggregator dedupe, stamper hardening, the
-> operator lane with the `ops/selfstamp.py` diary tool (schema selfstamp/2:
-> commissioning block, float, external audit logs, witness by file drop),
+> operator lane with the `ops/selfstamp.py` diary tool (schema selfstamp/3:
+> chain labels in place of host names and paths, float, external audit
+> logs, witness by file drop; selfstamp/1 and /2 chains read unchanged),
 > the `ops/watch.py` box watcher, and the appliance shape (`docker-compose.enterprise.yml`,
 > a root `Dockerfile` copied from the gateway's `otsd/`) on top of upstream
 > v0.7.1. The notes below are upstream's and end there; fork
