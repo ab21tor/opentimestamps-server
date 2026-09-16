@@ -100,7 +100,7 @@
  ],
  "expect": [
   [
-   "pi5 heartbeat: ok 20/20"
+   "pi5 heartbeat: ok 21/21"
   ],
   [],
   [
@@ -109,7 +109,7 @@
   [],
   [],
   [
-   "RECOVERED: all 20 checks ok (was: reboot_wanted"
+   "RECOVERED: all 21 checks ok (was: reboot_wanted"
   ]
  ]
 }

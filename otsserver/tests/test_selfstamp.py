@@ -1066,5 +1066,31 @@ class Test_witness_delivery(Test_witness):
         self.assertIsNone(m['witnessed'][0]['foreign_proof'])
 
 
+class Test_malformed_foreign_proof(SelfstampCase):
+    """2026-09-15/16 review F14: a foreign proof companion whose pending URI
+    held an invalid UTF-8 byte raised UnicodeDecodeError out of parse_ots,
+    past the OtsError handling, before the host's own manifest was
+    written; the same inbox pair stopped every later run. The reader now
+    raises only OtsError, so the companion is rejected and removed, the
+    manifest witnessed, and the heartbeat written."""
+
+    def test_a_malformed_foreign_proof_is_rejected_and_the_heartbeat_goes_on(self):
+        inbox = self.root / 'inbox'
+        inbox.mkdir()
+        cfg = dict(self.cfg, inbox=str(inbox))
+        raw = json.dumps({'schema': 'selfstamp/2', 'host': 'foreign', 'seq': 1, 'period': '2026-09-01'}).encode()
+        digest = hashlib.sha256(raw).digest()
+        proof = selfstamp.MAGIC + b'\x01\x08' + digest + b'\x00' + selfstamp.PENDING_TAG + b'\x02\x01\xff'
+        for period in (P1, P2):
+            (inbox / 'manifest.json').write_bytes(raw)
+            (inbox / 'manifest.json.ots').write_bytes(proof)
+            self.assertEqual(selfstamp.run(cfg, period=period, log=self.log.append), 0, self.log)
+            self.assertEqual(sorted(p.name for p in inbox.iterdir()), [], 'the pair is consumed, not left to stop the next run')
+        self.assertEqual(self.manifests(), ['2026-09-01.json', '2026-09-02.json'])
+        self.assertTrue(any('foreign proof rejected' in line for line in self.log), self.log)
+        witnessed = self.state / 'witnessed'
+        self.assertEqual(len(list(witnessed.glob('foreign-*.json'))), 1)
+        self.assertEqual(list(witnessed.glob('*.foreign.ots')), [], 'a proof that does not parse is never kept')
+
 if __name__ == "__main__":
     unittest.main()

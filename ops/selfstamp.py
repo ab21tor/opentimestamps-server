@@ -101,11 +101,26 @@ FORK_MARKER = 0xff
 PENDING_TAG = bytes.fromhex('83dfe30d2ef90c8e')
 BITCOIN_TAG = bytes.fromhex('0588960d73d71901')
 
+# The public client's limits (opentimestamps 0.4.x), mirrored so that
+# "parses" means the same here as there; the corpus in ops/tests/
+# proof_corpus.py holds both to them (docs/contracts.md, "The proof
+# parser"). The last one is ours: nothing valid needs more than ten bytes.
+MAX_OPERAND = 4096              # Op.MAX_RESULT_LENGTH: an append/prepend operand is 1..4096 bytes
+MAX_MSG = 4096                  # Op.MAX_MSG_LENGTH: no message on a path is longer
+MAX_ATTESTATION_PAYLOAD = 8192  # TimeAttestation.MAX_PAYLOAD_SIZE
+MAX_URI = 1000                  # PendingAttestation.MAX_URI_LENGTH
+URI_CHARS = frozenset(b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._/:')
+MAX_OPS_ON_A_PATH = 255         # Timestamp.deserialize's recursion limit (256 levels)
+MAX_VARUINT_BYTES = 10
+
 Proof = collections.namedtuple('Proof', 'digest commitment attestation ops_end')
 
 
 class OtsError(Exception):
-    """A proof this tool cannot read or must not write"""
+    """A proof this tool cannot read or must not write: the only error the
+    reader raises, whatever the bytes (2026-09-15/16 review F14: a
+    UnicodeDecodeError from a foreign proof's URI escaped and stopped
+    every run at the same inbox file)."""
 
 
 class Locked(Exception):
@@ -161,9 +176,12 @@ def varuint(n):
 def read_varuint(data, pos):
     value = 0
     shift = 0
+    start = pos
     while True:
         if pos >= len(data):
             raise OtsError('truncated varuint')
+        if pos - start >= MAX_VARUINT_BYTES:
+            raise OtsError('varuint longer than %d bytes' % MAX_VARUINT_BYTES)
         byte = data[pos]
         pos += 1
         value |= (byte & 0x7f) << shift
@@ -172,11 +190,39 @@ def read_varuint(data, pos):
             return value, pos
 
 
-def read_varbytes(data, pos):
+def read_varbytes(data, pos, max_len, min_len=0):
     length, pos = read_varuint(data, pos)
+    if length > max_len:
+        raise OtsError('varbytes longer than %d bytes' % max_len)
+    if length < min_len:
+        raise OtsError('varbytes shorter than %d byte' % min_len)
     if pos + length > len(data):
         raise OtsError('truncated varbytes')
     return data[pos:pos + length], pos + length
+
+
+def read_attestation(data, pos):
+    """The attestation whose marker byte was just read: (kind, value, end).
+    A known payload is consumed to its last byte; a pending URI is at most
+    MAX_URI bytes of URI_CHARS; an unknown tag is kept as ('unknown', hex)."""
+    atag = data[pos:pos + 8]
+    if len(atag) != 8:
+        raise OtsError('truncated attestation tag')
+    pos += 8
+    payload, pos = read_varbytes(data, pos, MAX_ATTESTATION_PAYLOAD)
+    if atag == PENDING_TAG:
+        uri, end = read_varbytes(payload, 0, MAX_URI)
+        if end != len(payload):
+            raise OtsError('trailing bytes in the pending attestation')
+        if any(b not in URI_CHARS for b in uri):
+            raise OtsError('pending uri has a character outside the allowed set')
+        return 'pending', uri.decode('ascii'), pos
+    if atag == BITCOIN_TAG:
+        height, end = read_varuint(payload, 0)
+        if end != len(payload):
+            raise OtsError('trailing bytes in the bitcoin attestation')
+        return 'bitcoin', height, pos
+    return 'unknown', atag.hex(), pos
 
 
 def parse_ots(data):
@@ -201,42 +247,37 @@ def parse_ots(data):
         raise OtsError('truncated digest')
     pos += 32
     msg = digest
+    ops = 0
     while True:
         if pos >= len(data):
             raise OtsError('truncated: no attestation')
         tag = data[pos]
         if tag == ATTESTATION_MARKER:
             ops_end = pos
-            pos += 1
-            atag = data[pos:pos + 8]
-            if len(atag) != 8:
-                raise OtsError('truncated attestation tag')
-            pos += 8
-            payload, pos = read_varbytes(data, pos)
-            if atag == PENDING_TAG:
-                uri, _ = read_varbytes(payload, 0)
-                attestation = ('pending', uri.decode('utf-8'))
-            elif atag == BITCOIN_TAG:
-                height, _ = read_varuint(payload, 0)
-                attestation = ('bitcoin', height)
-            else:
-                attestation = ('unknown', atag.hex())
+            kind, value, pos = read_attestation(data, pos + 1)
             if pos != len(data):
                 raise OtsError('trailing bytes after the attestation')
-            return Proof(digest, msg, attestation, ops_end)
+            return Proof(digest, msg, (kind, value), ops_end)
         if tag == FORK_MARKER:
             raise OtsError('non-linear timestamp (fork marker); use the ots client')
         pos += 1
+        if len(msg) > MAX_MSG:
+            raise OtsError('message longer than %d bytes' % MAX_MSG)
         if tag == OP_SHA256:
             msg = hashlib.sha256(msg).digest()
         elif tag == OP_APPEND:
-            operand, pos = read_varbytes(data, pos)
+            operand, pos = read_varbytes(data, pos, MAX_OPERAND, min_len=1)
             msg = msg + operand
         elif tag == OP_PREPEND:
-            operand, pos = read_varbytes(data, pos)
+            operand, pos = read_varbytes(data, pos, MAX_OPERAND, min_len=1)
             msg = operand + msg
         else:
             raise OtsError('unsupported op 0x%02x' % tag)
+        if len(msg) > MAX_OPERAND:
+            raise OtsError('result longer than %d bytes' % MAX_OPERAND)
+        ops += 1
+        if ops > MAX_OPS_ON_A_PATH:
+            raise OtsError('more than %d operations on one path' % MAX_OPS_ON_A_PATH)
 
 
 def build_ots(digest, calendar_response):

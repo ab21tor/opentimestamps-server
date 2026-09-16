@@ -183,9 +183,34 @@ def _get_tx_fee(tx, proxy):
     return value_in - value_out
 
 
-def marker_path(receipts_path):
-    """The pending-receipt marker that sits beside the receipts file"""
-    return receipts_path + '.pending'
+def marker_path(receipts_path, txid=None):
+    """The pending-receipt marker beside the receipts file, one per anchor:
+    `<receipts>.pending.<txid>`. An earlier anchor's marker is never
+    touched by a later anchor: each is settled on its own and removed only
+    by the code that wrote its receipt or found it not owed (2026-09-15/16
+    review F08: one shared name, and a later anchor's success unlinked an
+    earlier anchor's still-owed marker). Without a txid: the single name
+    used before 2026-09-16, which pending_markers still finds."""
+    return receipts_path + '.pending' + ('.' + txid if txid else '')
+
+
+def pending_markers(receipts_path):
+    """Every marker on file beside the receipts file, by name: the single
+    old name first if present, then one per txid. Temporary and set-aside
+    files are not markers."""
+    directory = os.path.dirname(os.path.abspath(receipts_path)) or '.'
+    base = os.path.basename(receipts_path) + '.pending'
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    found = []
+    for name in names:
+        suffix = name[len(base):]
+        if name == base or (name.startswith(base + '.') and len(suffix) == 65
+                            and all(c in '0123456789abcdef' for c in suffix[1:])):
+            found.append(os.path.join(directory, name))
+    return sorted(found)
 
 
 def _write_all(fd, data):
@@ -206,9 +231,10 @@ def _write_pending_receipt(receipts_path, body):
 
     body is {'receipt': <the line to append later>, 'probe': <hex of one
     commitment in the anchor's tree>}: enough to settle, after a crash,
-    whether the calendar save the marker guards ever happened.
+    whether the calendar save the marker guards ever happened. The marker
+    is named by the receipt's txid.
     """
-    path = marker_path(receipts_path)
+    path = marker_path(receipts_path, body['receipt']['txid'])
     tmp = path + '.tmp'
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
@@ -461,24 +487,32 @@ class Stamper:
                                 nLockTime=new_min_block_height)
 
     def settle_pending_receipt(self):
-        """Settle a pending-receipt marker left by an earlier crash
+        """Settle every pending-receipt marker left by an earlier stop
 
-        The marker (see __save_confirmed_timestamp_tx) holds the receipt
-        and one commitment of the anchor's tree. If that commitment is in
-        the calendar the save happened and the receipt is owed: it is
-        appended unless its txid is already on file. If it is not, the
-        save never happened: those commitments are still pending and will
-        be re-anchored under a new txid with their own receipt, so this
+        A marker (see __save_confirmed_timestamp_tx) holds the receipt and
+        one commitment of the anchor's tree. If that commitment is in the
+        calendar the save happened and the receipt is owed: it is appended
+        unless its txid is already on file. If it is not, the save never
+        happened: those commitments are still pending and will be
+        re-anchored under a new txid with their own receipt, so this
         receipt must not be written — writing it would bill the same
         records twice. Either way the marker is removed and the outcome
-        logged. Runs at stamper start and before any new marker; a no-op
-        when receipts are off or no marker exists.
+        logged. Each marker is settled on its own: one that cannot be
+        settled (the receipts file unwritable) is logged and left standing
+        for the next start or the next anchor, and never stops the others
+        or the anchor being saved. Runs at stamper start and before any
+        new marker; a no-op when receipts are off or no marker exists.
         """
         if not self.anchor_receipts_path:
             return
-        path = marker_path(self.anchor_receipts_path)
-        if not os.path.exists(path):
-            return
+        for path in pending_markers(self.anchor_receipts_path):
+            try:
+                self.__settle_marker(path)
+            except Exception as exp:
+                logging.warning("Pending anchor receipt marker %s could not be settled: %r; it stays until it can be"
+                                % (path, exp))
+
+    def __settle_marker(self, path):
         try:
             with open(path, 'rb') as fd:
                 body = json.loads(fd.read())
@@ -574,8 +608,11 @@ class Stamper:
         is discarded at the next start (settle_pending_receipt) — never a
         second bill for the same records. A crash after the save leaves a
         marker whose commitments the calendar holds: the receipt is
-        recovered from it. What a crash can lose is at most one receipt,
-        and the marker names it; what it can never do is bill twice.
+        recovered from it. Every marker is named by its anchor's txid, so
+        an earlier anchor's receipt still owed (its marker standing because
+        the receipts file could not be written) survives every later
+        anchor: what a crash or a full disk can lose is a receipt's
+        timeliness, never the receipt; what it can never do is bill twice.
 
         watermark, when given, is the journal checkpoint this save makes
         true; the calendar commits it in the same synchronous batch as the
@@ -620,7 +657,7 @@ class Stamper:
                                 "keeps it until it can be written" % (txid, exp))
                 return
             try:
-                os.unlink(marker_path(self.anchor_receipts_path))
+                os.unlink(marker_path(self.anchor_receipts_path, txid))   # this anchor's marker, never another's
             except FileNotFoundError:
                 pass
             except OSError as exp:

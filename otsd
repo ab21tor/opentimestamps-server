@@ -111,6 +111,19 @@ exit_event = threading.Event()
 calendar_path = os.path.expanduser(args.calendar_path)
 
 calendar = otsserver.calendar.Calendar(calendar_path)
+
+# Bind before any worker starts: a port that cannot be bound is a start
+# that fails whole, exit 1, nothing left running. Before 2026-09-16 the
+# workers started first, the bind's exception escaped, and their non-daemon
+# threads kept a process alive that served nothing (2026-09-15/16 review
+# F19). The aggregator is attached to the server once it exists.
+try:
+    server = otsserver.rpc.StampServer((args.rpc_address, args.rpc_port), None, calendar)
+except OSError as exp:
+    logging.critical("otsd: cannot bind %s:%d: %s; nothing was started, exiting 1"
+                     % (args.rpc_address, args.rpc_port, exp))
+    sys.exit(1)
+
 aggregator = otsserver.calendar.Aggregator(calendar, exit_event)
 
 stamper = otsserver.stamper.Stamper(calendar, exit_event,
@@ -122,10 +135,7 @@ stamper = otsserver.stamper.Stamper(calendar, exit_event,
                                     args.max_pending)
 
 calendar.stamper = stamper
-
-server = otsserver.rpc.StampServer((args.rpc_address, args.rpc_port),
-                                   aggregator,
-                                   calendar)
+server.attach_aggregator(aggregator)
 
 # Serve until a worker stops the service or the operator does. A worker
 # that fails past recovery (the aggregator's round did not commit, the

@@ -105,6 +105,13 @@ class Test_mature_tree_saves(unittest.TestCase):
                 fd.write('http://127.0.0.1:14788\n')
             with open(os.path.join(d, 'hmac-key'), 'wb') as fd:
                 fd.write(b'\x01' * 32)
+            # The journal the checkpoint will describe: entries 0-2 are the
+            # anchored commitment (a resubmission keeps its lowest index),
+            # entry 3 the outstanding one. Since 2026-09-16 a restart checks
+            # the journal against the checkpoint (test_calendar,
+            # Test_journal_boundary), so the file must exist and agree.
+            with open(os.path.join(d, 'journal'), 'wb') as fd:
+                fd.write(b'x' * 44 * 3 + b'y' * 44)
             calendar = Calendar(d)
             s = make_stamper(None)
             s.calendar = calendar

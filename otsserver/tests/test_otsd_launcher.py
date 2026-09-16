@@ -193,5 +193,34 @@ class Test_process_boundary(unittest.TestCase):
         self.assertNotIn('CALENDAR STORAGE INCONSISTENT', out)
 
 
+class Test_bind_failure(unittest.TestCase):
+    """2026-09-15/16 review F19: before this change otsd started the
+    aggregator and stamper threads and only then bound the listener; a
+    bind failure escaped as a traceback while the non-daemon workers kept
+    the process alive with no listener, so a supervisor saw a running
+    service that served nothing. Now the listener is bound before any
+    worker starts, and a bind failure exits 1 with nothing running."""
+
+    setUp = Test_process_boundary.setUp
+    tearDown = Test_process_boundary.tearDown
+    start = Test_process_boundary.start
+
+    def test_a_bind_failure_exits_nonzero_with_nothing_left_running(self):
+        with socket.socket() as occupied:
+            occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            occupied.bind(('127.0.0.1', self.port))
+            occupied.listen()
+            self.start()
+            try:
+                out, _ = self.proc.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                out, _ = self.proc.communicate(timeout=10)
+                self.fail('otsd stayed alive after failing to bind its port:\n' + out)
+        self.assertNotEqual(self.proc.returncode, 0, out)
+        self.assertIn('Address already in use', out)
+        self.assertNotIn('Starting aggregator loop', out, 'no worker may start before the bind')
+        self.assertNotIn('Starting stamper loop', out, 'no worker may start before the bind')
+
 if __name__ == "__main__":
     unittest.main()

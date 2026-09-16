@@ -20,9 +20,14 @@ the calendar check's verdicts, the sats parser, and the box name in every
 message. Nothing here touches the network, docker, systemd or the journal.
 """
 
+import contextlib
+import errno
 import importlib.util
 import json
+import os
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -66,11 +71,11 @@ class Test_active_checks(unittest.TestCase):
         for skipped in ("health_reach", "health", "feeder", "tor_circuits", "disk_boot", "dhcp_lease"):
             self.assertNotIn(skipped, active)
         self.assertIn("calendar", active)
-        self.assertEqual(len(active), 15)
+        self.assertEqual(len(active), 16)
 
-    def test_pi_defaults_keep_their_twenty_and_no_calendar(self):
+    def test_pi_defaults_keep_their_twenty_one_and_no_calendar(self):
         active = watch.active_checks(cfg_with())
-        self.assertEqual(len(active), 20)
+        self.assertEqual(len(active), 21)
         self.assertNotIn("calendar", active)
         self.assertEqual([n for n in watch.ORDER if n != "calendar"], active)
 
@@ -91,7 +96,7 @@ class Test_active_checks(unittest.TestCase):
         state, msgs = watch.decide(state, checks, 1788600300, cfg)
         self.assertEqual(msgs, [])                     # ... never alerted
         self.assertEqual(state["delivered"], [])
-        self.assertIn("ok 15/15", watch.status_line(1788600300, state, checks, cfg))
+        self.assertIn("ok 16/16", watch.status_line(1788600300, state, checks, cfg))
 
 
 class Test_calendar_check(unittest.TestCase):
@@ -148,7 +153,7 @@ class Test_names(unittest.TestCase):
         o = {"calendar": {"balance": "22,015", "pending_commitments": "1,204"}, "anchors": 4, "anchor_age_h": 1.5,
              "disk": {"/": 9.1}, "temp_c": 40.0, "mem_avail_mb": 4000, "uptime_s": 100}
         line = watch.heartbeat_line({"delivered": []}, checks, o, cfg)
-        self.assertTrue(line.startswith("box7 heartbeat: ok 15/15"), line)
+        self.assertTrue(line.startswith("box7 heartbeat: ok 16/16"), line)
         self.assertIn("wallet 22,015 sats, pending 1,204", line)
         line = watch.heartbeat_line({"delivered": []}, checks, dict(o, calendar=None), cfg)
         self.assertNotIn("wallet", line)
@@ -245,5 +250,246 @@ class Test_outbox(unittest.TestCase):
         self.assertEqual(queued[0]['text'], 'old 6')
 
 
+NOW = 1788600000
+ALL_OK = {name: (True, '') for name in watch.ORDER}
+
+
+def review_cfg(**over):
+    cfg = dict(watch.DEFAULTS, HEARTBEAT_HOUR='99', NAME='box', NTFY_URL='http://ntfy.invalid/box')
+    cfg.update(over)
+    return cfg
+
+
+@contextlib.contextmanager
+def watcher_run(directory, checks, send, now=NOW, quiet=True):
+    """real_run against a state directory, with observation and evaluation
+    replaced by the given checks and the sender by `send`."""
+    patches = [mock.patch.multiple(watch, WATCH_DIR=str(directory), STATE=str(directory / 'state.json'),
+                                   STATUS=str(directory / 'status')),
+               mock.patch.object(watch, 'load_config', return_value=review_cfg()),
+               mock.patch.object(watch, 'observe', return_value={}),
+               mock.patch.object(watch, 'evaluate', return_value=checks),
+               mock.patch.object(watch, 'send', side_effect=send),
+               mock.patch.object(watch.time, 'time', return_value=now)]
+    if quiet:
+        patches.append(mock.patch.object(watch, 'log'))
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        yield
+
+
+class Test_observation_failure(unittest.TestCase):
+    """2026-09-15/16 review F09: a journalctl call that fails used to read
+    as zero events, and the cursor moved past the window nobody read. Now
+    a failed read is a failed check (journal_read) and the cursor stays
+    where it was until every journal query succeeds."""
+
+    def observe_with(self, journal_rc):
+        config = review_cfg()
+        for key in watch.SKIP_WHEN_EMPTY.values():
+            config[key] = ''
+        seen = []
+
+        def command(cmd, **kwargs):
+            if cmd[0] == 'journalctl':
+                seen.append(cmd)
+                return journal_rc, ''
+            return 0, ''
+        with mock.patch.object(watch, 'run', side_effect=command), \
+                mock.patch.object(watch, 'kernel_versions', return_value=('same', 'same')):
+            observation = watch.observe(config, NOW, {'journal': NOW - 300})
+        self.assertEqual(len(seen), 5, 'every journal query was made')
+        return config, observation
+
+    def run_with(self, config, observation):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            (d / 'state.json').write_text(json.dumps({'cursors': {'journal': NOW - 300}}))
+            with mock.patch.multiple(watch, WATCH_DIR=str(d), STATE=str(d / 'state.json'), STATUS=str(d / 'status')), \
+                    mock.patch.object(watch, 'load_config', return_value=config), \
+                    mock.patch.object(watch, 'observe', return_value=observation), \
+                    mock.patch.object(watch, 'send', return_value=(True, 'ok')), \
+                    mock.patch.object(watch, 'log'), mock.patch.object(watch.time, 'time', return_value=NOW):
+                rc = watch.real_run(False)
+            return rc, json.loads((d / 'state.json').read_text())
+
+    def test_a_failed_journal_read_is_a_failed_check_and_keeps_the_cursor(self):
+        config, observation = self.observe_with(journal_rc=1)
+        checks = watch.evaluate(observation, config)
+        self.assertFalse(checks['journal_read'][0], checks['journal_read'])
+        self.assertIn('journalctl', checks['journal_read'][1])
+        self.assertIn('journal_read', watch.active_checks(config))
+        rc, state = self.run_with(config, observation)
+        self.assertEqual(state['cursors']['journal'], NOW - 300, 'the unread window is read again next run')
+
+    def test_a_successful_journal_read_advances_the_cursor(self):
+        config, observation = self.observe_with(journal_rc=0)
+        checks = watch.evaluate(observation, config)
+        self.assertTrue(checks['journal_read'][0])
+        rc, state = self.run_with(config, observation)
+        self.assertEqual(rc, 0)
+        self.assertEqual(state['cursors']['journal'], NOW)
+
+
+class Test_outbox_read_failure(unittest.TestCase):
+    """2026-09-15/16 review F10: an outbox that could not be read used to
+    become an empty queue, and the next write replaced the undelivered
+    messages. Now only a missing file is an empty queue: an unreadable one
+    fails the run with nothing touched, and bytes that are not a message
+    list are set aside for inspection and reported as an alert."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.dir = pathlib.Path(self.tmpdir.name)
+        self.outbox = self.dir / 'outbox.json'
+        self.state = self.dir / 'state.json'
+        self.state.write_text(json.dumps({'cursors': {'journal': NOW - 300}}))
+
+    def test_an_unreadable_outbox_fails_the_run_and_touches_nothing(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads a mode-000 file; the failure cannot be produced')
+        original = json.dumps([{'text': 'security alert never delivered', 'queued': 'old'}])
+        self.outbox.write_text(original)
+        self.outbox.chmod(0)
+        self.addCleanup(self.outbox.chmod, 0o600)
+        with self.assertRaises(PermissionError):
+            self.outbox.read_bytes()
+        sent = []
+        with watcher_run(self.dir, ALL_OK, lambda _, text: sent.append(text) or (True, 'ok')):
+            rc = watch.real_run(False)
+        self.assertEqual(rc, 1)
+        self.assertEqual(sent, [])
+        self.outbox.chmod(0o600)
+        self.assertEqual(self.outbox.read_text(), original, 'the undelivered queue is untouched')
+        self.assertEqual(json.loads(self.state.read_text())['cursors']['journal'], NOW - 300,
+                         'the state did not move')
+
+    def test_a_corrupt_outbox_is_set_aside_and_reported(self):
+        self.outbox.write_bytes(b'{not a message list')
+        sent = []
+        with watcher_run(self.dir, ALL_OK, lambda _, text: sent.append(text) or (True, 'ok')):
+            rc = watch.real_run(False)
+        self.assertEqual(rc, 0)
+        aside = [p for p in self.dir.iterdir() if p.name.startswith('outbox.json.corrupt-')]
+        self.assertEqual(len(aside), 1, os.listdir(self.dir))
+        self.assertEqual(aside[0].read_bytes(), b'{not a message list', 'the bytes are kept for inspection')
+        self.assertEqual(len(sent), 1, sent)
+        self.assertIn('outbox', sent[0])
+        self.assertIn(aside[0].name, sent[0])
+        self.assertEqual(json.loads(self.outbox.read_text()), [])
+
+
+class Test_run_lock(unittest.TestCase):
+    """2026-09-15/16 review F11: two overlapping runs used to read the same
+    queue and the later writer replaced the other's messages. Now a run
+    holds an exclusive lock on the state directory for its whole duration;
+    a second run waits up to watch.LOCK_WAIT seconds, then exits 1 with
+    'locked' and nothing written. Two real processes; the first is paused
+    inside its sender while the second tries."""
+
+    def test_a_second_run_cannot_interleave_and_no_alert_is_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            first = dict(ALL_OK, ssh_unexpected=(False, 'login A'))
+            child = {}
+
+            def send_a(_, text):
+                # The lock is held here. A second run must wait, give up, and change nothing.
+                p = subprocess.run([sys.executable, '-B', __file__, '--child', str(d), '0.5'],
+                                   capture_output=True, text=True, timeout=60,
+                                   env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+                child['rc'], child['out'] = p.returncode, p.stdout + p.stderr
+                child['outbox'] = json.loads((d / 'outbox.json').read_text())
+                return True, 'delivered A'
+            with watcher_run(d, first, send_a):
+                rc = watch.real_run(False)
+            self.assertEqual(rc, 0)
+            self.assertEqual(child['rc'], 1, child['out'])
+            self.assertIn('locked', child['out'])
+            self.assertEqual([m['text'] for m in child['outbox']], [m['text'] for m in child['outbox'] if 'login A' in m['text']],
+                             'while the first run held the lock only its own message was on file')
+            self.assertEqual(json.loads((d / 'outbox.json').read_text()), [])
+            # The lock is free: the second run now observes B, cannot send it, and B is on disk.
+            p = subprocess.run([sys.executable, '-B', __file__, '--child', str(d), '5'],
+                               capture_output=True, text=True, timeout=60,
+                               env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertNotIn('locked', p.stdout + p.stderr)
+            queued = json.loads((d / 'outbox.json').read_text())
+            self.assertTrue(any('new security burst B' in m['text'] for m in queued), queued)
+            self.assertEqual(json.loads((d / 'state.json').read_text())['cursors']['journal'], NOW + 300)
+
+
+def _child_run(directory, lock_wait):
+    """The second watcher process of Test_run_lock: a burst B, a sender that
+    is offline, the given lock wait; exits with real_run's code."""
+    watch.LOCK_WAIT = lock_wait
+    checks = dict(ALL_OK, journal_errors=(False, 'new security burst B'))
+    with watcher_run(pathlib.Path(directory), checks, lambda *_: (False, 'offline B'), now=NOW + 300, quiet=False):
+        return watch.real_run(False)
+
+
+class Test_outbox_recovery_interrupted(unittest.TestCase):
+    """The corrupt-outbox recovery is itself interruptible (close-gate
+    correction, 2026-09-16). The first version moved the corrupt file
+    aside and only later persisted the notice in the replacement queue;
+    a stop between the two left an aside file nobody reports and an empty
+    queue. Now the aside copy is written first, under a name derived from
+    the bytes, and the notice replaces the corrupt file in one rename: a
+    stop before the rename leaves the corrupt file to be found again, a
+    stop after it leaves the notice on disk. Exception injection at the
+    rename; not a power cut."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.dir = pathlib.Path(self.tmpdir.name)
+        self.outbox = self.dir / 'outbox.json'
+        self.patches = [mock.patch.multiple(watch, WATCH_DIR=str(self.dir), STATE=str(self.dir / 'state.json'),
+                                            STATUS=str(self.dir / 'status')),
+                        mock.patch.object(watch, 'log')]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def asides(self):
+        return sorted(p for p in self.dir.iterdir() if p.name.startswith('outbox.json.corrupt-'))
+
+    def test_a_stop_right_after_the_quarantine_keeps_the_notice(self):
+        self.outbox.write_bytes(b'{not a message list')
+        first = watch.load_outbox(review_cfg())          # the run stops here, before it writes anything else
+        self.assertEqual(len(first), 1)
+        self.assertIn('outbox', first[0]['text'])
+        again = watch.load_outbox(review_cfg())          # the next run
+        self.assertEqual([m['text'] for m in again], [first[0]['text']],
+                         'the notice is on disk the moment the corrupt file is gone')
+        self.assertEqual(len(self.asides()), 1)
+        self.assertEqual(self.asides()[0].read_bytes(), b'{not a message list')
+        self.assertIn(self.asides()[0].name, first[0]['text'])
+
+    def test_a_stop_between_the_aside_copy_and_the_replacement_is_repeated_cleanly(self):
+        self.outbox.write_bytes(b'{not a message list')
+        real_replace = os.replace
+        calls = []
+
+        def fail_once(src, dst):
+            if dst == str(self.outbox) and not calls:
+                calls.append(dst)
+                raise OSError(errno.EIO, 'injected stop before the replacement lands')
+            return real_replace(src, dst)
+        with mock.patch.object(watch.os, 'replace', side_effect=fail_once):
+            with self.assertRaises(OSError):
+                watch.load_outbox(review_cfg())
+        self.assertEqual(self.outbox.read_bytes(), b'{not a message list', 'the corrupt file is still there to be found')
+        self.assertEqual(len(self.asides()), 1, 'the aside copy was made before the replacement')
+        queue = watch.load_outbox(review_cfg())
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(len(self.asides()), 1, 'the same bytes get the same aside name: no second copy')
+        self.assertEqual(watch.load_outbox(review_cfg()), queue, 'and the notice stays until delivered')
+
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == '--child':
+        sys.exit(_child_run(sys.argv[2], float(sys.argv[3])))
     unittest.main()

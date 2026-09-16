@@ -65,9 +65,11 @@ Each rule below is made by the code described in the section it names.
   one ("Not-before bound").
 - Exactly one receipt is written per confirmed anchor, after the calendar
   save. Every byte of the receipt is checked onto disk, file and
-  directory fsynced, before its marker goes; a crash loses at most one
-  receipt, named in that marker and recovered from it, and never writes
-  two receipts for the same records. Record counts err low, with one
+  directory fsynced, before its marker goes; a receipt not yet on file
+  has a marker of its own, named by its anchor, that no later anchor
+  touches, and is recovered from it at the next anchor or the next
+  start; no crash writes two receipts for the same records. Record
+  counts err low, with one
   bounded exception ("Anchor receipts").
 - A digest submitted through the operator lane is aggregated and anchored
   like any other and is never counted as a record ("Operator lane").
@@ -468,14 +470,22 @@ Two rules the code keeps:
   returned (LevelDB's synchronous write). A save that fails is logged
   once, the tree is kept, and every pass, new block or not, retries every
   mature unsaved tree until it lands; nothing accepted is dropped.
-- No crash writes two receipts for the same records, and a crash loses at
-  most one receipt, named. The receipt is written after the calendar
-  save, guarded by a marker: before the save the stamper writes
-  `<receipts file>.pending`, the receipt line plus one commitment of the
-  anchor's tree, atomically (fsynced, with its directory); after the save
-  it appends the receipt, every byte checked (a short write is completed,
-  never taken for a whole line), fsyncs the file and its directory, and
-  only then removes the marker. An incomplete last line left by an
+- No crash writes two receipts for the same records, and no receipt is
+  lost: one still owed has its marker standing. The receipt is written
+  after the calendar save, guarded by a marker named by the anchor:
+  before the save the stamper writes `<receipts file>.pending.<txid>`,
+  the receipt line plus one commitment of the anchor's tree, atomically
+  (fsynced, with its directory); after the save it appends the receipt,
+  every byte checked (a short write is completed, never taken for a whole
+  line), fsyncs the file and its directory, and only then removes that
+  marker and no other. Markers are settled one at a time: one that cannot
+  be settled (the receipts file unwritable) is logged and left standing,
+  and never holds up another anchor's save or receipt; a receipt
+  recovered later may follow later anchors' lines in the file. Before
+  2026-09-16 there was one marker name, and a later anchor's success
+  removed an earlier anchor's still-owed marker (2026-09-15/16 review
+  F08); the old name, `<receipts file>.pending`, is still read and
+  settled at the first start after the upgrade. An incomplete last line left by an
   interrupted append is dropped before the next append and its receipt
   recovered from the marker, so no completed receipt is ever duplicated
   and no outstanding marker discarded. What the tests inject is the
@@ -590,7 +600,23 @@ pair before serving: a checkpoint whose generation is not the database's
 (`db/` recreated, or restored from another lineage), or whose index is
 above the database's watermark (`db/` restored from an older backup than
 the checkpoint), or that cannot be read at all, stops the service with
-`CALENDAR STORAGE INCONSISTENT` and the recovery text, exit 1. Nothing in
+`CALENDAR STORAGE INCONSISTENT` and the recovery text, exit 1. The
+journal is checked against the checkpoint too, within bounds: it must
+hold at least that many entries, and the entry just below the
+checkpoint and entry 0 must be in the database, or the start is refused
+the same way; a missing journal is never created beside a checkpoint
+that names entries it should hold. Without this a journal lost or
+restored from an older backup beside a kept checkpoint started cleanly
+and took every new submission at an index below the checkpoint, where
+the scan never looks (2026-09-15/16 review F02). The check is two reads
+and two probes, not a proof that the journal is whole: it catches a
+missing or truncated journal and one from another lineage that differs
+at either probed entry, and it assumes the restore rule below. It does
+not detect an older prefix-identical journal that still reaches the
+checkpoint (the entries beyond it are lost, and no check can tell), nor
+one that differs only between the two probed entries; that is why the
+four files are one snapshot ("Recover"), and why deleting the checkpoint
+(a rescan from 0) is the full check. Nothing in
 this check reads a file's timestamp. Recovery is to delete the checkpoint
 and start again: the stamper rescans from index 0 and re-anchors every
 commitment the database lacks ("Recover" for what that costs). Migration
@@ -843,16 +869,26 @@ alerts through ntfy (optional) on transitions only; one line a day is the
 heartbeat. Every message is written to `~/watcher/outbox.json` before
 the journal cursor moves past what produced it, delivered oldest first,
 and kept and retried by every later run until it is delivered (the run
-exits 1 while anything is undelivered); with `NTFY_URL` empty nothing is
-queued and the log carries the text. Config: `<WATCH_DIR>/config` (`ops/watch.config.example`); a
+exits 1 while anything is undelivered; the queue keeps the newest 200
+messages and logs what it drops beyond that); with `NTFY_URL` empty
+nothing is queued and the log carries the text. Only a missing outbox
+is an empty queue: one that exists but cannot be read fails the run with
+nothing touched, and one whose bytes are not a message list is set aside
+as `outbox.json.corrupt-<12 hex of the bytes' sha256>` and reported as an alert. A `journalctl`
+call that fails is a failed check (`journal_read`) and the journal
+cursor stays where it was until every journal query succeeds, so no
+window goes unread. A run holds an exclusive lock on `WATCH_DIR` for its
+whole duration; a second run waits up to a minute, then exits 1 with
+`locked` and nothing written (2026-09-15/16 review F09, F10, F11).
+Config: `<WATCH_DIR>/config` (`ops/watch.config.example`); a
 knob left empty skips its check, so it neither fails nor counts. With the
-single-host config that is fifteen checks: the calendar's status
+single-host config that is sixteen checks: the calendar's status
 (reachable, `best_block` set, no anchor needing attention, receipts on,
 wallet above `CAL_MIN_SATS`), the containers and units, disk,
 temperature, memory, the adapter's heartbeat and breaker, journal errors,
-ssh failures and unexpected logins, the age of the last confirmed anchor,
-pending reboots, refused outbound packets, bitcoind's peers. `watch.py
---dry` makes every check and sends nothing.
+ssh failures and unexpected logins, the journal readable, the age of the
+last confirmed anchor, pending reboots, refused outbound packets,
+bitcoind's peers. `watch.py --dry` makes every check and sends nothing.
 
 ### The headers export
 
@@ -1037,11 +1073,14 @@ whose copy is missing is a verification break), the compose `.env`;
 encrypted, off-host.
 
 At every start the calendar checks that `journal.known-good` belongs to
-`db/` and lies within what it durably holds, and stops with the recovery
-text if not; then the stamper re-reads the journal from the checkpoint
-(or from the beginning without it) and anchors every entry the calendar
-does not hold ("Restart checkpoint"). A pending-receipt marker left by a
-stop is settled before anything else ("Anchor receipts"); the
+`db/`, lies within what it durably holds, and describes the journal that
+is there, and stops with the recovery text if not; the listener is bound
+before any worker starts, so a port that cannot be bound is a start that
+fails whole (exit 1, nothing running: 2026-09-15/16 review F19); then
+the stamper re-reads the journal from the checkpoint (or from the
+beginning without it) and anchors every entry the calendar does not hold
+("Restart checkpoint"). Every pending-receipt marker left by a stop is
+settled before anything else ("Anchor receipts"); the
 receipts-off warning fires if the sidecar exists
 without `OTSD_ANCHOR_RECEIPTS`; the deep-reorg detector's first check
 runs on the first pass; the not-before bound returns with the first block
@@ -1110,7 +1149,7 @@ Test modules live under `otsserver/tests/`:
   `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py`,
   `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py`,
   `test_claim_kit.py`, `test_stamper_save_retry.py`,
-  `test_rpc_privacy.py`: regression tests for this branch's delta
+  `test_rpc_privacy.py`, `test_proof_corpus.py`: regression tests for this branch's delta
   (launcher flags, the status line and its RPC wiring, stamper-loop
   crash fixes, anchor receipts, anchor cadence, the `/digest`
   Content-Length handling, anchor-receipt record counts and their
@@ -1148,8 +1187,19 @@ Test modules live under `otsserver/tests/`:
   processes, unique temporary names, missing witnessed copies and later
   foreign proofs (`test_selfstamp.py`); the exporter's lock, write-all
   loop and tail recovery (`test_claim_kit.py`); the watcher's outbox
-  (`test_watch.py`). Every durability test injects failures at the write
-  boundary or kills the process; none simulates a power cut.
+  (`test_watch.py`). The 2026-09-15/16 review's findings likewise: the
+  journal checked against the checkpoint, with a coherent restart's
+  first fill pass as the control (`test_calendar.py`); one receipt
+  marker per anchor and the old name still settled
+  (`test_receipt_marker.py`); a bind failure that exits with nothing
+  running (`test_otsd_launcher.py`); the watcher's failed journal read,
+  unreadable and corrupt outbox, and whole-run lock across two real
+  processes (`test_watch.py`); and the proof corpus
+  (`ops/tests/proof_corpus.py`) run against both readers under `ops/`
+  and against the `opentimestamps` library as the oracle
+  (`test_proof_corpus.py`; `docs/contracts.md`, "The proof parser").
+  Every durability test injects failures at the write boundary or kills
+  the process; none simulates a power cut.
 
 No test module needs a running Bitcoin node. Every module does need the
 full dependency set installed, and `plyvel` is a native build:
@@ -1163,7 +1213,7 @@ with the LevelDB headers installed (`libleveldb-dev` on Debian, `leveldb`
 from Homebrew on macOS):
 
 ```
-python -m unittest discover -v                       # Ran 153 tests ... OK
+python -m unittest discover -v                       # Ran 234 tests ... OK
 ```
 
 The otsd image has no pytest; where pytest is installed,

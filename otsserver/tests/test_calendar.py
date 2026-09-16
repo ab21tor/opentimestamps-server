@@ -15,13 +15,18 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 from bitcoin.core import *
 
 from opentimestamps.core.timestamp import *
 
+from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
+
 from otsserver.calendar import *
+from otsserver.stamper import Stamper
 
 class Test_LevelDbCalendar(unittest.TestCase):
     def test_creation(self):
@@ -277,6 +282,122 @@ class Test_storage_generation(unittest.TestCase):
             fd.write('2\n')
         self.assertIn('does not hold journal entry 1', self.refuse())
 
+
+class Test_journal_boundary(unittest.TestCase):
+    """2026-09-15/16 review F02: the checkpoint said "everything below 3 is
+    in the database" about a journal that was no longer the one it
+    described. Before this change a missing journal was recreated and a
+    shorter one accepted, the scan started at 3, and every new submission
+    landed at index 0, 1, 2: accepted durably, never anchored. Now the
+    journal must reach the checkpoint and agree with the database at the
+    entry below it, or the start is refused with the recovery text; a
+    missing journal is never created while a checkpoint names an index
+    above 0. The control drives a real stamper fill pass over a coherent
+    restart and sees the new submission become pending."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.path = os.path.join(self.tmpdir.name, 'calendar')
+        os.makedirs(self.path)
+        with open(os.path.join(self.path, 'uri'), 'w') as fd:
+            fd.write('http://127.0.0.1:14788\n')
+        with open(os.path.join(self.path, 'hmac-key'), 'wb') as fd:
+            fd.write(b'\x01' * 32)
+        self.journal_path = os.path.join(self.path, 'journal')
+        self.known_good = os.path.join(self.path, 'journal.known-good')
+        self.env = mock.patch.dict(os.environ)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        os.environ.pop('OTSD_ANCHOR_RECEIPTS', None)
+
+    def close(self, cal):
+        cal.journal.append_fd.close()
+        cal.db.db.close()
+
+    def checkpointed_calendar(self):
+        """Three entries submitted, saved and checkpointed at 3; closed."""
+        cal = Calendar(self.path)
+        entries = []
+        for n in range(3):
+            msg = bytes([n + 1]) * 44
+            cal.journal.submit(msg)
+            ts = Timestamp(msg)
+            ts.attestations.add(BitcoinBlockHeaderAttestation(1))
+            entries.append(ts)
+        cal.add_commitment_timestamps(entries, watermark=3)
+        write_checkpoint(self.known_good, 3, cal.generation)
+        self.close(cal)
+        with open(self.journal_path, 'rb') as fd:
+            return fd.read()
+
+    def refuse(self):
+        code = None
+        with self.assertLogs(level='CRITICAL') as captured:
+            try:
+                Calendar(self.path)
+            except SystemExit as exc:
+                code = exc.code
+        gc.collect()
+        self.assertEqual(code, 1, 'startup must refuse')
+        text = '\n'.join(captured.output)
+        self.assertIn('CALENDAR STORAGE INCONSISTENT', text)
+        self.assertIn('Recovery', text)
+        return text
+
+    def test_a_journal_shorter_than_the_checkpoint_is_refused_and_not_recreated(self):
+        whole = self.checkpointed_calendar()
+        for kept in (1, 0):
+            with self.subTest(entries_kept=kept):
+                with open(self.journal_path, 'wb') as fd:
+                    fd.write(whole[:kept * Journal.COMMITMENT_SIZE])
+                if kept == 0:
+                    os.unlink(self.journal_path)
+                text = self.refuse()
+                self.assertIn('journal', text)
+                self.assertIn('holds %d entr' % kept, text)
+                if kept == 0:
+                    self.assertFalse(os.path.exists(self.journal_path),
+                                     'a refused start must not create the journal it found missing')
+        # The documented recovery: delete the checkpoint; the scan starts at 0
+        # over whatever journal there is.
+        os.unlink(self.known_good)
+        cal = Calendar(self.path)
+        self.assertIsNone(cal.checkpoint)
+        self.close(cal)
+
+    def test_a_journal_of_another_lineage_is_refused(self):
+        self.checkpointed_calendar()
+        with open(self.journal_path, 'wb') as fd:
+            for i in range(3):
+                fd.write(bytes([0x40 + i]) * 36 + b'\x00' * 8)
+        text = self.refuse()
+        self.assertIn('does not hold journal entry 2', text)
+
+    def test_a_coherent_restart_scans_the_next_submission(self):
+        """Control, and the corrected form of the review's reproduction:
+        with the journal intact the restart is accepted, the checkpoint
+        honoured, and a submission made after it is read by the stamper's
+        first fill pass (Bitcoin stubbed, nothing else)."""
+        self.checkpointed_calendar()
+        cal = Calendar(self.path)
+        self.assertEqual(cal.checkpoint, 3)
+        cal.submit(Timestamp(b'n' * 32))
+        reader = Journal(self.journal_path)
+        try:
+            new_commitment = reader[3]
+        finally:
+            reader.read_fd.close()
+        self.assertNotIn(new_commitment, cal)
+        stop = threading.Event()
+        with mock.patch.object(Stamper, '_Stamper__do_bitcoin', lambda s: stop.set()):
+            stamper = Stamper(cal, stop, 12, 1, 6, 21600, 20000, 100)
+            stamper.thread.join(5)
+        self.assertFalse(stamper.thread.is_alive())
+        self.assertEqual(stamper.journal_cursor, 4)
+        self.assertIn(new_commitment, stamper.pending_commitments)
+        self.assertTrue(stamper.is_pending(new_commitment))
+        self.close(cal)
 
 if __name__ == "__main__":
     unittest.main()

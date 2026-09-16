@@ -86,7 +86,7 @@
    "DEGRADED: 40 ssh auth failures since last check | still: none"
   ],
   [
-   "RECOVERED: all 20 checks ok (was: ssh_failures"
+   "RECOVERED: all 21 checks ok (was: ssh_failures"
   ],
   []
  ]

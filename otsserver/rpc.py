@@ -335,6 +335,14 @@ class StampServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
         super().__init__(server_address, rpc_request_handler)
 
+    def attach_aggregator(self, aggregator):
+        """otsd binds the listener before it starts the workers, so the
+        aggregator arrives after the bind (2026-09-15/16 review F19: a
+        bind failure used to leave the non-daemon worker threads alive
+        behind no port). Nothing is served until serve_until_exit starts
+        the serving thread, so no request can see it missing."""
+        self.RequestHandlerClass.aggregator = aggregator
+
     def handle_error(self, request, client_address):
         # The base class prints "Exception occurred during processing of
         # request from ('IP', port)" and a traceback to stderr. Never the

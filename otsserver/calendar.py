@@ -434,7 +434,6 @@ class Calendar:
         path = os.path.normpath(path)
         os.makedirs(path, exist_ok=True)
         self.path = path
-        self.journal = JournalWriter(path + '/journal')
 
         self.db = LevelDbCalendar(path + '/db')
 
@@ -454,11 +453,18 @@ class Calendar:
             logging.error('HMAC secret key not set; %r does not exist' % hmac_key_path)
             sys.exit(1)
 
-        # The checkpoint on file must belong to this database and lie at or
-        # below what the database durably holds; otherwise the service does
-        # not start (a lost, recreated or older-restored db/ beside a kept
-        # checkpoint would skip the journal entries the checkpoint claims).
+        # The checkpoint on file must belong to this database, lie at or
+        # below what the database durably holds, and describe the journal
+        # that is here; otherwise the service does not start (a lost,
+        # recreated or older-restored db/ beside a kept checkpoint would
+        # skip the journal entries the checkpoint claims; a lost or older
+        # journal beside a kept checkpoint would take new submissions below
+        # the checkpoint, where the scan never looks). Checked before the
+        # journal is opened for appending, so a journal found missing is
+        # never created beside a checkpoint that names entries it should
+        # hold (2026-09-15/16 review F02).
         self.checkpoint = self.verify_storage_generation()
+        self.journal = JournalWriter(path + '/journal')
 
         # The stamper, set by otsd once both exist: its view of the chain is
         # where the not-before bound below comes from.
@@ -467,7 +473,9 @@ class Calendar:
     RECOVERY = ("Recovery: if db/ was restored from a backup or recreated, delete %s and start again: the stamper "
                 "rescans the whole journal from index 0 and re-anchors every commitment the database lacks. The "
                 "re-anchored proofs name later blocks than the originals, whose paths lived only in the lost database. "
-                "Never copy a journal.known-good from another database.")
+                "If the journal was restored or lost, restore it from the same snapshot as db/ and the checkpoint: "
+                "entries lost with a journal cannot be recovered, and deleting the checkpoint rescans the journal "
+                "that is here. Never copy a journal.known-good from another database.")
 
     def __refuse(self, reason, path):
         logging.critical("CALENDAR STORAGE INCONSISTENT: %s. %s" % (reason, self.RECOVERY % path))
@@ -477,14 +485,54 @@ class Calendar:
     def generation(self):
         return self.db.generation
 
+    def __check_journal(self, idx, path):
+        """A bounded check that the journal is one the checkpoint can
+        describe: it holds at least idx entries, and the entry just below
+        idx and entry 0 are in the database (every entry below the
+        checkpoint is anchored, by the checkpoint's definition). It
+        catches a missing journal, one truncated below the checkpoint,
+        and one from another lineage whose entries differ at those two
+        positions. It does not catch an older prefix-identical copy that
+        still reaches the checkpoint (the entries beyond it are lost,
+        undetectably: the snapshot rule in the README is what prevents
+        that), nor a journal that differs only between the two probed
+        entries. Two reads and two probes, whatever the checkpoint's
+        size; the full check is the rescan from 0."""
+        if idx <= 0:
+            return
+        journal_path = self.path + '/journal'
+        try:
+            entries = os.path.getsize(journal_path) // Journal.COMMITMENT_SIZE
+        except FileNotFoundError:
+            entries = 0
+        if entries < idx:
+            self.__refuse('%s names journal index %d, but the journal holds %d entr%s: the journal is missing or '
+                          'older than the checkpoint (deleted, or restored from an older backup); new submissions '
+                          'would land below the checkpoint and never be anchored'
+                          % (path, idx, entries, 'y' if entries == 1 else 'ies'), path)
+        journal = Journal(journal_path)
+        try:
+            for probe in (idx - 1, 0):
+                try:
+                    entry = journal[probe]
+                except KeyError:
+                    self.__refuse('%s names journal index %d, but the journal has no entry %d' % (path, idx, probe), path)
+                if entry not in self.db:
+                    self.__refuse('%s names journal index %d, but the database does not hold journal entry %d: '
+                                  'the journal is not the one the checkpoint describes (restored from elsewhere?), '
+                                  'or db/ is older than the checkpoint' % (path, idx, probe), path)
+        finally:
+            journal.read_fd.close()
+
     def verify_storage_generation(self):
         """Check journal.known-good against the database's generation and
-        committed watermark; returns the checkpoint index the scan may
-        start at (None: from 0), or stops the process with the recovery
-        text. Migration of a database from before generations: a v1
-        checkpoint (index alone) is adopted only if the journal entry just
-        below it is in the database; the database is then stamped with a
-        generation and that watermark, and the file rewritten as v2."""
+        committed watermark, and against the journal (__check_journal);
+        returns the checkpoint index the scan may start at (None: from 0),
+        or stops the process with the recovery text. Migration of a
+        database from before generations: a v1 checkpoint (index alone) is
+        adopted only if the journal entry just below it is in the
+        database; the database is then stamped with a generation and that
+        watermark, and the file rewritten as v2."""
         path = self.path + '/journal.known-good'
         try:
             checkpoint = read_checkpoint(path)
@@ -502,17 +550,7 @@ class Calendar:
                 self.__refuse('%s names journal index %d without a database generation, but db/ carries generation %s: '
                               'the checkpoint predates this database (db/ was recreated, or an older checkpoint was restored)'
                               % (path, idx, self.db.generation), path)
-            if idx > 0:
-                journal = Journal(self.path + '/journal')
-                try:
-                    entry = journal[idx - 1]
-                except KeyError:
-                    self.__refuse('%s names journal index %d, but the journal has no entry %d' % (path, idx, idx - 1), path)
-                finally:
-                    journal.read_fd.close()
-                if entry not in self.db:
-                    self.__refuse('%s names journal index %d, but the database does not hold journal entry %d: '
-                                  'db/ is older than the checkpoint' % (path, idx, idx - 1), path)
+            self.__check_journal(idx, path)
             self.db.adopt_generation(idx)
             write_checkpoint(path, idx, self.db.generation)
             logging.warning("Calendar storage migrated: %s (index %d, the format before generations) adopted as the "
@@ -529,6 +567,7 @@ class Calendar:
         if idx > self.db.watermark:
             self.__refuse('%s names journal index %d, but the database\'s committed watermark is %d: db/ is older than '
                           'the checkpoint (restored from an older backup?)' % (path, idx, self.db.watermark), path)
+        self.__check_journal(idx, path)
         return idx
 
     # Warn once while submissions go out without a not-before bound (no
@@ -649,10 +688,14 @@ class Aggregator:
                 # submit() would wait forever and the status would still
                 # show a live chain. Say so, wake the waiters with a
                 # refusal, and stop the process so the supervisor restarts
-                # it. Nothing is lost that was not lost already: the round's
-                # digests were never written, and their clients get a 503.
-                logging.error("Aggregator round failed, %d digests not committed; stopping: %r"
-                              % (len(digests), exp))
+                # it. What the round's clients get is a 503, no proof: the
+                # commitment may or may not be in the journal (a failed
+                # fsync after the write, or a partial write padded at the
+                # next start), and either way it is anchored on restart
+                # like any journal entry, unasked for; their resubmission
+                # is a new commitment, counted again.
+                logging.error("Aggregator round failed, %d digests not acknowledged (the round's commitment "
+                              "may or may not be in the journal); stopping: %r" % (len(digests), exp))
                 self.failure = exp
                 self.exit_event.set()
                 for done_event in done_events:

@@ -26,11 +26,23 @@ state and the log carries the text. If the outbox itself cannot be
 written the run still tries to send, and the cursor advances only when
 everything was delivered, so the next run re-observes the burst.
 
+Three rules from the 2026-09-15/16 review (F09, F10, F11): a journalctl
+call that fails is a failed check (journal_read) and the journal cursor
+stays where it was until every journal query succeeds, so no window is
+skipped unread; an outbox that exists but cannot be read fails the run
+with nothing touched, and one whose bytes are not a message list is set
+aside as outbox.json.corrupt-<12 hex of the bytes' sha256> and reported as an alert (only a
+missing file is an empty queue); and a run holds an exclusive lock on
+WATCH_DIR for its whole duration (<WATCH_DIR>/.lock, across processes), a
+second run waiting up to LOCK_WAIT seconds and then exiting 1 with
+'locked', so two runs never read and rewrite the same queue. Every file
+is written under a unique temporary name.
+
 Two shapes, one script, chosen by the config: the hosted shape (the Pi)
 sets HEALTH_URL and the demo's feeder and tor knobs; the appliance shape
 sets CALENDAR_URL and leaves what it has not got EMPTY. An empty knob skips
-its check entirely — it neither fails nor counts — so "ok 15/15" on an
-appliance and "ok 20/20" on the Pi both mean every configured check passed.
+its check entirely — it neither fails nor counts — so "ok 16/16" on an
+appliance and "ok 21/21" on the Pi both mean every configured check passed.
 The script lives in the fork's ops/ (read-only on the box); config, state,
 status and log live in WATCH_DIR (default ~/watcher).
 
@@ -42,13 +54,17 @@ more than EGRESS_DROPS (10) in one run alerts, and the daily heartbeat carries t
 previous heartbeat. ssh_unexpected alerts once for any accepted publickey login whose source is
 not in SSH_KNOWN_SOURCES. dhcp_lease, tor_circuits, btc_peers and calendar follow the two-run rule.
 """
+import contextlib
 import datetime
+import errno
+import fcntl
 import glob
 import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -60,10 +76,47 @@ STATE = os.path.join(WATCH_DIR, "state.json")
 STATUS = os.path.join(WATCH_DIR, "status")
 FIXTURES = os.path.join(DIR, "tests", "watch")
 OUTBOX_MAX = 200    # undelivered messages kept; older ones are dropped, logged
+LOCK_WAIT = 60.0    # seconds a run waits for another run's lock before exiting 1 'locked'
 
 
 def outbox_path():
     return os.path.join(WATCH_DIR, "outbox.json")
+
+
+def lock_path():
+    return os.path.join(WATCH_DIR, ".lock")
+
+
+class Locked(Exception):
+    """Another run holds the state directory's lock"""
+
+
+class OutboxUnreadable(Exception):
+    """The outbox exists and could not be read: the run must not go on"""
+
+
+@contextlib.contextmanager
+def run_lock(wait=None):
+    """An exclusive lock on WATCH_DIR for the whole run, across processes
+    (flock on <WATCH_DIR>/.lock), so two runs never read and rewrite the
+    same outbox and state (2026-09-15/16 review F11). Waits up to LOCK_WAIT
+    seconds for the holder, then raises Locked. The lock goes with the
+    descriptor: a run that dies releases it."""
+    wait = LOCK_WAIT if wait is None else wait
+    fd = os.open(lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK) or time.monotonic() >= deadline:
+                    raise Locked("%s is held by another run" % lock_path())
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(fd)
 
 DEFAULTS = {
     "NTFY_URL": "",
@@ -97,8 +150,8 @@ DEFAULTS = {
 }
 BURST_CHECKS = ("journal_errors", "ssh_failures", "egress_drops", "ssh_unexpected")   # one-run events: alert at once, clear at once
 ORDER = ["health_reach", "health", "calendar", "containers", "units_system", "units_user", "disk_root", "disk_boot",
-         "temp", "mem", "feeder", "endpoint", "journal_errors", "ssh_failures", "anchor_age", "reboot_wanted",
-         "egress_drops", "dhcp_lease", "tor_circuits", "btc_peers", "ssh_unexpected"]
+         "temp", "mem", "feeder", "endpoint", "journal_errors", "ssh_failures", "journal_read", "anchor_age",
+         "reboot_wanted", "egress_drops", "dhcp_lease", "tor_circuits", "btc_peers", "ssh_unexpected"]
 # A check whose knob is empty is not configured on this box: skipped, never counted.
 SKIP_WHEN_EMPTY = {"health_reach": "HEALTH_URL", "health": "HEALTH_URL", "calendar": "CALENDAR_URL",
                    "containers": "CONTAINERS", "units_system": "UNITS_SYSTEM", "units_user": "UNITS_USER",
@@ -253,16 +306,31 @@ def observe(cfg, now, cursors, want_updates=False):
             o["endpoint_breaker"] = [t.split("=", 1)[1] for t in open(cfg["ENDPOINT_HEARTBEAT"]).read().split() if t.startswith("breaker=")][0]
         except Exception:
             o["endpoint_breaker"] = None
-    since = "@%d" % int(cursors.get("journal", now - 300))
-    o["journal_errors"] = sum(len(run(["journalctl"] + scope + ["-p", "err", "--since", since, "-q", "--no-pager"])[1].splitlines())
+    # The journal since the last run's cursor. A query that fails (a nonzero
+    # exit, a timeout) is recorded in journal_failed and reads as no lines,
+    # never as no events: evaluate turns the list into the journal_read
+    # check, and real_run keeps the cursor at journal_since until every
+    # query succeeds (2026-09-15/16 review F09).
+    o["journal_since"] = int(cursors.get("journal", now - 300))
+    since = "@%d" % o["journal_since"]
+    o["journal_failed"] = []
+
+    def journal(label, *args):
+        rc, out = run(["journalctl"] + list(args))
+        if rc != 0:
+            o["journal_failed"].append(label)
+            return ""
+        return out
+    o["journal_errors"] = sum(len(journal("errors" + ("(user)" if scope else ""),
+                                          *(scope + ["-p", "err", "--since", since, "-q", "--no-pager"])).splitlines())
                               for scope in ([], ["--user"]))
-    o["ssh_failures"] = len(run(["journalctl", "-u", "ssh", "--since", since, "-q", "--no-pager", "-g",
-                                 "Failed password|Invalid user|authentication failure|maximum authentication attempts"])[1].splitlines())
+    o["ssh_failures"] = len(journal("ssh-failures", "-u", "ssh", "--since", since, "-q", "--no-pager", "-g",
+                                    "Failed password|Invalid user|authentication failure|maximum authentication attempts").splitlines())
     # accepted ssh logins since the last run, by source address (zone suffix stripped)
-    acc = run(["journalctl", "-u", "ssh", "--since", since, "-q", "--no-pager", "-g", "Accepted publickey"])[1]
+    acc = journal("ssh-accepted", "-u", "ssh", "--since", since, "-q", "--no-pager", "-g", "Accepted publickey")
     o["ssh_sources"] = sorted({l.split(" from ", 1)[1].split()[0].split("%")[0] for l in acc.splitlines() if " from " in l})
     # refused outbound since the last run: the host firewall logs "egress-drop*" at warn, rate-limited
-    o["egress_drops"] = len(run(["journalctl", "-k", "--since", since, "-q", "--no-pager", "-g", "egress-drop"])[1].splitlines())
+    o["egress_drops"] = len(journal("egress", "-k", "--since", since, "-q", "--no-pager", "-g", "egress-drop").splitlines())
     # dhcp: hours until the lease expires (renewal happens at half-life, so under 6 h means a renewal was missed)
     o["dhcp_lease_left_h"] = None
     if cfg["DHCP_IFACE"]:
@@ -378,6 +446,8 @@ def evaluate(o, cfg):
     c["journal_errors"] = (je <= int(cfg["JOURNAL_ERRORS"]), "%d journal errors since last check" % je)
     sf = o.get("ssh_failures") or 0
     c["ssh_failures"] = (sf <= int(cfg["SSH_FAILURES"]), "%d ssh auth failures since last check" % sf)
+    failed = o.get("journal_failed") or []
+    c["journal_read"] = (not failed, "journalctl failed: %s (window kept, read again next run)" % ", ".join(failed))
     ah = o.get("anchor_age_h")
     c["anchor_age"] = (ah is None or ah <= float(cfg["ANCHOR_MAX_H"]), "last anchor %.0fh ago" % (ah or 0))
     kr, kn = o.get("kernel_running"), o.get("kernel_newest")
@@ -533,33 +603,94 @@ def log(msg):
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg, flush=True)
 
 
-def write_json_atomic(path, data):
-    """tmp, fsync, rename, fsync the directory: the file is whole or absent."""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fd:
-        json.dump(data, fd, indent=1)
-        fd.flush()
-        os.fsync(fd.fileno())
-    os.replace(tmp, path)
-    dfd = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_RDONLY)
+def write_bytes_atomic(path, data, mode=0o644):
+    """A unique temporary name in the same directory, fsync, rename, fsync
+    the directory: the file is whole or absent, and two writers never share
+    a temporary name."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(dfd)
     finally:
         os.close(dfd)
 
 
-def load_outbox():
+def write_text_atomic(path, text, mode=0o644):
+    write_bytes_atomic(path, text.encode("utf-8"), mode)
+
+
+def write_json_atomic(path, data):
+    write_bytes_atomic(path, json.dumps(data, indent=1).encode("utf-8"), mode=0o600)
+
+
+def load_outbox(cfg=None):
+    """The undelivered messages on file. Only a missing file is an empty
+    queue. A file that cannot be read raises OutboxUnreadable: the run
+    fails with nothing touched. Bytes that are not a list of messages are
+    set aside for inspection as outbox.json.corrupt-<12 hex of their
+    sha256>, and the queue becomes one alert saying so (2026-09-15/16
+    review F10).
+
+    The recovery is itself interruptible: the aside copy is written first
+    (a name from the bytes, so a repeat writes the same file), and the
+    notice replaces the corrupt file in one rename. A stop before the
+    rename leaves the corrupt file to be found and handled again; a stop
+    after it leaves the notice on disk, owed like any other message. At
+    no point is the corrupt file gone while the notice is only in
+    memory."""
+    path = outbox_path()
     try:
-        with open(outbox_path()) as fd:
-            data = json.load(fd)
-    except (OSError, ValueError):
+        with open(path, "rb") as fd:
+            raw = fd.read()
+    except FileNotFoundError:
         return []
-    return [m for m in data if isinstance(m, dict) and isinstance(m.get("text"), str)] if isinstance(data, list) else []
+    except OSError as exc:
+        raise OutboxUnreadable("%s: %r" % (path, exc))
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, list) or not all(isinstance(m, dict) and isinstance(m.get("text"), str) for m in data):
+            raise ValueError("not a list of messages")
+    except ValueError as exc:
+        import hashlib
+        aside = "%s.corrupt-%s" % (path, hashlib.sha256(raw).hexdigest()[:12])
+        write_bytes_atomic(aside, raw, mode=0o600)
+        name = box_name(cfg) if cfg is not None else socket.gethostname()
+        notice = [{"text": "%s WATCHER: outbox.json could not be read (%s); %d bytes set aside as %s; alerts "
+                           "queued before this run may not have been delivered"
+                           % (name, exc, len(raw), os.path.basename(aside)),
+                   "queued": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}]
+        write_json_atomic(path, notice)     # one rename: the corrupt file leaves as the notice lands
+        log("outbox unreadable (%s); %d bytes set aside as %s; the notice is queued" % (exc, len(raw), os.path.basename(aside)))
+        return notice
+    return data
 
 
 def real_run(dry):
     cfg = load_config()
     os.makedirs(WATCH_DIR, exist_ok=True)
+    try:
+        with run_lock():
+            return _run_locked(cfg, dry)
+    except Locked as exc:
+        log("locked: %s; nothing done, exit 1" % exc)
+        return 1
+
+
+def _run_locked(cfg, dry):
     now = time.time()
     state = {}
     if os.path.exists(STATE):
@@ -578,9 +709,7 @@ def real_run(dry):
         acc = 0
     new_state["drops_acc"] = acc
     line = status_line(now, new_state, checks, cfg)
-    with open(STATUS + ".tmp", "w") as fd:
-        fd.write(line + "\n")
-    os.replace(STATUS + ".tmp", STATUS)
+    write_text_atomic(STATUS, line + "\n")
     log(line)
     if dry:
         for m in msgs:
@@ -588,7 +717,9 @@ def real_run(dry):
         return 0
 
     def commit(st):
-        st["cursors"] = {"journal": now}
+        # The cursor moves past the window only when every journal query
+        # read it; a failed read keeps the earliest unread cursor.
+        st["cursors"] = {"journal": o["journal_since"] if o.get("journal_failed") else now}
         write_json_atomic(STATE, st)
 
     if not cfg.get("NTFY_URL"):
@@ -600,7 +731,12 @@ def real_run(dry):
         return 0
 
     # The burst goes to disk before the cursor moves past it.
-    queue = load_outbox() + [{"text": m, "queued": utc.strftime("%Y-%m-%dT%H:%M:%SZ")} for m in msgs]
+    try:
+        queue = load_outbox(cfg)
+    except OutboxUnreadable as exc:
+        log("outbox unreadable: %s; nothing sent, state kept, exit 1" % exc)
+        return 1
+    queue = queue + [{"text": m, "queued": utc.strftime("%Y-%m-%dT%H:%M:%SZ")} for m in msgs]
     if len(queue) > OUTBOX_MAX:
         log("outbox over %d messages; dropping the oldest %d" % (OUTBOX_MAX, len(queue) - OUTBOX_MAX))
         queue = queue[-OUTBOX_MAX:]

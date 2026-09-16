@@ -75,6 +75,17 @@ FORK_MARKER = 0xff
 PENDING_TAG = bytes.fromhex('83dfe30d2ef90c8e')
 BITCOIN_TAG = bytes.fromhex('0588960d73d71901')
 OP_NAMES = {OP_SHA256: 'sha256', OP_APPEND: 'append', OP_PREPEND: 'prepend'}
+# The public client's limits (opentimestamps 0.4.x), mirrored so that
+# "parses" means the same here as there; ops/tests/proof_corpus.py holds
+# both to them. The last one is ours: nothing valid needs more than ten
+# bytes of varuint.
+MAX_OPERAND = 4096
+MAX_MSG = 4096
+MAX_ATTESTATION_PAYLOAD = 8192
+MAX_URI = 1000
+URI_CHARS = frozenset(b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._/:')
+MAX_OPS_ON_A_PATH = 255
+MAX_VARUINT_BYTES = 10
 
 # --- Bitcoin networks ------------------------------------------------------------
 
@@ -113,9 +124,12 @@ ChainResult = collections.namedtuple('ChainResult', 'ok problems checked first_h
 def read_varuint(data, pos):
     value = 0
     shift = 0
+    start = pos
     while True:
         if pos >= len(data):
             raise ProofError('truncated varuint')
+        if pos - start >= MAX_VARUINT_BYTES:
+            raise ProofError('varuint longer than %d bytes' % MAX_VARUINT_BYTES)
         byte = data[pos]
         pos += 1
         value |= (byte & 0x7f) << shift
@@ -124,59 +138,50 @@ def read_varuint(data, pos):
             return value, pos
 
 
-def read_varbytes(data, pos):
+def read_varbytes(data, pos, max_len, min_len=0):
     length, pos = read_varuint(data, pos)
+    if length > max_len:
+        raise ProofError('varbytes longer than %d bytes' % max_len)
+    if length < min_len:
+        raise ProofError('varbytes shorter than %d byte' % min_len)
     if pos + length > len(data):
         raise ProofError('truncated varbytes')
     return data[pos:pos + length], pos + length
 
 
-def _parse_timestamp(data, pos, msg, path, out):
-    """One timestamp: zero or more fork-marked branches, then a last branch"""
-    while True:
-        if pos >= len(data):
-            raise ProofError('truncated: no attestation')
-        if data[pos] == FORK_MARKER:
-            pos = _parse_branch(data, pos + 1, msg, path, out)
-            continue
-        return _parse_branch(data, pos, msg, path, out)
-
-
-def _parse_branch(data, pos, msg, path, out):
-    tag = data[pos]
-    pos += 1
-    if tag == ATTESTATION_MARKER:
-        atag = data[pos:pos + 8]
-        if len(atag) != 8:
-            raise ProofError('truncated attestation tag')
-        pos += 8
-        payload, pos = read_varbytes(data, pos)
-        if atag == PENDING_TAG:
-            uri, _ = read_varbytes(payload, 0)
-            out.append(Attestation('pending', None, uri.decode('utf-8', 'replace'), msg, tuple(path)))
-        elif atag == BITCOIN_TAG:
-            height, _ = read_varuint(payload, 0)
-            out.append(Attestation('bitcoin', height, None, msg, tuple(path)))
-        else:
-            out.append(Attestation('unknown:' + atag.hex(), None, None, msg, tuple(path)))
-        return pos
-    if tag == OP_SHA256:
-        new = hashlib.sha256(msg).digest()
-        operand = b''
-    elif tag == OP_APPEND:
-        operand, pos = read_varbytes(data, pos)
-        new = msg + operand
-    elif tag == OP_PREPEND:
-        operand, pos = read_varbytes(data, pos)
-        new = operand + msg
-    else:
-        raise ProofError('unsupported op 0x%02x: the calendar never emits it; use the ots client' % tag)
-    return _parse_timestamp(data, pos, new, path + [(OP_NAMES[tag], operand, new)], out)
+def _read_attestation(data, pos, msg, path):
+    """The attestation whose marker byte was just read: (Attestation, end).
+    A known payload is consumed to its last byte; a pending URI is at most
+    MAX_URI bytes of URI_CHARS; an unknown tag is kept as 'unknown:<hex>'."""
+    atag = data[pos:pos + 8]
+    if len(atag) != 8:
+        raise ProofError('truncated attestation tag')
+    pos += 8
+    payload, pos = read_varbytes(data, pos, MAX_ATTESTATION_PAYLOAD)
+    if atag == PENDING_TAG:
+        uri, end = read_varbytes(payload, 0, MAX_URI)
+        if end != len(payload):
+            raise ProofError('trailing bytes in the pending attestation')
+        if any(b not in URI_CHARS for b in uri):
+            raise ProofError('pending uri has a character outside the allowed set')
+        return Attestation('pending', None, uri.decode('ascii'), msg, tuple(path)), pos
+    if atag == BITCOIN_TAG:
+        height, end = read_varuint(payload, 0)
+        if end != len(payload):
+            raise ProofError('trailing bytes in the bitcoin attestation')
+        return Attestation('bitcoin', height, None, msg, tuple(path)), pos
+    return Attestation('unknown:' + atag.hex(), None, None, msg, tuple(path)), pos
 
 
 def parse_proof(data):
     """Parsed(digest, attestations): every attestation with the op path
-    ((name, operand, result) per op) that leads to it from the digest."""
+    ((name, operand, result) per op) that leads to it from the digest.
+    Raises ProofError, and only ProofError, on anything that is not one
+    whole proof by the public client's rules. The walk is a loop: a
+    timestamp is zero or more fork-marked branches then a last branch;
+    every fork marker promises one more branch of the same timestamp after
+    the branch it opens ends, so `pending` holds, per open fork, the
+    message, path and operation count the sibling branch resumes with."""
     if data[:len(MAGIC)] != MAGIC:
         raise ProofError('not an OpenTimestamps proof (bad magic)')
     pos = len(MAGIC)
@@ -191,8 +196,48 @@ def parse_proof(data):
         raise ProofError('truncated digest')
     pos += 32
     out = []
-    end = _parse_timestamp(data, pos, digest, [], out)
-    if end != len(data):
+    pending = []
+    msg, path, ops, after_fork = digest, [], 0, False
+    while True:
+        if pos >= len(data):
+            raise ProofError('truncated: no attestation')
+        tag = data[pos]
+        pos += 1
+        if tag == FORK_MARKER:
+            if after_fork:
+                raise ProofError('a fork marker followed by another fork marker')
+            pending.append((msg, path, ops))
+            after_fork = True
+            continue
+        after_fork = False
+        if tag == ATTESTATION_MARKER:
+            attestation, pos = _read_attestation(data, pos, msg, path)
+            out.append(attestation)
+            if not pending:
+                break
+            msg, path, ops = pending.pop()
+            continue
+        if len(msg) > MAX_MSG:
+            raise ProofError('message longer than %d bytes' % MAX_MSG)
+        if tag == OP_SHA256:
+            new = hashlib.sha256(msg).digest()
+            operand = b''
+        elif tag == OP_APPEND:
+            operand, pos = read_varbytes(data, pos, MAX_OPERAND, min_len=1)
+            new = msg + operand
+        elif tag == OP_PREPEND:
+            operand, pos = read_varbytes(data, pos, MAX_OPERAND, min_len=1)
+            new = operand + msg
+        else:
+            raise ProofError('unsupported op 0x%02x: the calendar never emits it; use the ots client' % tag)
+        if len(new) > MAX_OPERAND:
+            raise ProofError('result longer than %d bytes' % MAX_OPERAND)
+        path = path + [(OP_NAMES[tag], operand, new)]
+        msg = new
+        ops += 1
+        if ops > MAX_OPS_ON_A_PATH:
+            raise ProofError('more than %d operations on one path' % MAX_OPS_ON_A_PATH)
+    if pos != len(data):
         raise ProofError('trailing bytes after the proof')
     return Parsed(digest, out)
 
