@@ -2,8 +2,10 @@
 # it). KEY=VALUE; a key left out uses the default in ops/watch.py; a key set
 # EMPTY skips its check entirely, so it neither fails nor counts. The only
 # secret is the ntfy topic URL. Empty = no off-box channel (status file only).
+# What leaves the box: NAME, each check's short detail, counts. Never a path;
+# an unexpected ssh login goes out as a count, its address stays in watch.log.
 NTFY_URL=
-# The box's name in every message (empty = the hostname).
+# The box's name in every message (empty = the hostname: set it).
 NAME=
 
 # --- The appliance shape (docker-compose.enterprise.yml): the calendar's own
@@ -29,6 +31,9 @@ RECEIPTS=/home/appliance/opentimestamps-server/receipts/anchor-receipts.jsonl
 # --- Thresholds (rulings 2026-09-04): disk 85%, temp 75C, mem 256MB, endpoint
 # 180s, journal 20 errors/run, ssh 10 failures/run, anchor 36h (three times
 # the default 6–12 h departure window), heartbeat at 08:00Z, confirm 2 runs.
+# A check whose source cannot be read says "unknown", never ok, and alarms
+# after CONFIRM_RUNS like a failure. A box with no thermal sensor or no
+# readable /proc/meminfo sets TEMP_C or MEM_MB empty to skip that check.
 DISK_PCT=85
 TEMP_C=75
 MEM_MB=256

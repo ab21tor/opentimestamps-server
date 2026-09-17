@@ -14,29 +14,25 @@ one heartbeat per UTC day. A persisting problem never re-alarms.
     watch.py --dry      real observations, print what would be sent, send nothing
     watch.py --test     fixture scenarios under tests/watch/, sender stubbed, exit 1 on any deviation
 
-Delivery (2026-09-15): every message a run decides to send is first
-written to <WATCH_DIR>/outbox.json (atomic, fsynced), and only then is
-the journal cursor advanced: a burst the journal will not show again (an
-unexpected ssh login) is on disk before it is consumed. The outbox is
-delivered oldest first, stopping at the first failure so alerts never
-reorder; what is not delivered stays and is retried by every later run,
-and the run exits 1 while anything is undelivered. With NTFY_URL empty
-(status-only mode) nothing is queued: the transition is recorded in the
-state and the log carries the text. If the outbox itself cannot be
-written the run still tries to send, and the cursor advances only when
-everything was delivered, so the next run re-observes the burst.
-
-Three rules from the 2026-09-15/16 review (F09, F10, F11): a journalctl
-call that fails is a failed check (journal_read) and the journal cursor
-stays where it was until every journal query succeeds, so no window is
-skipped unread; an outbox that exists but cannot be read fails the run
-with nothing touched, and one whose bytes are not a message list is set
-aside as outbox.json.corrupt-<12 hex of the bytes' sha256> and reported as an alert (only a
-missing file is an empty queue); and a run holds an exclusive lock on
-WATCH_DIR for its whole duration (<WATCH_DIR>/.lock, across processes), a
-second run waiting up to LOCK_WAIT seconds and then exiting 1 with
-'locked', so two runs never read and rewrite the same queue. Every file
-is written under a unique temporary name.
+What a run writes, and in what order (docs/contracts.md, section 8, W1):
+the status line; then one record, state.json, holding the delivered set
+and counters, the journal cursor, and, under "owed", the outbox as it must
+now be (what was queued, what this run adds, the cap applied); then that
+queue copied to outbox.json and the record rewritten without it; then
+delivery oldest first, the outbox rewritten after each success. A stop
+before the record leaves nothing to recover: the next run observes afresh
+and the journal window is read again because the cursor did not move. A
+stop after it is finished by the next run copying the recorded queue over
+the outbox, so nothing is queued twice and nothing already discarded comes
+back. An outbox that cannot be read (a permission error) ends the run
+before anything is observed; one whose bytes are not a message list is set
+aside as outbox.json.corrupt-<12 hex of the bytes' sha256> and reported
+as an alert; the same for state.json. A run holds an exclusive lock on
+WATCH_DIR for its whole duration (<WATCH_DIR>/.lock), a second run waiting
+up to LOCK_WAIT seconds and then exiting 1 with 'locked', having observed
+nothing. Every file is written under a unique temporary name. "Delivered"
+in the state means an alarm transition was recorded, not that the operator
+received anything: that is the outbox's business, at least once.
 
 Two shapes, one script, chosen by the config: the hosted shape (the Pi)
 sets HEALTH_URL and the demo's feeder and tor knobs; the appliance shape
@@ -52,7 +48,40 @@ alert on the run they are seen and clear on the next. egress_drops counts kernel
 lines (the host firewall's refused outbound, rate-limited at the source) since the previous run;
 more than EGRESS_DROPS (10) in one run alerts, and the daily heartbeat carries the count since the
 previous heartbeat. ssh_unexpected alerts once for any accepted publickey login whose source is
-not in SSH_KNOWN_SOURCES. dhcp_lease, tor_circuits, btc_peers and calendar follow the two-run rule.
+not in SSH_KNOWN_SOURCES; the message off-box carries the count, the log on the box the address.
+dhcp_lease, tor_circuits, btc_peers and calendar follow the two-run rule.
+
+Four rules from workflow three (2026-09-16, docs/contracts.md section 8):
+
+- Unknown is a state. A check whose source could not be read or gave no
+  answer has the verdict None, never True: the status line and the
+  heartbeat name it as unknown, and it alarms like a failure after the
+  same two runs, worded as unknown. A check whose unknown is another
+  check's doing (health behind health_reach, the four journal counts
+  behind journal_read; OWNED_BY) is suspended while the owner fails: it
+  neither alarms nor recovers nor is listed as still failing, and it
+  resumes with its next real verdict. An empty TEMP_C or MEM_MB skips
+  that check like every other empty knob.
+- The record is one write. A transition, the journal cursor and the
+  outbox as it must now be (under "owed": the queue with this run's
+  messages appended and the cap applied) land in state.json together, and
+  only then is that queue copied to the outbox and the state rewritten
+  without it. A stop before that write records nothing; a stop after it,
+  on either side of the outbox write, is finished by the next run copying
+  the recorded queue over the outbox: every message queued once, every
+  discard final, the order kept.
+- The cap is a message. The outbox keeps OUTBOX_MAX entries; when it
+  would hold more, the oldest are dropped and the drop is the first
+  message in line, a notice saying how many were dropped and when they
+  were queued, folded into the notice already there when there is one.
+  The decision is part of the record, so a replay never drops twice.
+- The state file is read like the outbox: missing is a fresh start;
+  unreadable fails the run with nothing done; bytes that are not a state
+  object, or an object whose fields are not what the run relies on, are
+  set aside as state.json.corrupt-<12 hex of their sha256> and the run
+  goes on from a fresh state with a notice saying what the fresh state
+  cannot know. A dry run sets nothing aside and only says what a real
+  run would do. No message names a path or a configured mount.
 """
 import contextlib
 import datetime
@@ -112,7 +141,7 @@ def run_lock(wait=None):
                 break
             except OSError as exc:
                 if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK) or time.monotonic() >= deadline:
-                    raise Locked("%s is held by another run" % lock_path())
+                    raise Locked("another run holds the state directory")
                 time.sleep(0.1)
         yield
     finally:
@@ -155,9 +184,16 @@ ORDER = ["health_reach", "health", "calendar", "containers", "units_system", "un
 # A check whose knob is empty is not configured on this box: skipped, never counted.
 SKIP_WHEN_EMPTY = {"health_reach": "HEALTH_URL", "health": "HEALTH_URL", "calendar": "CALENDAR_URL",
                    "containers": "CONTAINERS", "units_system": "UNITS_SYSTEM", "units_user": "UNITS_USER",
-                   "disk_root": "DISK_ROOT", "disk_boot": "DISK_BOOT", "feeder": "FEEDER_LOG",
-                   "endpoint": "ENDPOINT_HEARTBEAT", "anchor_age": "RECEIPTS", "dhcp_lease": "DHCP_IFACE",
-                   "tor_circuits": "TOR_CONTAINER", "btc_peers": "BTC_P2P_PORT"}
+                   "disk_root": "DISK_ROOT", "disk_boot": "DISK_BOOT", "temp": "TEMP_C", "mem": "MEM_MB",
+                   "feeder": "FEEDER_LOG", "endpoint": "ENDPOINT_HEARTBEAT", "anchor_age": "RECEIPTS",
+                   "dhcp_lease": "DHCP_IFACE", "tor_circuits": "TOR_CONTAINER", "btc_peers": "BTC_P2P_PORT"}
+# A check whose unknown is another check's failure: while the owner fails
+# the check is suspended (decide), and the owner's alarm speaks for it.
+OWNED_BY = {"health": "health_reach", "journal_errors": "journal_read", "ssh_failures": "journal_read",
+            "egress_drops": "journal_read", "ssh_unexpected": "journal_read"}
+# What `systemctl is-active` can say; anything else is not an answer.
+SYSTEMD_STATES = {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance",
+                  "refreshing", "unknown"}
 
 
 def active_checks(cfg):
@@ -201,11 +237,16 @@ def run(cmd, timeout=30):
         return -1, "exc %r" % (e,)
 
 
-def mtime_age(path, now):
+def file_age(path, now):
+    """(seconds since the file last changed, error): error is None,
+    'missing' or 'unreadable'. A file that cannot be stat'ed is not a
+    stale file, and evaluate must not read it as one."""
     try:
-        return now - os.path.getmtime(path)
+        return now - os.stat(path).st_mtime, None
+    except FileNotFoundError:
+        return None, "missing"
     except OSError:
-        return None
+        return None, "unreadable"
 
 
 # ----------------------------------------------------------------------------- observe
@@ -218,7 +259,7 @@ def kernel_versions():
     try:
         cands = [d for d in os.listdir("/lib/modules") if d.endswith(flavour)]
     except OSError:
-        cands = []
+        return running, None          # unknown: evaluate says so, never "up to date"
     newest = max(cands, key=key) if cands else running
     return running, newest
 
@@ -234,18 +275,24 @@ def pending_updates():
 
 def fetch_json(url, headers=None, timeout=60):
     """(parsed body or None, reached). A 503 still carries a body (the
-    gateway's degraded /health); any other failure is unreached."""
+    gateway's degraded /health). An answer whose body is not JSON is
+    reached with no body (evaluate calls that unknown, not absent); no
+    answer at all is unreached."""
     req = urllib.request.Request(url, headers=dict(headers or {}))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode()), True
+            raw = r.read()
     except urllib.error.HTTPError as e:
         try:
-            return json.loads(e.read().decode()), True
+            raw = e.read()
         except Exception:
             return None, False
     except Exception:
         return None, False
+    try:
+        return json.loads(raw.decode("utf-8")), True
+    except (ValueError, UnicodeDecodeError):
+        return None, True
 
 
 def observe(cfg, now, cursors, want_updates=False):
@@ -290,22 +337,35 @@ def observe(cfg, now, cursors, want_updates=False):
         o["mem_avail_mb"] = int(mem["MemAvailable"].split()[0]) // 1024
     except Exception:
         o["mem_avail_mb"] = None
-    o["feeder_age"], o["feeder_err_polls"] = None, None
+    o["feeder_age"], o["feeder_err_polls"], o["feeder_error"], o["feeder_tail_error"] = None, None, None, None
     if cfg["FEEDER_LOG"]:
-        o["feeder_age"] = mtime_age(cfg["FEEDER_LOG"], now)
-        try:
-            tail = run(["tail", "-n", cfg["FEEDER_ERR_POLLS"], cfg["FEEDER_LOG"]])[1].splitlines()
-            errs = [int(l.split("errors=")[1].split()[0]) for l in tail if "errors=" in l]
-            o["feeder_err_polls"] = sum(1 for e in errs if e > 0) if errs else None
-        except Exception:
-            o["feeder_err_polls"] = None
-    o["endpoint_age"], o["endpoint_breaker"] = None, None
+        o["feeder_age"], o["feeder_error"] = file_age(cfg["FEEDER_LOG"], now)
+        rc, out = run(["tail", "-n", cfg["FEEDER_ERR_POLLS"], cfg["FEEDER_LOG"]])
+        if rc != 0:
+            o["feeder_tail_error"] = "tail failed"
+        else:
+            try:
+                errs = [int(l.split("errors=")[1].split()[0]) for l in out.splitlines() if "errors=" in l]
+            except (IndexError, ValueError):
+                errs = []
+            if errs:
+                o["feeder_err_polls"] = sum(1 for e in errs if e > 0)
+            else:
+                o["feeder_tail_error"] = "no poll lines"
+    o["endpoint_age"], o["endpoint_breaker"], o["endpoint_error"] = None, None, None
     if cfg["ENDPOINT_HEARTBEAT"]:
-        o["endpoint_age"] = mtime_age(cfg["ENDPOINT_HEARTBEAT"], now)
-        try:
-            o["endpoint_breaker"] = [t.split("=", 1)[1] for t in open(cfg["ENDPOINT_HEARTBEAT"]).read().split() if t.startswith("breaker=")][0]
-        except Exception:
-            o["endpoint_breaker"] = None
+        o["endpoint_age"], o["endpoint_error"] = file_age(cfg["ENDPOINT_HEARTBEAT"], now)
+        if o["endpoint_error"] is None:
+            try:
+                with open(cfg["ENDPOINT_HEARTBEAT"], "rb") as fd:
+                    tokens = fd.read().decode("utf-8").split()
+            except OSError:
+                o["endpoint_error"] = "unreadable"
+            except UnicodeDecodeError:
+                o["endpoint_error"] = "unparseable"
+            else:
+                breakers = [t.split("=", 1)[1] for t in tokens if t.startswith("breaker=")]
+                o["endpoint_breaker"] = breakers[0] if breakers else None
     # The journal since the last run's cursor. A query that fails (a nonzero
     # exit, a timeout) is recorded in journal_failed and reads as no lines,
     # never as no events: evaluate turns the list into the journal_read
@@ -361,15 +421,23 @@ def observe(cfg, now, cursors, want_updates=False):
     if cfg["BTC_P2P_PORT"]:
         rc, out = run(["ss", "-Htn", "state", "established", "( dport = :%s )" % cfg["BTC_P2P_PORT"]])
         o["btc_peers"] = len(out.splitlines()) if rc == 0 else None
-    o["anchors"], o["anchor_age_h"] = None, None
+    o["anchors"], o["anchor_age_h"], o["receipts_error"] = None, None, None
     if cfg["RECEIPTS"]:
         try:
-            lines = [json.loads(l) for l in open(cfg["RECEIPTS"]) if l.strip()]
-            o["anchors"] = len(lines)
-            if lines:
-                o["anchor_age_h"] = (now - lines[-1]["confirmed_at"]) / 3600.0
-        except Exception:
-            pass
+            with open(cfg["RECEIPTS"], "rb") as fd:
+                raw = fd.read()
+        except FileNotFoundError:
+            o["receipts_error"] = "missing"
+        except OSError:
+            o["receipts_error"] = "unreadable"
+        else:
+            try:
+                lines = [json.loads(l) for l in raw.decode("utf-8").splitlines() if l.strip()]
+                o["anchors"] = len(lines)
+                if lines:
+                    o["anchor_age_h"] = (now - lines[-1]["confirmed_at"]) / 3600.0
+            except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+                o["anchors"], o["anchor_age_h"], o["receipts_error"] = None, None, "unparseable"
     try:
         o["uptime_s"] = float(open("/proc/uptime").read().split()[0])
     except Exception:
@@ -378,23 +446,37 @@ def observe(cfg, now, cursors, want_updates=False):
 
 
 # ----------------------------------------------------------------------------- evaluate
+def unexpected_sources(o, cfg):
+    """The accepted-login sources of this window that SSH_KNOWN_SOURCES does not name"""
+    known = [k.strip() for k in cfg.get("SSH_KNOWN_SOURCES", "").split(",") if k.strip()]
+    return [a for a in (o.get("ssh_sources") or []) if not source_known(a, known)]
+
+
 def evaluate(o, cfg):
-    """Every check -> (ok, detail). Detail is the short text an alert quotes.
-    Checks whose knob is empty come out ok and are never counted (active_checks)."""
+    """Every check -> (verdict, detail). The verdict is True (ok), False
+    (failed) or None (unknown: the source could not be read or gave no
+    answer, which is never ok). Detail is the short text an alert quotes;
+    an unknown's detail says unknown and why. Checks whose knob is empty
+    are computed but never counted (active_checks)."""
     c = {}
-    c["health_reach"] = (o.get("health_reach") is True, "no answer from /health")
-    h = o.get("health") or {}
-    if o.get("health_reach"):
+    reach = o.get("health_reach")
+    c["health_reach"] = (reach is True, "no answer from /health")
+    h = o.get("health")
+    if not reach:
+        c["health"] = (None, "health unknown: /health unreachable")   # health_reach speaks for it
+    elif not isinstance(h, dict):
+        c["health"] = (None, "health unknown: body is not an object")
+    else:
         bad = [f for f in ("payment", "otsd", "wallet", "float", "proofs", "backup", "billing") if h.get(f) not in
                (None, "ok", "unknown", "absent", "inactive", "local_only", "off", "n/a")]
         st = h.get("status")
         c["health"] = (st == "ok", "health=%s %s" % (st, " ".join("%s=%s" % (f, h.get(f)) for f in bad)))
-    else:
-        c["health"] = (True, "")   # reach already fails; do not double-count
     cal = o.get("calendar")
     if not o.get("calendar_reach"):
         c["calendar"] = (False, "no answer from the calendar")
-    elif not isinstance(cal, dict) or not cal.get("best_block"):
+    elif not isinstance(cal, dict):
+        c["calendar"] = (None, "calendar unknown: status unreadable")
+    elif not cal.get("best_block"):
         c["calendar"] = (False, "calendar is Bitcoin-blind")
     elif cal.get("needs_attention"):
         c["calendar"] = (False, "calendar needs attention: " + "; ".join(str(f) for f in cal["needs_attention"]))
@@ -403,80 +485,133 @@ def evaluate(o, cfg):
     else:
         sats = parse_sats(cal.get("balance"))
         if sats is None:
-            c["calendar"] = (False, "calendar balance unreadable")
+            c["calendar"] = (None, "calendar unknown: balance unreadable")
         elif sats < int(cfg["CAL_MIN_SATS"]):
             c["calendar"] = (False, "anchor wallet %d sats < %s" % (sats, cfg["CAL_MIN_SATS"]))
         else:
             c["calendar"] = (True, "")
     cs = o.get("containers")
     if cs is None:
-        c["containers"] = (False, "docker ps failed")
+        c["containers"] = (None, "containers unknown: docker ps failed")
     else:
         down = [n for n in cfg["CONTAINERS"].split(",") if n and not cs.get(n, "").startswith("Up")]
         c["containers"] = (not down, "down: " + ",".join(down))
     for key in ("units_system", "units_user"):
-        bad = [u for u, s in (o.get(key) or {}).items() if s != "active"]
-        c[key] = (not bad, ",".join("%s=%s" % (u, (o.get(key) or {}).get(u)) for u in bad))
+        states = o.get(key) or {}
+        odd = [u for u, st in states.items() if st not in SYSTEMD_STATES]
+        if odd:
+            c[key] = (None, "%s unknown: systemctl gave no state for %s" % (key.replace("_", " "), ",".join(odd)))
+        else:
+            bad = [u for u, st in states.items() if st != "active"]
+            c[key] = (not bad, ",".join("%s=%s" % (u, states.get(u)) for u in bad))
     for key, name in (("DISK_ROOT", "disk_root"), ("DISK_BOOT", "disk_boot")):
+        # The role and the measurement leave the box; the mount is configuration.
         pct = (o.get("disk") or {}).get(cfg[key])
-        c[name] = (pct is not None and pct < float(cfg["DISK_PCT"]), "%s at %s%%" % (cfg[key], pct))
+        if pct is None:
+            c[name] = (None, "%s unknown: mount unreadable" % name)
+        else:
+            c[name] = (pct < float(cfg["DISK_PCT"]), "%s at %s%%" % (name, pct))
     t = o.get("temp_c")
-    c["temp"] = (t is not None and t < float(cfg["TEMP_C"]), "temp %sC" % t)
+    if t is None:
+        c["temp"] = (None, "temp unknown: no thermal reading")
+    else:
+        c["temp"] = (not cfg["TEMP_C"] or t < float(cfg["TEMP_C"]), "temp %sC" % t)
     m = o.get("mem_avail_mb")
-    c["mem"] = (m is not None and m >= int(cfg["MEM_MB"]), "mem available %sMB" % m)
+    if m is None:
+        c["mem"] = (None, "mem unknown: meminfo unreadable")
+    else:
+        c["mem"] = (not cfg["MEM_MB"] or m >= int(cfg["MEM_MB"]), "mem available %sMB" % m)
     fa, fe = o.get("feeder_age"), o.get("feeder_err_polls")
-    if fa is None:
+    if o.get("feeder_error") == "unreadable":
+        c["feeder"] = (None, "feeder unknown: log unreadable")
+    elif fa is None:
         c["feeder"] = (False, "feeder log missing")
     elif fa > float(cfg["FEEDER_STALE_S"]):
         c["feeder"] = (False, "feeder log stale %dm" % (fa // 60))
-    elif fe is not None and fe >= int(cfg["FEEDER_ERR_POLLS"]):
+    elif o.get("feeder_tail_error") or fe is None:
+        c["feeder"] = (None, "feeder unknown: %s" % (o.get("feeder_tail_error") or "no poll lines"))
+    elif fe >= int(cfg["FEEDER_ERR_POLLS"]):
         c["feeder"] = (False, "feeder last %d polls all with errors" % fe)
     else:
         c["feeder"] = (True, "")
     ea, eb = o.get("endpoint_age"), o.get("endpoint_breaker")
-    if ea is None:
+    if o.get("endpoint_error") in ("unreadable", "unparseable"):
+        c["endpoint"] = (None, "endpoint unknown: heartbeat %s" % o["endpoint_error"])
+    elif ea is None:
         c["endpoint"] = (False, "endpoint heartbeat missing")
     elif ea > float(cfg["ENDPOINT_STALE_S"]):
         c["endpoint"] = (False, "endpoint heartbeat stale %dm" % (ea // 60))
-    elif eb not in (None, "ok"):
+    elif eb is None:
+        c["endpoint"] = (None, "endpoint unknown: heartbeat has no breaker field")
+    elif eb != "ok":
         c["endpoint"] = (False, "endpoint breaker=%s" % eb)
     else:
         c["endpoint"] = (True, "")
-    je = o.get("journal_errors") or 0
-    c["journal_errors"] = (je <= int(cfg["JOURNAL_ERRORS"]), "%d journal errors since last check" % je)
-    sf = o.get("ssh_failures") or 0
-    c["ssh_failures"] = (sf <= int(cfg["SSH_FAILURES"]), "%d ssh auth failures since last check" % sf)
     failed = o.get("journal_failed") or []
     c["journal_read"] = (not failed, "journalctl failed: %s (window kept, read again next run)" % ", ".join(failed))
-    ah = o.get("anchor_age_h")
-    c["anchor_age"] = (ah is None or ah <= float(cfg["ANCHOR_MAX_H"]), "last anchor %.0fh ago" % (ah or 0))
+    if "errors" in failed or "errors(user)" in failed:
+        c["journal_errors"] = (None, "journal errors unknown: journalctl failed")
+    else:
+        je = o.get("journal_errors") or 0
+        c["journal_errors"] = (je <= int(cfg["JOURNAL_ERRORS"]), "%d journal errors since last check" % je)
+    if "ssh-failures" in failed:
+        c["ssh_failures"] = (None, "ssh failures unknown: journalctl failed")
+    else:
+        sf = o.get("ssh_failures") or 0
+        c["ssh_failures"] = (sf <= int(cfg["SSH_FAILURES"]), "%d ssh auth failures since last check" % sf)
+    if "egress" in failed:
+        c["egress_drops"] = (None, "refused outbound unknown: journalctl failed")
+    else:
+        ed = o.get("egress_drops") or 0
+        c["egress_drops"] = (ed <= int(cfg["EGRESS_DROPS"]), "%d refused outbound packets since last check" % ed)
+    if "ssh-accepted" in failed:
+        c["ssh_unexpected"] = (None, "ssh sources unknown: journalctl failed")
+    else:
+        # The count leaves the box; the addresses stay in the log on it.
+        unexpected = unexpected_sources(o, cfg)
+        c["ssh_unexpected"] = (not unexpected, "ssh accepted from %d source%s not in SSH_KNOWN_SOURCES"
+                               % (len(unexpected), "" if len(unexpected) == 1 else "s"))
+    err, anchors, ah = o.get("receipts_error"), o.get("anchors"), o.get("anchor_age_h")
+    if err:
+        c["anchor_age"] = (None, "anchor age unknown: receipts %s" % err)
+    elif anchors is None:
+        c["anchor_age"] = (None, "anchor age unknown: receipts not observed")
+    elif not anchors or ah is None:
+        c["anchor_age"] = (None, "anchor age unknown: no receipt yet")
+    else:
+        c["anchor_age"] = (ah <= float(cfg["ANCHOR_MAX_H"]), "last anchor %.0fh ago" % ah)
     kr, kn = o.get("kernel_running"), o.get("kernel_newest")
     if o.get("reboot_required_file"):
         c["reboot_wanted"] = (False, "reboot wanted: /run/reboot-required is set")
-    elif kr and kn and kr != kn:
+    elif kr is None or kn is None:
+        c["reboot_wanted"] = (None, "reboot unknown: kernel list unreadable")
+    elif kr != kn:
         c["reboot_wanted"] = (False, "reboot wanted: kernel %s installed, running %s" % (kn.split("+")[0], kr.split("+")[0]))
     else:
         c["reboot_wanted"] = (True, "")
-    ed = o.get("egress_drops") or 0
-    c["egress_drops"] = (ed <= int(cfg["EGRESS_DROPS"]), "%d refused outbound packets since last check" % ed)
     dl = o.get("dhcp_lease_left_h")
-    c["dhcp_lease"] = (dl is None or dl >= float(cfg["DHCP_MIN_H"]), "dhcp lease expires in %.1fh, renewal missed" % (dl or 0))
-    ta, tc, tw = o.get("tor_alive_lines"), o.get("tor_circuits"), o.get("tor_net_warn") or 0
+    if dl is None:
+        c["dhcp_lease"] = (None, "dhcp unknown: no lease expiry from nmcli")
+    else:
+        c["dhcp_lease"] = (dl >= float(cfg["DHCP_MIN_H"]), "dhcp lease expires in %.1fh, renewal missed" % dl)
+    ta, tc, tw = o.get("tor_alive_lines"), o.get("tor_circuits"), o.get("tor_net_warn")
     if ta is None:
-        c["tor_circuits"] = (False, "tor log unreadable")
+        c["tor_circuits"] = (None, "tor unknown: log unreadable")
     elif ta == 0:
         c["tor_circuits"] = (False, "no tor heartbeat in %sh" % cfg["TOR_HB_MAX_H"])
     elif tc == 0:
         c["tor_circuits"] = (False, "tor reports 0 circuits open")
+    elif tw is None:
+        c["tor_circuits"] = (None, "tor unknown: the warning window could not be read")
     elif tw > 0:
         c["tor_circuits"] = (False, "tor: %d no-network-activity warnings in %sm" % (tw, cfg["TOR_WARN_MIN"]))
     else:
         c["tor_circuits"] = (True, "")
-    known = [k.strip() for k in cfg.get("SSH_KNOWN_SOURCES", "").split(",") if k.strip()]
-    unexpected = [a for a in (o.get("ssh_sources") or []) if not source_known(a, known)]
-    c["ssh_unexpected"] = (not unexpected, "ssh accepted from unexpected source %s" % ",".join(unexpected))
     bp = o.get("btc_peers")
-    c["btc_peers"] = (bp is not None and bp >= int(cfg["BTC_MIN_PEERS"]), "%s bitcoind peers established" % bp)
+    if bp is None:
+        c["btc_peers"] = (None, "bitcoind peers unknown: ss failed")
+    else:
+        c["btc_peers"] = (bp >= int(cfg["BTC_MIN_PEERS"]), "%s bitcoind peers established" % bp)
     return c
 
 
@@ -494,11 +629,17 @@ def decide(state, checks, now, cfg):
     active = active_checks(cfg)
     name = box_name(cfg)
     delivered = set(s["delivered"])
-    joined, left = [], []
+    joined, left, suspended = [], [], []
     for check in active:
         ok, detail = checks.get(check, (True, ""))
+        owner = OWNED_BY.get(check)
+        if ok is None and owner and checks.get(owner, (True, ""))[0] is not True:
+            # Unknown because the owner failed: the owner's alarm speaks for
+            # it; nothing here moves until it has a verdict of its own.
+            suspended.append(check)
+            continue
         need = 1 if check in BURST_CHECKS else confirm
-        if ok:
+        if ok is True:
             s["fail_runs"][check] = 0
             s["ok_runs"][check] = s["ok_runs"].get(check, 0) + 1
             if check in delivered and s["ok_runs"][check] >= need:
@@ -512,14 +653,20 @@ def decide(state, checks, now, cfg):
                 delivered.add(check)
                 joined.append(check)
     msgs = []
-    still = [n for n in active if n in delivered and n not in joined]
+    still = [n for n in active if n in delivered and n not in joined and n not in suspended]
     if joined:
         what = "; ".join(checks[n][1] for n in joined)
-        rest = "; ".join(checks[n][1] for n in still) if still else "none"
+        rest = "; ".join(checks[n][1] if checks[n][0] is not True else "%s recovering" % n for n in still) if still else "none"
         msgs.append("%s DEGRADED: %s | still: %s" % (name, what, rest))
     if left and not delivered:
         dur = max(now - s["since"].get(n, now) for n in left)
-        msgs.append("%s RECOVERED: all %d checks ok (was: %s; %s)" % (name, len(active), ", ".join(left), fmt_dur(dur)))
+        not_clear = [n for n in active if checks.get(n, (True, ""))[0] is not True]
+        if not_clear:
+            # The alarm set emptied, and that is said; "all ok" is not, because it is not so.
+            msgs.append("%s RECOVERED: %s ok (was failing %s); not all clear: %s" % (
+                name, ", ".join(left), fmt_dur(dur), "; ".join(checks[n][1] for n in not_clear)))
+        else:
+            msgs.append("%s RECOVERED: all %d checks ok (was: %s; %s)" % (name, len(active), ", ".join(left), fmt_dur(dur)))
     for n in left:
         s["since"].pop(n, None)
     s["delivered"] = [n for n in active if n in delivered]
@@ -559,14 +706,30 @@ def fmt_dur(sec):
 
 
 def heartbeat_line(s, checks, o, cfg):
+    """One line a day, worded from this run's verdicts: `ok N/N` only when
+    every check is ok now; a failing check is named whether or not its
+    alarm has been confirmed (an unconfirmed one says so); an unknown one
+    is named as unknown. The alarm set decides notifications, never this
+    wording."""
     active = active_checks(cfg)
     name = box_name(cfg)
-    bad = [n for n in active if n in s.get("delivered", [])]
-    head = "%s heartbeat: ok %d/%d" % (name, len(active), len(active)) if not bad else \
-        "%s heartbeat: still degraded: " % name + "; ".join(checks[n][1] for n in bad)
+    delivered = set(s.get("delivered", []))
+    failed = [n for n in active if checks[n][0] is False]
+    unknown = [n for n in active if checks[n][0] is None]
+    if not failed and not unknown:
+        head = "%s heartbeat: ok %d/%d" % (name, len(active), len(active))
+    else:
+        parts = []
+        if failed:
+            parts.append("degraded: " + "; ".join(checks[n][1] + ("" if n in delivered else " (not yet alarmed)") for n in failed))
+        if unknown:
+            parts.append("unknown: " + ", ".join(unknown))
+        head = "%s heartbeat: " % name + " | ".join(parts)
     disk = o.get("disk") or {}
-    vit = "disk %s%% boot %s%% temp %sC mem %sMB" % (disk.get("/", "?"), disk.get("/boot/firmware", "?"),
-                                                    o.get("temp_c", "?"), o.get("mem_avail_mb", "?"))
+    vit = "disk %s%%" % disk.get(cfg.get("DISK_ROOT") or "/", "?")
+    if cfg.get("DISK_BOOT"):
+        vit += " boot %s%%" % disk.get(cfg["DISK_BOOT"], "?")
+    vit += " temp %sC mem %sMB" % (o.get("temp_c", "?"), o.get("mem_avail_mb", "?"))
     anch = "anchors %s, last %s ago" % (o.get("anchors", "?"), fmt_dur((o.get("anchor_age_h") or 0) * 3600))
     cal = o.get("calendar") if isinstance(o.get("calendar"), dict) else None
     if cal is not None:
@@ -577,13 +740,19 @@ def heartbeat_line(s, checks, o, cfg):
     return " | ".join([head, vit, anch, upd, drops, up])
 
 
-def status_line(now, s, checks, cfg):
+def status_line(now, s, checks, cfg, queued=0):
+    """One line: the time, ok|unknown|degraded, ok-count/active, then each
+    failed and each unknown check with its detail, then queued=N while
+    messages wait for delivery."""
     active = active_checks(cfg)
-    bad = [n for n in active if not checks[n][0]]
-    word = "degraded" if bad else "ok"
+    failed = [n for n in active if checks[n][0] is False]
+    unknown = [n for n in active if checks[n][0] is None]
+    word = "degraded" if failed else ("unknown" if unknown else "ok")
     ts = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return "%s %s %d/%d%s" % (ts, word, len(active) - len(bad), len(active),
-                              "".join(" %s=%s" % (n, checks[n][1].replace(" ", "_")) for n in bad))
+    parts = "".join(" %s=%s" % (n, checks[n][1].replace(" ", "_")) for n in failed + unknown)
+    if queued:
+        parts += " queued=%d" % queued
+    return "%s %s %d/%d%s" % (ts, word, len(active) - len(failed) - len(unknown), len(active), parts)
 
 
 # ----------------------------------------------------------------------------- send + main
@@ -659,12 +828,12 @@ def load_outbox(cfg=None):
     except FileNotFoundError:
         return []
     except OSError as exc:
-        raise OutboxUnreadable("%s: %r" % (path, exc))
+        raise OutboxUnreadable(type(exc).__name__)
     try:
         data = json.loads(raw.decode("utf-8"))
-        if not isinstance(data, list) or not all(isinstance(m, dict) and isinstance(m.get("text"), str) for m in data):
+        if not valid_messages(data):
             raise ValueError("not a list of messages")
-    except ValueError as exc:
+    except (ValueError, UnicodeDecodeError) as exc:
         import hashlib
         aside = "%s.corrupt-%s" % (path, hashlib.sha256(raw).hexdigest()[:12])
         write_bytes_atomic(aside, raw, mode=0o600)
@@ -672,11 +841,125 @@ def load_outbox(cfg=None):
         notice = [{"text": "%s WATCHER: outbox.json could not be read (%s); %d bytes set aside as %s; alerts "
                            "queued before this run may not have been delivered"
                            % (name, exc, len(raw), os.path.basename(aside)),
-                   "queued": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}]
+                   "queued": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "notice": True}]
         write_json_atomic(path, notice)     # one rename: the corrupt file leaves as the notice lands
         log("outbox unreadable (%s); %d bytes set aside as %s; the notice is queued" % (exc, len(raw), os.path.basename(aside)))
         return notice
     return data
+
+
+class StateUnreadable(Exception):
+    """The state file exists and could not be read: the run must not go on"""
+
+
+def valid_messages(data):
+    """A list of messages, each with the two fields delivery relies on"""
+    return isinstance(data, list) and all(
+        isinstance(m, dict) and isinstance(m.get("text"), str) and isinstance(m.get("queued"), str) for m in data)
+
+
+def _count(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def valid_state(data):
+    """A state object whose fields, where present, are what the run relies
+    on: a list of check names delivered; run counters by check; `since`
+    times by check; a heartbeat day; the drop accumulator; the cursors;
+    the owed queue as a list of messages. Older states may lack any of
+    them; a field of the wrong shape makes the file corrupt, and it is set
+    aside rather than half read."""
+    if not isinstance(data, dict):
+        return False
+    if not isinstance(data.get("delivered", []), list) or not all(isinstance(n, str) for n in data.get("delivered", [])):
+        return False
+    for key in ("fail_runs", "ok_runs"):
+        runs = data.get(key, {})
+        if not isinstance(runs, dict) or not all(isinstance(k, str) and _count(v) for k, v in runs.items()):
+            return False
+    since = data.get("since", {})
+    if not isinstance(since, dict) or not all(isinstance(k, str) and isinstance(t, (int, float)) and not isinstance(t, bool)
+                                              for k, t in since.items()):
+        return False
+    if "heartbeat_day" in data and not isinstance(data["heartbeat_day"], str):
+        return False
+    if not _count(data.get("drops_acc", 0)):
+        return False
+    cursors = data.get("cursors", {})
+    if not isinstance(cursors, dict):
+        return False
+    if "journal" in cursors and (isinstance(cursors["journal"], bool) or not isinstance(cursors["journal"], (int, float))):
+        return False
+    if data.get("owed") is not None and not valid_messages(data["owed"]):
+        return False
+    return True
+
+
+def load_state(cfg, aside=True):
+    """(state, notices). Missing: a fresh state. Unreadable (any error but
+    absence): StateUnreadable, and the run does nothing. Bytes that are
+    not a state object, or an object whose fields are not what the run
+    relies on (valid_state): set aside as state.json.corrupt-<12 hex of
+    their sha256> (the aside copy first, its name from the bytes, so a
+    repeat writes the same file), and the run goes on from a fresh state
+    with one notice to queue that says what the fresh state cannot know:
+    the checks that were failing (they will alarm again once), the
+    journal since the last good run (not read again) and any messages
+    the old state still owed. The corrupt file itself is replaced when
+    the run commits; a stop before that leaves it to be found and set
+    aside again, under the same name. With aside=False (a dry run)
+    nothing is written: the log says what a real run would do."""
+    try:
+        with open(STATE, "rb") as fd:
+            raw = fd.read()
+    except FileNotFoundError:
+        return {}, []
+    except OSError as exc:
+        raise StateUnreadable(type(exc).__name__)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        if not valid_state(data):
+            raise ValueError("not a state object with the fields the run relies on")
+    except (ValueError, UnicodeDecodeError) as exc:
+        import hashlib
+        aside_name = "%s.corrupt-%s" % (os.path.basename(STATE), hashlib.sha256(raw).hexdigest()[:12])
+        if not aside:
+            log("state unreadable (%s); a real run would set %d bytes aside as %s and queue a notice" % (exc, len(raw), aside_name))
+            return {}, []
+        write_bytes_atomic(os.path.join(os.path.dirname(STATE), aside_name), raw, mode=0o600)
+        text = ("%s WATCHER: state.json could not be read (%s); %d bytes set aside as %s; starting afresh: checks "
+                "failing now will alarm again once, the journal since the last good run was not read, and any "
+                "alert the old state still owed is in the aside file only"
+                % (box_name(cfg), exc, len(raw), aside_name))
+        log("state unreadable (%s); %d bytes set aside as %s; starting afresh" % (exc, len(raw), aside_name))
+        return {}, [text]
+    return data, []
+
+
+def enqueue(queue, new, cfg, stamp):
+    """The queue with this run's messages appended, then the bound: the
+    queue keeps OUTBOX_MAX entries, the oldest are dropped beyond that,
+    and the drop is itself the first message in line, a notice that says
+    how many were dropped and when they were queued, folded into the
+    notice already at the head when there is one. Returns (queue, number
+    dropped this time). The result is what the record holds, so a replay
+    copies the decision instead of making it again."""
+    queue = list(queue) + list(new)
+    dropped = 0
+    if len(queue) > OUTBOX_MAX:
+        notice = queue[0] if queue[0].get("cap") else None
+        rest = queue[1:] if notice else queue
+        keep = OUTBOX_MAX - 1
+        lost, rest = rest[:len(rest) - keep], rest[len(rest) - keep:]
+        dropped = len(lost)
+        total = (notice or {}).get("dropped", 0) + dropped
+        first = (notice or {}).get("first") or lost[0].get("queued", "")
+        last = lost[-1].get("queued", "")
+        notice = {"cap": True, "dropped": total, "first": first, "last": last, "queued": stamp,
+                  "text": "%s WATCHER: outbox over %d: %d oldest alerts dropped (queued %s to %s); their text is lost"
+                          % (box_name(cfg), OUTBOX_MAX, total, first, last)}
+        queue = [notice] + rest
+    return queue, dropped
 
 
 def real_run(dry):
@@ -692,15 +975,36 @@ def real_run(dry):
 
 def _run_locked(cfg, dry):
     now = time.time()
-    state = {}
-    if os.path.exists(STATE):
-        with open(STATE) as fd:
-            state = json.load(fd)
+    try:
+        state, notices = load_state(cfg, aside=not dry)
+    except StateUnreadable as exc:
+        log("state unreadable (%s); nothing done, exit 1" % exc)
+        return 1
+    queue = None
+    if cfg.get("NTFY_URL") and not dry:
+        # Read before anything is observed: an outbox that cannot be read
+        # ends the run with nothing done.
+        try:
+            loaded = load_outbox(cfg)
+        except OutboxUnreadable as exc:
+            log("outbox unreadable (%s); nothing done, exit 1" % exc)
+            return 1
+        owed = state.get("owed")
+        if owed is not None:
+            # A run stopped between its record and the outbox: the record
+            # is the queue. What the outbox holds is that queue or older;
+            # only a recovery notice the loader just made is carried over.
+            queue = list(owed) + [m for m in loaded if m.get("notice") and m not in owed]
+        else:
+            queue = loaded
     cursors = state.get("cursors", {})
     utc = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    stamp = utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     want_updates = state.get("heartbeat_day") != utc.strftime("%Y-%m-%d") and utc.hour >= int(cfg["HEARTBEAT_HOUR"])
     o = observe(cfg, now, cursors, want_updates=want_updates or dry)
     checks = evaluate(o, cfg)
+    for addr in unexpected_sources(o, cfg):
+        log("ssh accepted from %s (not in SSH_KNOWN_SOURCES)" % addr)   # the log keeps the address; the message counts
     acc = int(state.get("drops_acc", 0)) + int(o.get("egress_drops") or 0)
     new_state, msgs = decide(state, checks, now, cfg)
     if new_state.pop("heartbeat_pending", False):
@@ -708,47 +1012,60 @@ def _run_locked(cfg, dry):
         msgs.append(heartbeat_line(new_state, checks, o, cfg))
         acc = 0
     new_state["drops_acc"] = acc
-    line = status_line(now, new_state, checks, cfg)
-    write_text_atomic(STATUS, line + "\n")
-    log(line)
+    msgs = notices + msgs
+    new = [{"text": m, "queued": stamp} for m in msgs]
+
+    def commit(st, owed):
+        # The cursor moves past the window only when every journal query
+        # read it; a failed read keeps the earliest unread cursor. `owed`
+        # is the outbox as it must be, or None when the outbox has it.
+        st["cursors"] = {"journal": o["journal_since"] if o.get("journal_failed") else now}
+        if owed is None:
+            st.pop("owed", None)
+        else:
+            st["owed"] = owed
+        write_json_atomic(STATE, st)
+
     if dry:
+        write_text_atomic(STATUS, status_line(now, new_state, checks, cfg, queued=len(new)) + "\n")
+        log(status_line(now, new_state, checks, cfg, queued=len(new)))
         for m in msgs:
             log("WOULD SEND: " + m)
         return 0
-
-    def commit(st):
-        # The cursor moves past the window only when every journal query
-        # read it; a failed read keeps the earliest unread cursor.
-        st["cursors"] = {"journal": o["journal_since"] if o.get("journal_failed") else now}
-        write_json_atomic(STATE, st)
-
     if not cfg.get("NTFY_URL"):
-        # Status-only mode: nothing to deliver to, so nothing is queued;
-        # the state records the transition and the log carries the text.
+        # Status-only mode: nothing to deliver to, so nothing is owed; the
+        # state records the transition and the log carries the text.
+        write_text_atomic(STATUS, status_line(now, new_state, checks, cfg) + "\n")
+        log(status_line(now, new_state, checks, cfg))
         for m in msgs:
             log("NOT SENT (no NTFY_URL): " + m)
-        commit(new_state)
+        commit(new_state, None)
         return 0
 
-    # The burst goes to disk before the cursor moves past it.
+    prepared, dropped = enqueue(queue, new, cfg, stamp)
+    if dropped:
+        log("outbox over %d messages: %d oldest dropped; the notice at the head says so" % (OUTBOX_MAX, dropped))
+    line = status_line(now, new_state, checks, cfg, queued=len(prepared))
+    write_text_atomic(STATUS, line + "\n")
+    log(line)
+    # The record, in one write: the transition, the cursor and the outbox
+    # as it must now be. From here every message in it is queued, once,
+    # whatever happens next; before here nothing happened.
+    commit(new_state, prepared)
     try:
-        queue = load_outbox(cfg)
-    except OutboxUnreadable as exc:
-        log("outbox unreadable: %s; nothing sent, state kept, exit 1" % exc)
-        return 1
-    queue = queue + [{"text": m, "queued": utc.strftime("%Y-%m-%dT%H:%M:%SZ")} for m in msgs]
-    if len(queue) > OUTBOX_MAX:
-        log("outbox over %d messages; dropping the oldest %d" % (OUTBOX_MAX, len(queue) - OUTBOX_MAX))
-        queue = queue[-OUTBOX_MAX:]
-    try:
-        write_json_atomic(outbox_path(), queue)
+        write_json_atomic(outbox_path(), prepared)
         persisted = True
     except OSError as e:
-        log("outbox write failed: %r; the cursor will not advance unless everything is delivered" % (e,))
+        log("outbox write failed: %r; the record holds the queue and the next run writes it" % (e,))
         persisted = False
     if persisted:
-        commit(new_state)
+        try:
+            commit(new_state, None)          # the outbox has it: the record no longer carries the queue
+        except OSError as e:
+            log("state write failed after the outbox: %r; nothing delivered this run, the next run copies the record again" % (e,))
+            return 1
     # Oldest first; stop at the first failure so alerts never reorder.
+    queue = list(prepared)
     while queue:
         ok, why = send(cfg, queue[0]["text"])
         if not ok:
@@ -760,14 +1077,16 @@ def _run_locked(cfg, dry):
             try:
                 write_json_atomic(outbox_path(), queue)
             except OSError as e:
-                log("outbox write failed after a delivery: %r" % (e,))
-    if not persisted:
-        if queue:
-            # Undelivered and not on disk: keep the old state and the old
-            # cursor, so the next run observes the same burst again.
-            write_json_atomic(STATE, state)
+                log("outbox write failed after a delivery: %r; that message may be sent again" % (e,))
         else:
-            commit(new_state)
+            try:
+                commit(new_state, queue if queue else None)   # the record shrinks with each delivery
+            except OSError as e:
+                log("state write failed after a delivery: %r; stopping, so no unrecorded delivery is repeated" % (e,))
+                break
+    if len(queue) != len(prepared):
+        # What is queued changed with the deliveries: the status line says so.
+        write_text_atomic(STATUS, status_line(now, new_state, checks, cfg, queued=len(queue)) + "\n")
     return 1 if queue else 0
 
 

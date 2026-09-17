@@ -93,7 +93,7 @@
    "pi5 heartbeat"
   ],
   [
-   "DEGRADED: ssh accepted from unexpected source 192.168.0.77"
+   "DEGRADED: ssh accepted from 1 source not in SSH_KNOWN_SOURCES"
   ],
   [
    "RECOVERED"

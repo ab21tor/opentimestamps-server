@@ -39,7 +39,6 @@ module's shape.
 
 import contextlib
 import datetime
-import errno
 import functools
 import hashlib
 import io
@@ -53,6 +52,7 @@ import sys
 import unittest
 from unittest import mock
 
+from otsserver.tests.faults import fail_on_call, unreadable   # shared with the watcher's tests
 from otsserver.tests.test_selfstamp import (   # the fake calendar's case class and the tool, loaded by path
     SelfstampCase, TOOL, P1, P2, P3, proof_bytes, selfstamp, sha256_hex)
 
@@ -76,22 +76,6 @@ def keys_in(value):
         for v in value:
             found |= keys_in(v)
     return found
-
-
-def unreadable(path):
-    """chmod 000, restored by the caller's cleanup (a file the tool has
-    since renamed is left alone); skipped as root, who reads anything"""
-    if os.geteuid() == 0:
-        raise unittest.SkipTest('running as root: permission faults cannot be injected')
-    mode = os.stat(path).st_mode
-
-    def restore():
-        try:
-            os.chmod(path, stat.S_IMODE(mode))
-        except FileNotFoundError:
-            pass
-    os.chmod(path, 0)
-    return restore
 
 
 class Tap:
@@ -129,25 +113,6 @@ def tapped_open(target, hook):
             return Tap(fd, hook)
         return fd
     return mock.patch.object(selfstamp, 'open', opener, create=True)
-
-
-@contextlib.contextmanager
-def fail_on_call(module_obj, name, n, exc=None):
-    """Patch module_obj.name so that its n-th call raises (the run stops
-    there); every other call goes through. Yields a record that says how
-    many calls were made and whether the n-th one happened, so a sweep can
-    tell a boundary it exercised from one it never reached."""
-    real = getattr(module_obj, name)
-    record = {'calls': 0, 'fired': False}
-
-    def wrapper(*args, **kwargs):
-        record['calls'] += 1
-        if record['calls'] == n:
-            record['fired'] = True
-            raise exc or OSError(errno.EIO, 'injected stop at %s call %d' % (name, n))
-        return real(*args, **kwargs)
-    with mock.patch.object(module_obj, name, wrapper):
-        yield record
 
 
 # --- S1: the period and the observation -------------------------------------

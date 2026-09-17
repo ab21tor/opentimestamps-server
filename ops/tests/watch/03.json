@@ -116,7 +116,7 @@
   ],
   [],
   [
-   "DEGRADED: / at 91.0% | still: feeder log stale 11m"
+   "DEGRADED: disk_root at 91.0% | still: feeder log stale 11m"
   ],
   []
  ]

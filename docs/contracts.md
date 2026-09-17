@@ -5,7 +5,8 @@ handoff, what durable evidence lets a part forget, and which records are
 authoritative. Every statement here is made by code named in the README
 section it cites; a change to any of them changes this file first
 (CONTRIBUTING.md). Written 2026-09-16 against the 2026-09-15/16 reviews;
-section 9, the self-stamp, added the same day (workflow two).
+section 9, the self-stamp (workflow two), and section 8 as the watcher's
+full contract (workflow three) added the same day.
 
 The words used throughout:
 
@@ -192,6 +193,18 @@ The same invariants in the self-stamp (section 9):
 | External effects have retry semantics | a lost submission response: the same digest again, deduped or anchored twice, never a second manifest; an upgrade answer cut short: the pending file untouched, asked again | `Test_submission_ambiguity` |
 | Time, capacity, observation | the period is a finished UTC day; `created_at` is the box's clock; missed days are gaps; a manifest names no host, path or file name | `Test_period_and_observation`, `Test_amnesia` |
 
+The same invariants in the watcher (section 8):
+
+| Invariant | Where it holds in the watcher | Where it is checked |
+|---|---|---|
+| Conservation of obligations | a message is owed from the record on and stays in the state until the outbox holds it, in the outbox until ntfy took it; the cap's drop is itself a message | `test_watch_observation.Test_recording_boundaries`, `Test_delivery_and_cap` |
+| Ambiguity is a state | a source that cannot be read is an unknown verdict, named in the status line and the heartbeat, never ok; a corrupt state is a notice, not a silent fresh start | `Test_unknown_is_a_state`, `Test_state_recovery` |
+| Recovery is interruptible | the record is one rename; the owed list is copied once whatever run does it; the two quarantines copy aside first | `Test_recording_boundaries`, `Test_state_recovery`, `test_watch.Test_outbox_recovery_interrupted` |
+| Concurrency preserves decisions | one run at a time, the loser observing nothing | `Test_two_runs`, `test_watch.Test_run_lock` |
+| Safety includes progress | one unreadable source never stops the run; an undeliverable message never blocks observation | `Test_unknown_is_a_state.test_an_unknown_check_never_stops_the_run`, `Test_delivery_and_cap` |
+| External effects have retry semantics | delivery is at least once, in order, from a durable queue | `Test_delivery_and_cap`, `test_watch.Test_outbox` |
+| Time, capacity, observation | the journal cursor moves only in the write that records the burst; the heartbeat is once a day and its absence is the outside's to see; the queue's bound is named | `Test_recording_boundaries`, `Test_heartbeat`, `Test_delivery_and_cap` |
+
 ## 6. The proof parser: three claims kept apart
 
 The tools under `ops/` (`selfstamp.py`, `verify_claim.py`) and the client
@@ -254,42 +267,207 @@ Files that several runs may write are always written under a unique
 temporary name in the same directory, fsynced, renamed, and the directory
 fsynced.
 
-## 8. Pulled forward: the watcher run (`ops/watch.py`)
+## 8. Workflow 3: the watcher (`ops/watch.py`)
 
-The watcher's full observation contract is the next sittings' work; the
-three transitions the 2026-09-15/16 review touched are written now.
+Written 2026-09-16 (workflow three), on the three tables the 2026-09-15/16
+review left here. The words used:
 
-### W1. One run: observe, decide, persist, deliver
+- **Check**: one named question about the box (`ORDER`), asked every run;
+  a check whose knob is empty is not asked and not counted.
+- **Verdict**: what a check says this run: **ok** (True), **failed**
+  (False) or **unknown** (None: the source could not be read or gave no
+  answer). Unknown is never ok.
+- **Owner**: the check whose failure is the reason another check is
+  unknown (`OWNED_BY`: `health` behind `health_reach`, the four journal
+  counts behind `journal_read`). While the owner fails the owned check is
+  *suspended*.
+- **Transition**: a check entering the delivered set (DEGRADED) or the set
+  emptying (RECOVERED). The **delivered set** is the checks whose alarm
+  transition has been recorded and not yet undone; the name is the
+  state's. It says a message was decided and queued, not that the
+  operator received it: receipt is the outbox's business, at least once.
+- **Burst check**: a check about a window of the journal
+  (`BURST_CHECKS`): it alarms on the run it is seen and clears on the
+  next; every other check needs `CONFIRM_RUNS` runs both ways (the
+  flapping guard).
+- **Cursor**: the journal time the next run reads from.
+- **Owed**: the outbox as it must now be, recorded in the state (with
+  this run's messages appended and the cap applied) before it is copied
+  to the outbox; absent once the outbox has it.
+- **Heartbeat**: the one message a day that says the box is there.
+
+### Records
+
+| Record | Kind | Authoritative for | Loss or damage |
+|---|---|---|---|
+| `state.json` | authoritative | the delivered set, the per-check run counters and `since` times, the heartbeat day, the egress-drop accumulator, the cursor, and, while the outbox has not been brought into line, the queue owed (the outbox as it must be) | missing: a fresh start (checks failing now alarm once, the journal is read from five minutes back); unreadable: the run does nothing, exit 1; not a state object, or one whose fields are not what the run relies on: set aside as `state.json.corrupt-<12 hex>`, a fresh start with a notice (W8) |
+| `outbox.json` | the delivery queue | the queue as last recorded, less what has been delivered since, oldest first | missing: empty; unreadable: the run does nothing, exit 1; not a list of messages with the two fields delivery needs: set aside, a notice queued (W2) |
+| `status` | derived | one line: the time, ok/unknown/degraded, the counts, each failed and unknown check, what is queued | rewritten every run; nothing reads it back |
+| `.lock` | coordination | one run at a time | goes with the descriptor |
+| `watch.log` | diagnostic | the run's account, the addresses of unexpected logins, what was sent and not | nothing is derived from it |
+| `state.json.corrupt-<12 hex>`, `outbox.json.corrupt-<12 hex>` | quarantine | bytes that could not be used | the operator's |
+
+### Who owns unfinished work
+
+| Handoff | Before | After | Owner in between | Evidence that lets the previous owner forget |
+|---|---|---|---|---|
+| timer → run | a tick | the lock held | nobody: a tick that finds the lock held exits 1 having observed nothing, and the window it did not read is read by the next run because the cursor did not move | none needed |
+| source → observation | files, commands, two HTTP answers | the observation dict, each source's failure marked | the run; a source that cannot be read is an unknown, not an answer | none: observations are made again every run |
+| observation → verdict → transition | the dict | `decide`'s new state and messages, in memory | the run | none yet |
+| transition → record | memory | `state.json` renamed into place with the delivered set, the cursor and the queue owed (the outbox as it must be, this run's messages appended and the cap applied) | the run until the rename; nothing before it is anybody's | the file: from here the transition happened once and every message in the recorded queue is queued once |
+| owed → outbox | `owed` in the state | `outbox.json` holding that queue, the state rewritten without it | the state: a stop leaves the queue owed, and the next run copies it over the outbox, discards and order included | the second state write |
+| outbox → operator | a message in the outbox | a 200 from ntfy, the outbox rewritten without it | the outbox; at least once | the rewrite |
+| the day → the heartbeat | a day begun | `heartbeat_day` in the state, the line owed | the run; a stop before the record makes the next run send it | the record |
+
+### W1. One run: observe, decide, record, queue, deliver
 
 | | |
 |---|---|
-| Authoritative state | `state.json` (the delivered set, the fail/ok run counts, the journal cursor); `outbox.json` (messages owed) |
-| Preconditions | the whole-run lock on `WATCH_DIR/.lock` is held (a second run waits up to `LOCK_WAIT`, then exits 1 `locked`, nothing written) |
-| Side effects, in order | (1) observe, every journalctl failure recorded; (2) evaluate and decide; (3) `status` written; (4) the outbox loaded (W2); (5) this run's messages appended and the outbox written atomically; (6) `state.json` written with the cursor: the run's start time if every journal query succeeded, else the cursor the run read from; (7) deliver oldest first, rewriting the outbox after each delivery, stopping at the first failure; exit 1 while anything is undelivered |
-| Acknowledgement point | (5): a message is owed from the moment it is on disk |
-| Ambiguous outcomes | a stop between (5) and (6): the messages are on disk and the cursor has not moved, so the next run observes the window again and may queue the same burst twice (at-least-once, by design); a stop during (7): delivered messages not yet removed are sent again; the outbox unwritable at (5): the run still tries to send, and the cursor moves only if everything was delivered |
-| Recovery | the next run: same lock, same reads; nothing here is lost by a stop, and a burst is never consumed before it is on disk |
-| Tests | `test_watch.Test_outbox`, `Test_observation_failure`, `Test_run_lock` |
+| Authoritative record | `state.json` (W8); `outbox.json` (W2) for delivery |
+| Preconditions | the whole-run lock on `WATCH_DIR/.lock` (a second run waits up to `LOCK_WAIT`, then exits 1 `locked`, having observed nothing); the state read (W8) and, with `NTFY_URL` set, the outbox read (W2), both before anything is observed: a file that cannot be read ends the run with nothing done |
+| Side effects, in order | (1) observe: every source once, each failure marked (W4); (2) evaluate and decide (W5), the heartbeat line if due (W7); (3) the queue prepared: the queue as loaded (or, when the state still owes one, the recorded queue) with this run's messages appended and the cap applied (W6); `status` written with its length; (4) **the record**: `state.json` written once with the new delivered set and counters, the cursor (the run's start if every journal query succeeded, else the cursor it read from: W3) and the prepared queue under `owed`; (5) that queue written to the outbox; (6) `state.json` rewritten without `owed`; (7) delivery oldest first, the outbox rewritten after each, stopping at the first failure; (8) the status rewritten with what is still queued when that changed; exit 1 while anything is undelivered. With `NTFY_URL` empty: `status`, (4) with nothing owed, the messages in the log. With `--dry`: (1)–(2), `status`, the messages in the log as `WOULD SEND`, nothing else written and nothing set aside |
+| Visibility point | each rename: the status at (3), the record at (4), the queue at (5). A file is visible from its rename and durable from the directory fsync that follows; an fsync that fails raises after the rename, and the run stops there with the file visible and its durability not known: the next run takes what it finds |
+| Acknowledgement point | (4): one rename. Before it nothing was recorded: a stop leaves no transition, the cursor does not move, and the next run observes afresh and reads the journal window again; a transient condition seen only by the stopped run may have passed, in which case there was nothing to record. After it the transition is recorded and every message in the recorded queue is queued exactly once, whatever happens next (2026-09-16 workflow three: the record used to be two writes, the outbox then the state, and a stop between them left the message on disk and the transition unrecorded, so the next run queued it again) |
+| Ambiguous outcomes | a stop between (4) and (5): the queue is owed and the outbox is older: the next run copies the recorded queue over it; between (5) and (6): owed and queued alike: the next run copies the same queue again, and nothing is added or dropped a second time (the cap decision is part of the record; 2026-09-16 gate review: a replay used to re-append the discarded messages and drop newer ones); during (7): a message delivered and not yet removed is sent again (at least once, by design); (5) fails (the outbox cannot be written): the queue stays owed, the run still delivers from it directly and rewrites the record after each success, and stops delivering when that rewrite fails so no unrecorded delivery is repeated; (6) fails: nothing is delivered this run, and the next run copies the record again |
+| Recovery | the next run: same lock, same reads; nothing recorded is lost by a stop, nothing is alarmed twice for one transition, and a message discarded by the cap does not come back |
+| Postconditions tested | `test_watch.Test_outbox`, `Test_observation_failure`, `Test_run_lock`; `test_watch_observation.Test_recording_boundaries` (a stop before the record, after it, after the outbox write, by injection and by a child killed), `Test_delivery_and_cap`, `Test_two_runs` |
 
 ### W2. Loading the outbox, and its recovery
 
 | | |
 |---|---|
-| Authoritative state | `outbox.json` |
-| Preconditions | the lock is held |
-| Outcomes | missing: an empty queue; readable and a list of messages: the queue; unreadable (any error but absence): `OutboxUnreadable`, the run ends with exit 1 and touches nothing; readable but not a list of messages: the recovery below |
+| Authoritative record | `outbox.json` |
+| Preconditions | the lock is held; read before anything is observed |
+| Outcomes | missing: an empty queue; readable and a list of messages, each with a `text` and a `queued` string: the queue; unreadable (any error but absence): `OutboxUnreadable`, the run ends with exit 1 having done nothing (the message names the error class, not the path); readable but anything else, a field of the wrong shape included: the recovery below (2026-09-16 gate review: a message whose `queued` was a list used to stop every run) |
 | Recovery, in order | (a) the bytes are copied aside as `outbox.json.corrupt-<12 hex of their sha256>`, atomically; (b) a queue holding one notice (the box name, the reason, the byte count, the aside file's name) replaces the corrupt file in one atomic rename |
 | Ambiguous outcomes | a stop before (b): the corrupt file is still in place and the next run repeats (a) and (b); the same bytes give the same aside name, so no second copy; a stop after (b): the notice is on disk and owed; at no point is the corrupt file gone while the notice exists only in memory |
 | What it does not do | the messages the corrupt bytes held are not recovered; the notice says they may not have been delivered, and the bytes are kept for the operator |
 | Tests | `test_watch.Test_outbox_read_failure`, `Test_outbox_recovery_interrupted` |
 
-### W3. Observation failure
+### W3. Observation failure: the journal
 
 | | |
 |---|---|
-| Authoritative state | the journal cursor in `state.json` |
-| Rule | a `journalctl` call that exits nonzero (or times out) reads as no lines and is recorded; `journal_read` is then a failed check (two-run confirmation like the others), and the cursor written at W1 (6) is the one the run read from, so the window is read again next run until every query succeeds. Burst counts from a run with a failed query are not trusted for the cursor; a burst seen by a succeeding query in such a run may be counted again next run, the safe direction. |
-| Tests | `test_watch.Test_observation_failure` |
+| Authoritative record | the journal cursor in `state.json` |
+| Rule | a `journalctl` call that exits nonzero (or times out) reads as no lines and is recorded by label; `journal_read` is then a failed check (two-run confirmation like the others), and the cursor written at W1 (4) is the one the run read from, so the window is read again next run until every query succeeds. The four checks that count that window (`journal_errors`, `ssh_failures`, `egress_drops`, `ssh_unexpected`) are unknown when their query failed and suspended behind `journal_read` (W5): they neither read as ok (2026-09-16 workflow three: they used to count zero) nor alarm on their own. A burst seen by a succeeding query in such a run may be counted again next run, the safe direction. |
+| Tests | `test_watch.Test_observation_failure`; `test_watch_observation.Test_unknown_is_a_state`, `Test_decide_with_unknown` |
+
+### W4. The observations, check by check
+
+Every check is an observation with three answers. The source is read
+once per run; a source that cannot be read, decoded or parsed, or that
+answers in a shape the check does not expect, marks the observation (a
+`None`, an error class, a failed label) and `evaluate` turns the mark
+into unknown, never into ok, and never into an exception: one bad source
+stops nothing else (2026-09-16 gate review: invalid UTF-8 in the
+heartbeat or the receipts, and a JSON list from `/health`, used to stop
+the run). A positive verdict needs the fields it is about: a fresh file
+without them is unknown. Every check's failed and unknown answers are
+shown in the status line and the heartbeat; unknown alarms like failed
+after the same runs (W5), except where an owner speaks for it.
+
+| Check | Source | ok | failed | unknown | Owner | Runs |
+|---|---|---|---|---|---|---|
+| `health_reach` | `GET HEALTH_URL` | an answer with a body (200 or 503) | no answer | — | — | 2 |
+| `health` | that body | `status` ok | `status` not ok, the failing fields quoted | `/health` unreachable; a body that is not JSON or not an object | `health_reach` (unreachable only) | 2 |
+| `calendar` | `GET CALENDAR_URL/`, `Accept: application/json` | `best_block` set, `needs_attention` empty, `anchor_receipts` on, balance ≥ `CAL_MIN_SATS` | no answer; Bitcoin-blind; needs attention (the detector's text quoted); receipts off; wallet low | the body is not an object; the balance cannot be read | — | 2 |
+| `containers` | `docker ps` | every configured container `Up` | one is not | `docker ps` failed | — | 2 |
+| `units_system`, `units_user` | `systemctl is-active` per unit | `active` | any other state systemd names | an answer systemd does not give (the command failed) | — | 2 |
+| `disk_root`, `disk_boot` | `statvfs` of the mount | under `DISK_PCT` | at or over (the detail names the role and the figure, never the mount: it is configuration) | `statvfs` failed | — | 2; an empty knob skips |
+| `temp` | `/sys/class/thermal/thermal_zone0/temp` | under `TEMP_C` | at or over | no reading | — | 2; an empty `TEMP_C` skips |
+| `mem` | `/proc/meminfo` `MemAvailable` | at least `MEM_MB` | less | unreadable | — | 2; an empty `MEM_MB` skips |
+| `feeder` | `FEEDER_LOG` mtime and tail | fresh, and the tail's poll lines not all errors | missing; stale; errors | unreadable; the tail failed; no poll line in the tail | — | 2 |
+| `endpoint` | `ENDPOINT_HEARTBEAT` mtime and content | fresh, `breaker=ok` | missing; stale; breaker not ok | unreadable; not UTF-8; fresh but without a `breaker` field | — | 2 |
+| `journal_errors` | `journalctl -p err` since the cursor, system and user | at most `JOURNAL_ERRORS` | more | the query failed | `journal_read` | burst |
+| `ssh_failures` | `journalctl -u ssh` since the cursor, failures | at most `SSH_FAILURES` | more | the query failed | `journal_read` | burst |
+| `journal_read` | every `journalctl` query of the run | all succeeded | one failed (named; the window is kept) | — | — | 2 |
+| `anchor_age` | the last line of `RECEIPTS` | `confirmed_at` within `ANCHOR_MAX_H` | older | file missing; unreadable; not UTF-8 or not JSON lines; no receipt yet (a new host, until its first anchor) | — | 2 |
+| `reboot_wanted` | `/run/reboot-required`; `/lib/modules` against `uname` | no file, newest kernel running | the file is set; a newer kernel installed | the module list unreadable | — | 2 |
+| `egress_drops` | `journalctl -k` `egress-drop` since the cursor | at most `EGRESS_DROPS` | more | the query failed | `journal_read` | burst |
+| `dhcp_lease` | `nmcli` `DHCP4.OPTION` expiry | at least `DHCP_MIN_H` left | less | no expiry from `nmcli` | — | 2 |
+| `tor_circuits` | `docker logs` of `TOR_CONTAINER`, twice | a heartbeat with circuits, no no-network warnings | no heartbeat; zero circuits; warnings | the log unreadable; the warning-window query failed | — | 2 |
+| `btc_peers` | `ss` established to `BTC_P2P_PORT` | at least `BTC_MIN_PEERS` | fewer | `ss` failed | — | 2 |
+| `ssh_unexpected` | `journalctl -u ssh` accepted logins since the cursor | every source in `SSH_KNOWN_SOURCES` | one is not: the message carries the count, the log on the box the address | the query failed | `journal_read` | burst |
+
+Not checks, carried by the heartbeat only: pending package updates (`apt
+list --upgradable`, heartbeat runs and `--dry` only; `?` when the
+command fails), uptime, the egress drops since the previous heartbeat,
+the anchor wallet's balance and pending count when the calendar is
+observed. The self-stamp is observed through `selfstamp.timer` in
+`UNITS_USER` only: its summary line and its lock are not read (an
+assumption stated in "Assumptions and limits").
+
+### W5. The alarm rule
+
+| | |
+|---|---|
+| Authoritative record | `state.json`: `delivered`, `fail_runs`, `ok_runs`, `since` |
+| Preconditions | the verdicts of this run; the state as last recorded |
+| Rule | a check joins the delivered set after `CONFIRM_RUNS` failed-or-unknown runs in a row (one for a burst check) and leaves it after as many ok runs in a row; one DEGRADED message names what joined and what is still delivered (a delivered check that is ok again but not yet confirmed is named as recovering); one RECOVERED message when the set empties, naming what left and how long the oldest had been failing, and saying `all N checks ok` only when every verdict is ok now, else `not all clear:` with what is failing or unknown, unconfirmed as it may be (2026-09-16 gate review: it used to say all ok from the alarm set alone); nothing while a problem persists; a check that flaps under the confirmation never alarms. An owned check whose verdict is unknown while its owner is not ok is suspended: no counter moves, it is not `still`, and its owner's message speaks for it; it resumes with its next verdict of its own. The alarm set decides when to speak; what is said about health comes from the verdicts. |
+| What it never does | report healthy on a failed read: an unknown verdict is never counted ok, the status word is `unknown` and the check alarms or is suspended behind an alarm; collapse unknown into ok: the status line and the heartbeat name every unknown check; lose a transition across a restart: the delivered set lives in `state.json`, written in the same rename as the messages it produced (W1), and a run that stops before that rename leaves nothing, so the next run decides the same transition once; alarm twice for one transition; alarm on a one-run blip other than a burst |
+| Ambiguous outcomes | none in `decide`, which is pure; W1 names the stops around the record |
+| Postconditions tested | the 30 fixture scenarios (`test_watch.Test_fixtures`); `test_watch_observation.Test_alarm_rule` (once each way, the guard, the second failure, the reload between runs), `Test_decide_with_unknown` (unknown alarms after confirm and is worded so; an owned unknown suspended; the status words; the heartbeat's unknown list) |
+
+### W6. Delivery, at least once, and the cap
+
+| | |
+|---|---|
+| Authoritative record | `outbox.json` |
+| Rule | oldest first, one `POST` to `NTFY_URL` each, the outbox rewritten after each success, stopping at the first failure so alerts never reorder; a message whose send failed stays, the run exits 1 and the status line carries `queued=N`, and every later run tries again from the head. Delivery is at least once: a stop between a send and the rewrite sends that message again; so does an outbox that could not be written when the state could not be rewritten either. |
+| The cap | the outbox keeps `OUTBOX_MAX` (200) entries: a deliberate bound on what a long outage can accumulate. When more would be queued the oldest are dropped and the drop is itself the first message in line: a notice (`cap`) saying how many alerts were dropped and the `queued` times of the first and last, folded into the notice already at the head when there is one, so the queue is never silently shorter than what was owed (2026-09-16 workflow three: the drop used to be a log line). The decision is made once, when the queue is prepared, and recorded with the transition (W1): a replay copies it and never drops or reorders again. What the dropped alerts said is lost; the notice says so. |
+| Postconditions tested | `test_watch.Test_outbox`; `test_watch_observation.Test_delivery_and_cap` |
+
+### W7. The heartbeat
+
+| | |
+|---|---|
+| Authoritative record | `heartbeat_day` in `state.json`, written with the record (W1) |
+| Rule | one line per UTC day, on the first run at or after `HEARTBEAT_HOUR` that finds `heartbeat_day` behind; it is worded from this run's verdicts: `ok N/N` only when every check is ok now; `degraded:` with every failing check's detail, `(not yet alarmed)` after one whose alarm is not yet confirmed; `unknown:` with the unknown ones (2026-09-16 gate review: it used to say `ok` from the alarm set while a first failed observation stood); then the vitals (disk at the configured mounts by role, temperature, memory, anchors, wallet, updates, egress drops, uptime). A day the box was off gets no heartbeat and the next day's comes once; the timer's `Persistent=false` makes up no missed ticks. |
+| What it does not claim | a box that is down, powered off or cut off sends nothing, and this tool cannot say so: the heartbeat's absence is detectable only from outside the host, by whoever expects it, and no message from the box ever reports the box's own death |
+| Postconditions tested | `test_watch.Test_fixtures` (00, 06, 07, 18, 26); `test_watch_observation.Test_heartbeat`, `Test_decide_with_unknown.test_the_heartbeat_names_unknown_checks…` |
+
+### W8. The state file
+
+| | |
+|---|---|
+| Authoritative record | `state.json` |
+| Outcomes at load | missing: a fresh state; unreadable (any error but absence): `StateUnreadable`, the run does nothing and exits 1 (the message names the error class, not the path); not a JSON object, or an object whose fields are not what the run relies on (`valid_state`: `delivered` a list of names, `fail_runs` and `ok_runs` counters by name, `since` times by name, `heartbeat_day` a string, `drops_acc` a count, `cursors.journal` a number, `owed` a list of messages; a field may be absent, never of another shape): the bytes are copied aside as `state.json.corrupt-<12 hex of their sha256>` (first, a name from the bytes so a repeat writes the same file), the run goes on from a fresh state, and one notice is owed saying what a fresh state cannot know: the checks that were failing (they alarm again once), the journal since the last good run (read from five minutes back, not from where it stopped), and any alert the old state still owed, which is in the aside file only (2026-09-16 gate review: a counter of the wrong shape used to stop every run, and a malformed owed entry used to be dropped without a word). A dry run sets nothing aside: it names the problem in the log and goes on from an empty state in memory. |
+| Ambiguous outcomes | a stop after the aside copy and before the record: the corrupt file is still in place and the next run repeats the copy (same name) and the notice; the record replaces the corrupt file, so the notice is owed exactly once (2026-09-16 workflow three: a corrupt state used to stop every run with a traceback, which nothing but the heartbeat's absence would show) |
+| Postconditions tested | `test_watch_observation.Test_state_recovery` |
+
+### W9. Two runs
+
+| | |
+|---|---|
+| Rule | the lock is taken before the state is read and before anything is observed: the run that loses it observes nothing, writes nothing and exits 1 `locked`; nothing of its is lost because it made nothing, and the window it would have read is read by the next run, whose cursor is where the winner left it |
+| Postconditions tested | `test_watch.Test_run_lock` (two real processes); `test_watch_observation.Test_two_runs` (the lock held in-process, the loser's observe never called) |
+
+### Assumptions and limits
+
+- Off-box goes only what `NTFY_URL` receives: the box's `NAME` (the
+  hostname when unset: set it), the checks' details, counts. No message
+  names a path, and an unexpected login's address stays in the log on
+  the box. The ntfy topic is the operator's channel and their choice.
+- The self-stamp is watched through its timer's unit state only; its
+  summary line and its lock are not read. Reading them would need a knob
+  for its state directory, a new feature this workflow did not add.
+- Sources are read once per run; a value that changes between two reads
+  of the same run is not detected. A source that answers wrongly (a
+  container listed `Up` that is wedged) is believed.
+- A new host's `anchor_age` is unknown until its first receipt, and says
+  so; the first heartbeat carries it.
+- The heartbeat's absence is the outside's to notice; nothing here
+  reports the box's own death.
+- A stop before the record leaves nothing to recover; the next run
+  observes afresh. What survives a stop is what was recorded, and the
+  journal window is the one thing the next run can read again; a
+  condition that showed only to the stopped run may be gone.
+- Fault model: injected exceptions and stops at named calls, chmod, a
+  child killed after the record, two real processes on the lock, a
+  sender that fails. No power cut. Verified on this Mac: `observe` runs
+  for real only against files and a stubbed command runner; docker,
+  systemd, journalctl, nmcli, ss and the thermal file are exercised by the
+  fixtures and by no live command here.
 
 ## 9. Workflow 2: the self-stamp (`ops/selfstamp.py`)
 
@@ -547,6 +725,6 @@ they disclosed stays disclosed.
 
 ## 10. Not yet written
 
-The rest of the watcher's observation contract, and the restore and
-migration paths as workflows of their own, are the next sittings' work;
-they will be added here in the same shape as sections 4 and 9.
+The restore and migration paths as workflows of their own are the next
+sitting's work; they will be added here in the same shape as sections
+4, 8 and 9.

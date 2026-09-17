@@ -1,5 +1,5 @@
 {
- "name": "persisting problem: heartbeat says still degraded",
+ "name": "persisting problem: heartbeat says degraded, unconfirmed then confirmed",
  "base": {
   "health_reach": true,
   "health": {
@@ -110,14 +110,14 @@
  ],
  "expect": [
   [
-   "pi5 heartbeat: ok"
+   "pi5 heartbeat: degraded: aircraft-feeder.service=inactive (not yet alarmed)"
   ],
   [
    "DEGRADED: aircraft-feeder.service=inactive | still: none"
   ],
   [],
   [
-   "pi5 heartbeat: still degraded: aircraft-feeder.service=inactive"
+   "pi5 heartbeat: degraded: aircraft-feeder.service=inactive"
   ]
  ]
 }

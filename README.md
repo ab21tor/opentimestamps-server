@@ -963,29 +963,102 @@ every 5 minutes), standard library only, no listener. It reads the
 calendar's status line on loopback, unit and container states, files and
 the journal, writes `~/watcher/status`, `state.json` and `watch.log`, and
 alerts through ntfy (optional) on transitions only; one line a day is the
-heartbeat. Every message is written to `~/watcher/outbox.json` before
-the journal cursor moves past what produced it, delivered oldest first,
-and kept and retried by every later run until it is delivered (the run
-exits 1 while anything is undelivered; the queue keeps the newest 200
-messages and logs what it drops beyond that); with `NTFY_URL` empty
-nothing is queued and the log carries the text. Only a missing outbox
-is an empty queue: one that exists but cannot be read fails the run with
-nothing touched, and one whose bytes are not a message list is set aside
-as `outbox.json.corrupt-<12 hex of the bytes' sha256>` and reported as an alert. A `journalctl`
-call that fails is a failed check (`journal_read`) and the journal
-cursor stays where it was until every journal query succeeds, so no
-window goes unread. A run holds an exclusive lock on `WATCH_DIR` for its
-whole duration; a second run waits up to a minute, then exits 1 with
-`locked` and nothing written (2026-09-15/16 review F09, F10, F11).
-Config: `<WATCH_DIR>/config` (`ops/watch.config.example`); a
-knob left empty skips its check, so it neither fails nor counts. With the
-single-host config that is sixteen checks: the calendar's status
+heartbeat. Every step, every check and who owns the work between two
+steps is in `docs/contracts.md`, section 8.
+
+Every check has three answers: ok, failed, and unknown, which is what a
+check says when its source could not be read, decoded or parsed, gave no
+answer, or answered in a shape the check does not expect (`docker ps`
+failed, a file unreadable or not UTF-8, a `journalctl` query that did not
+run, a status or `/health` body that is not an object, a fresh adapter
+heartbeat without its `breaker` field, no thermal reading). One bad
+source stops nothing else. Unknown is never ok: the status line's word is `unknown` when nothing has failed but
+something could not be read, each unknown check is named there and in
+the heartbeat, and an unknown check alarms like a failure after the same
+two runs, worded as unknown. A check whose unknown is another check's
+doing is suspended while that check fails and the other's alarm speaks
+for it: `health` behind `health_reach`, and the four journal counts
+(journal errors, ssh failures, refused outbound, unexpected logins)
+behind `journal_read`. A box with no thermal sensor or no readable
+`/proc/meminfo` sets `TEMP_C` or `MEM_MB` empty, which skips the check
+like every other empty knob.
+
+Alerts are transitions: a check that has failed (or been unknown) on
+`CONFIRM_RUNS` runs in a row joins the delivered set and one DEGRADED
+message names it and what is still delivered; when the set empties after
+as many ok runs, one RECOVERED message; nothing while a problem
+persists, and a check that flaps under the confirmation never alarms.
+The burst checks (the four journal counts) alarm on the run they are
+seen and clear on the next. A RECOVERED says `all N checks ok` only when
+every check is ok at that moment; otherwise it says what is not yet
+clear. The delivered set lives in `state.json` (it records that an alarm
+was decided and queued, not that the operator received it), so a restart
+of the box or of the run loses no transition: the state, the journal
+cursor and the outbox as it must now be (the queue with this run's
+messages appended and the bound applied, under `owed`) are written in one
+rename, and only then is that queue copied to `~/watcher/outbox.json` and
+the state rewritten without it. A run that stops before that rename
+recorded nothing, and the next run observes afresh and reads the journal
+window again; one that stops after it, before or after the outbox write,
+is finished by the next run copying the recorded queue over the outbox:
+every message queued once, every discard final, the order kept.
+
+Delivery is oldest first, one ntfy post each, stopping at the first
+failure so alerts never reorder; a message whose send failed stays in
+the outbox, the run exits 1, the status line carries `queued=N`, and
+every later run tries again from the head. Delivery is at least once: a
+stop between a send and the rewrite that removes the message sends it
+again. The outbox keeps the newest 200 messages, a deliberate bound on
+what a long outage can pile up; when more would be queued the oldest are
+dropped and the drop is itself the first message in line, a notice
+saying how many were dropped and when they were queued, so the loss is
+never silent (what they said is lost, and the notice says so). With
+`NTFY_URL` empty nothing is queued: the transition is recorded and the
+log carries the text.
+
+Only a missing outbox is an empty queue: one that exists but cannot be
+read fails the run with nothing done, and one whose bytes are not a list
+of messages with the fields delivery needs is set aside as
+`outbox.json.corrupt-<12 hex of the bytes' sha256>` and reported as an
+alert. The state file is read the same way: missing is a fresh start,
+unreadable fails the run with nothing done, and bytes that are not a
+state object, or an object whose fields are not what the run relies on,
+are set aside as `state.json.corrupt-<12 hex>` and the run goes on from
+a fresh state with a notice saying what a fresh state cannot know (the
+checks that were failing alarm again once; the journal since the last
+good run is not read again; an alert the old state still owed is in the
+aside file only). A dry run sets nothing aside. A `journalctl` call that fails is a failed check
+(`journal_read`) and the journal cursor stays where it was until every
+journal query succeeds, so no window goes unread. A run holds an
+exclusive lock on `WATCH_DIR` for its whole duration; a second run waits
+up to a minute, then exits 1 with `locked`, having observed nothing,
+and the window it would have read is read by the next run.
+
+The heartbeat is one line per UTC day, on the first run at or after
+`HEARTBEAT_HOUR`, worded from that run's verdicts: `ok N/N` only when
+every check is ok now, `degraded:` with each failing check (`not yet
+alarmed` after one the two-run guard has not confirmed) and `unknown:`
+with the unknown ones, then disk, temperature, memory, anchors, the
+wallet, pending updates, egress drops and uptime.
+Its absence is what an outside reader notices: a box that is down or cut
+off sends nothing, and nothing from the box can say so.
+
+What leaves the box is the box's `NAME` (the hostname when unset: set
+it), the checks' details and counts; no message names a path or a
+configured mount (a disk check says `disk_root at 91%`), and an
+unexpected ssh login goes off-box as a count while the address stays in
+`watch.log`. Config: `<WATCH_DIR>/config` (`ops/watch.config.example`); a
+knob left empty skips its check, so it neither fails nor counts. With
+the single-host config that is sixteen checks: the calendar's status
 (reachable, `best_block` set, no anchor needing attention, receipts on,
 wallet above `CAL_MIN_SATS`), the containers and units, disk,
 temperature, memory, the adapter's heartbeat and breaker, journal errors,
 ssh failures and unexpected logins, the journal readable, the age of the
-last confirmed anchor, pending reboots, refused outbound packets,
-bitcoind's peers. `watch.py --dry` makes every check and sends nothing.
+last confirmed anchor (unknown on a new host until its first receipt),
+pending reboots, refused outbound packets, bitcoind's peers. The
+self-stamp is watched through `selfstamp.timer` only; its summary line
+and lock are not read. `watch.py --dry` makes every check and sends
+nothing.
 
 ### The headers export
 
@@ -1275,6 +1348,12 @@ file.
   into a witness's inbox follows the naming convention ("Witness by file
   drop"); a file copied in place under its final name and caught half
   written is quarantined as malformed, kept, and must be delivered again.
+- The watcher cannot report the box's own death. A box that is down,
+  powered off or cut off sends nothing; the daily heartbeat's absence is
+  detectable only from outside the host, by whoever expects it. The
+  watcher believes a source that answers wrongly, reads the self-stamp
+  through its timer's unit state only, and sends the box's `NAME` and the
+  checks' details to the operator's ntfy topic and nowhere else.
 - A manifest written under `selfstamp/1` or `/2` keeps the host name,
   paths and file names it carried. Nothing rewrites anchored history; the
   naming rule holds from `selfstamp/3` on, and a witness records such a
@@ -1312,7 +1391,7 @@ Test modules live under `otsserver/tests/`:
   `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py`,
   `test_claim_kit.py`, `test_stamper_save_retry.py`,
   `test_rpc_privacy.py`, `test_proof_corpus.py`,
-  `test_selfstamp_workflow.py`: regression tests for this branch's delta
+  `test_selfstamp_workflow.py`, `test_watch_observation.py`: regression tests for this branch's delta
   (launcher flags, the status line and its RPC wiring, stamper-loop
   crash fixes, anchor receipts, anchor cadence, the `/digest`
   Content-Length handling, anchor-receipt record counts and their
@@ -1395,6 +1474,31 @@ Test modules live under `otsserver/tests/`:
   accepted, a predecessor with an unknown schema accepted, a quarantine
   acknowledged before it was durable.
 
+  The watcher sitting of 2026-09-16 (workflow three, `docs/contracts.md`
+  section 8) adds `test_watch_observation.py`: the observation contract
+  W1–W9, each class naming its fault model (observations carrying the
+  marker `observe` leaves for a source it could not read; an exception or
+  a stop injected at the n-th write; chmod; a child process killed after
+  the record; the lock held in-process; a sender that fails). The fault
+  mechanisms shared with the self-stamp's tests live in
+  `otsserver/tests/faults.py`. Each defect's regression fails on the code
+  before the fix: a source that could not be read reading as ok (a
+  missing or unreadable receipts file, a failed `nmcli`, an unreadable
+  module list or heartbeat, a body that is not an object, the journal
+  counts behind a failed query), a transition recorded after its message
+  was queued so that a stop between the two alarmed twice, the outbox's
+  bound dropping alerts with only a log line, a corrupt `state.json`
+  stopping every run with a traceback, the heartbeat's disk figures read
+  from mount points the config did not name, a login's address and the
+  state directory's path in what leaves the box; and, from the sitting's
+  gate review, invalid UTF-8 in the heartbeat or the receipts and a JSON
+  list from `/health` stopping the run, a failed feeder tail, an empty
+  heartbeat and a failed Tor warning query reading as ok, a heartbeat
+  saying `ok` on a first failed observation and a RECOVERED saying all
+  ok while another check was unknown, the cap decided again on replay
+  after a stop, malformed fields inside valid JSON crashing every run or
+  vanishing, and a configured mount in a message.
+
 No test module needs a running Bitcoin node. Every module does need the
 full dependency set installed, and `plyvel` is a native build:
 `otsserver/calendar.py` imports it at module level, so without it every
@@ -1407,7 +1511,7 @@ with the LevelDB headers installed (`libleveldb-dev` on Debian, `leveldb`
 from Homebrew on macOS):
 
 ```
-python -m unittest discover -v                       # Ran 293 tests ... OK
+python -m unittest discover -v                       # Ran 334 tests ... OK
 ```
 
 The otsd image has no pytest; where pytest is installed,

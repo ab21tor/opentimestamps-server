@@ -45,7 +45,10 @@
   "anchors": 40,
   "anchor_age_h": 3.1,
   "btc_peers": 9,
-  "uptime_s": 300000
+  "uptime_s": 300000,
+  "kernel_running": "6.1.0-37-amd64",
+  "kernel_newest": "6.1.0-37-amd64",
+  "reboot_required_file": false
  },
  "runs": [
   {

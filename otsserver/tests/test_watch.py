@@ -89,7 +89,8 @@ class Test_active_checks(unittest.TestCase):
              "units_user": {u: "active" for u in cfg["UNITS_USER"].split(",")},
              "disk": {"/": 9.1}, "temp_c": 40.0, "mem_avail_mb": 4000,
              "endpoint_age": 5, "endpoint_breaker": "ok", "journal_errors": 0, "ssh_failures": 0,
-             "anchors": 3, "anchor_age_h": 2.0, "btc_peers": 8, "uptime_s": 1000}
+             "anchors": 3, "anchor_age_h": 2.0, "btc_peers": 8, "uptime_s": 1000,
+             "kernel_running": "k", "kernel_newest": "k", "reboot_required_file": False}
         checks = watch.evaluate(o, cfg)
         self.assertFalse(checks["feeder"][0])          # computed, but ...
         state, msgs = watch.decide({}, checks, 1788600000, cfg)
@@ -123,7 +124,8 @@ class Test_calendar_check(unittest.TestCase):
                          (False, "calendar needs attention: " + gone + "; anchor 4a4a mined again"))
         self.assertEqual(self.verdict(True, dict(ok, needs_attention=[]), "20000"), (True, ""))
         self.assertEqual(self.verdict(True, ok), (False, "anchor wallet 22015 sats < 100000"))
-        self.assertEqual(self.verdict(True, dict(ok, balance="lots")), (False, "calendar balance unreadable"))
+        # A balance that cannot be read is unknown (workflow three), never ok and not a failure.
+        self.assertEqual(self.verdict(True, dict(ok, balance="lots")), (None, "calendar unknown: balance unreadable"))
 
     def test_parse_sats(self):
         self.assertEqual(watch.parse_sats("22,015"), 22015)
@@ -214,6 +216,11 @@ class Test_outbox(unittest.TestCase):
         self.assertIn('journal', json.loads(self.state.read_text())['cursors'])
 
     def test_the_cursor_moves_only_once_the_burst_is_on_disk(self):
+        """Since workflow three the burst is on disk in state.json, in the
+        same write that moves the cursor (under "owed"), before the outbox
+        is written: an outbox that cannot be written leaves the burst owed
+        by the state, the cursor moved, and the message queued by the next
+        run; the run still tries to send it directly."""
         real = watch.write_json_atomic
 
         def outbox_fails(path, data):
@@ -225,13 +232,16 @@ class Test_outbox(unittest.TestCase):
         self.assertEqual(codes, [1])
         self.assertEqual(sent.call_count, 1, 'still tried directly')
         state = json.loads(self.state.read_text())
-        self.assertNotIn('cursors', state, 'the burst is neither on disk nor delivered: the cursor stays')
+        self.assertIn('journal', state['cursors'], 'the burst is durable in the state: the cursor may move')
+        self.assertEqual(len(state['owed']), 1)
         self.assertIsNone(self.queued())
-        # Delivered directly, the cursor moves even without an outbox.
+        # Delivered directly: nothing stays owed.
         codes, sent = self.runs(self.cfg(), [self.BURST], [(True, 'http 200')],
                                 extra=[mock.patch.object(watch, 'write_json_atomic', side_effect=outbox_fails)])
         self.assertEqual(codes, [0])
-        self.assertIn('journal', json.loads(self.state.read_text())['cursors'])
+        state = json.loads(self.state.read_text())
+        self.assertIn('journal', state['cursors'])
+        self.assertFalse(state.get('owed'), 'delivered directly: the record carries no queue')
 
     def test_status_only_mode_queues_nothing(self):
         codes, sent = self.runs(self.cfg(NTFY_URL=''), [self.BURST, self.ALL_OK], [])
@@ -241,13 +251,17 @@ class Test_outbox(unittest.TestCase):
         self.assertIn('journal', json.loads(self.state.read_text())['cursors'])
 
     def test_the_outbox_is_bounded(self):
+        """The bound is OUTBOX_MAX entries, and since workflow three the
+        drop is the first message in line, never silent."""
         self.outbox.write_text(json.dumps([{'text': 'old %d' % i, 'queued': ''} for i in range(watch.OUTBOX_MAX + 5)]))
         codes, sent = self.runs(self.cfg(), [self.BURST], [(False, 'down')])
         self.assertEqual(codes, [1])
         queued = self.queued()
         self.assertEqual(len(queued), watch.OUTBOX_MAX)
         self.assertIn('203.0.113.7', queued[-1]['text'])
-        self.assertEqual(queued[0]['text'], 'old 6')
+        self.assertTrue(queued[0].get('cap'), queued[0])
+        self.assertIn('7 oldest alerts dropped', queued[0]['text'])
+        self.assertEqual(queued[1]['text'], 'old 7')
 
 
 NOW = 1788600000
