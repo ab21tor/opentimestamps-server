@@ -749,6 +749,15 @@ def _label(m):
     return chain if isinstance(chain, str) and LABEL.match(chain) else None
 
 
+def _labelled_before(manifests_dir):
+    """Whether any manifest of the chain carries a label. Asked only when
+    the newest does not, which is one of two things: a chain from before
+    selfstamp/3 taking its one step to a label, or a labelled chain that an
+    older version of this tool has since continued. A manifest that cannot
+    be read leaves the question open, and raises."""
+    return any(_label(json.loads(path.read_bytes())) for path in _files(manifests_dir, '.json'))
+
+
 def _identity(m):
     """What a vouch is matched under: a labelled chain by (label, seq); an
     unlabelled one by (seq, period), its host name never being republished
@@ -1405,6 +1414,21 @@ def _run_locked(cfg, period, now, log):
             log('%s refused period=%s not after latest manifest %s'
                 % (_stamp(), period, latest[0]))
             return 1
+        if latest is not None and _label(latest[2]) is None:
+            # The label is drawn once. An unlabelled newest manifest gets the
+            # chain its label now only if the chain never had one.
+            try:
+                labelled = _labelled_before(manifests_dir)
+            except (OSError, ValueError, AttributeError) as exp:
+                log('%s refused period=%s an earlier manifest unreadable, so whether the chain has its label is not '
+                    'known: %s' % (_stamp(), period, _reason(exp)))
+                return 1
+            if labelled:
+                log('%s refused period=%s the chain has a label and its newest manifest %s has none: an older version '
+                    'of this tool wrote it, and a second label is never drawn. Move the manifests that version wrote, '
+                    'and their proofs, out of manifests/ (keep them): the chain goes on from its last labelled '
+                    'manifest and those days are a gap' % (_stamp(), period, latest[0]))
+                return 1
         entries, problems = witnessed_entries(witnessed_dir, manifests_dir, log)
         failures += problems
         manifest, raw = build_manifest(cfg, period, now, manifests_dir, witnessed=entries)

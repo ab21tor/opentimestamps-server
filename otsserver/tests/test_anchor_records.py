@@ -184,8 +184,10 @@ class Test_record_counts_sidecar(unittest.TestCase):
 
         with self.assertLogs(level='WARNING') as captured:
             self.assertIsNone(counts.get(0))
+        # Named by its fixed name, never by the directory it is in
+        # (2026-09-17 workflow four: no message names the calendar's path).
         warnings = [r for r in captured.records
-                    if self.counts_path in r.getMessage()]
+                    if 'journal.counts' in r.getMessage() and self.tmpdir.name not in r.getMessage()]
         self.assertEqual(len(warnings), 1, captured.output)
 
         # A permanently broken sidecar warns once, not per entry per scan.

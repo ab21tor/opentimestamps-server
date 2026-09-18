@@ -36,7 +36,7 @@ from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
 from opentimestamps.core.op import OpPrepend, OpSHA256
 from opentimestamps.core.timestamp import Timestamp, make_merkle_tree
 
-from otsserver.calendar import Journal, RecordCounts, fsync_dir, read_checkpoint, write_checkpoint
+from otsserver.calendar import Journal, RecordCounts, error_text, fsync_dir, read_checkpoint, write_checkpoint
 
 # https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp
 DUST = 330
@@ -194,6 +194,31 @@ def marker_path(receipts_path, txid=None):
     return receipts_path + '.pending' + ('.' + txid if txid else '')
 
 
+def marker_role(path):
+    """How a marker is named in a message: by its role and its anchor, never
+    by its file name, which is made from the receipts file's name and can
+    say who the calendar is run for (2026-09-18 gate review, G3). The
+    anchor is named only when the suffix is a txid, 64 hex characters, as
+    pending_markers requires; a receipts file whose own name holds
+    `.pending.` gives its single-name marker a suffix of another kind
+    (corrections review, G3b)."""
+    base, _, suffix = os.path.basename(path).rpartition('.pending.')
+    if base and len(suffix) == 64 and all(c in '0123456789abcdef' for c in suffix):
+        return 'the pending receipt marker of anchor %s' % suffix
+    return 'the pending receipt marker under the old single name'
+
+
+def anchor_probe(txid):
+    """The key that says an anchor's own save happened: its txid, as the
+    saved tree holds it (make_timestamp_from_block_tx puts the txid node on
+    the path from every commitment to the block). A commitment would
+    answer for any anchor that carried it, and the same commitments are
+    anchored again after a save that did not happen (2026-09-18 gate
+    review, G1: a marker whose discard had failed was later satisfied by
+    the next anchor's save of the same commitments, and billed twice)."""
+    return lx(txid)
+
+
 def pending_markers(receipts_path):
     """Every marker on file beside the receipts file, by name: the single
     old name first if present, then one per txid. Temporary and set-aside
@@ -229,10 +254,13 @@ def _write_pending_receipt(receipts_path, body):
     """Write the pending-receipt marker atomically (tmp + fsync + rename +
     directory fsync)
 
-    body is {'receipt': <the line to append later>, 'probe': <hex of one
-    commitment in the anchor's tree>}: enough to settle, after a crash,
-    whether the calendar save the marker guards ever happened. The marker
-    is named by the receipt's txid.
+    body is {'receipt': <the line to append later>, 'probe': <hex of the
+    key anchor_probe gives for the receipt's txid>}: enough to settle,
+    after a crash, whether the calendar save the marker guards ever
+    happened. The current reader asks about the txid it finds in the
+    receipt; `probe` is written for the readers before 2026-09-18, which
+    look up the field as it is, and now ask the same question by it. The
+    marker is named by the receipt's txid.
     """
     path = marker_path(receipts_path, body['receipt']['txid'])
     tmp = path + '.tmp'
@@ -290,7 +318,7 @@ def _recent_receipts(path, n):
     return receipts
 
 
-def _recover_receipt_tail(fd, path):
+def _recover_receipt_tail(fd):
     """Drop an incomplete last line (bytes after the final newline) left by
     an interrupted append, before anything is appended after it.
 
@@ -315,10 +343,31 @@ def _recover_receipt_tail(fd, path):
         pos = chunk_start
     os.ftruncate(fd, keep)
     os.fsync(fd)
-    logging.warning("%s ended in an incomplete receipt line (%d bytes without a newline, an interrupted append); "
-                    "dropped before appending; the receipt it held is recovered from its pending marker"
-                    % (path, size - keep))
+    logging.warning("The receipts file ended in an incomplete receipt line (%d bytes without a newline, an interrupted "
+                    "append); dropped before appending; the receipt it held is recovered from its pending marker"
+                    % (size - keep))
     return size - keep
+
+
+def _sync_receipts(path):
+    """fsync the receipts file and its directory. A complete line found on
+    file says it was written, not that it was synced: the append that
+    wrote it may have stopped, or failed, at its fsync, and the marker is
+    the only other copy of the receipt."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_dir(path)
+
+
+class ReceiptsAheadOfDatabase(Exception):
+    """A marker still stands, its receipt is on file, and the database does
+    not hold the anchor's commitments. No stop can leave that: the receipt
+    is appended only after the save's synchronous batch. The receipts file
+    is newer than db/ (copies from different moments), and going on would
+    anchor those records again and receipt them a second time."""
 
 
 def _append_anchor_receipt(path, receipt):
@@ -337,7 +386,7 @@ def _append_anchor_receipt(path, receipt):
     line = json.dumps(receipt) + '\n'
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     try:
-        _recover_receipt_tail(fd, path)
+        _recover_receipt_tail(fd)
         _write_all(fd, line.encode())
         os.fsync(fd)
     finally:
@@ -489,53 +538,78 @@ class Stamper:
     def settle_pending_receipt(self):
         """Settle every pending-receipt marker left by an earlier stop
 
-        A marker (see __save_confirmed_timestamp_tx) holds the receipt and
-        one commitment of the anchor's tree. If that commitment is in the
+        A marker (see __save_confirmed_timestamp_tx) holds the receipt. The
+        calendar is asked for that anchor's own key (anchor_probe: its txid
+        node, which only its saved tree puts there). If it is in the
         calendar the save happened and the receipt is owed: it is appended
         unless its txid is already on file. If it is not, the save never
         happened: those commitments are still pending and will be
         re-anchored under a new txid with their own receipt, so this
         receipt must not be written — writing it would bill the same
-        records twice. Either way the marker is removed and the outcome
-        logged. Each marker is settled on its own: one that cannot be
-        settled (the receipts file unwritable) is logged and left standing
-        for the next start or the next anchor, and never stops the others
-        or the anchor being saved. Runs at stamper start and before any
-        new marker; a no-op when receipts are off or no marker exists.
+        records twice; and no later anchor over the same commitments can
+        ever make this one look saved. Either way the marker is removed
+        and the outcome logged. Each marker is settled on its own: one
+        that cannot be settled (the receipts file unwritable, the marker
+        not removable) is logged and left standing for the next start or
+        the next anchor, asked about again then, and never stops the
+        others or the anchor being saved. The one state that is not
+        settled is a contradiction (ReceiptsAheadOfDatabase): it is raised,
+        and a start stops the service on it. Runs at stamper start and
+        before any new marker; a no-op when receipts are off or no marker
+        exists. Messages name a marker by its role and its anchor's txid,
+        never by its file name or directory.
         """
         if not self.anchor_receipts_path:
             return
         for path in pending_markers(self.anchor_receipts_path):
             try:
                 self.__settle_marker(path)
+            except ReceiptsAheadOfDatabase:
+                raise
             except Exception as exp:
-                logging.warning("Pending anchor receipt marker %s could not be settled: %r; it stays until it can be"
-                                % (path, exp))
+                logging.warning("%s could not be settled: %s; it stays until it can be, and is asked about again "
+                                "at the next start and before the next marker" % (marker_role(path), error_text(exp)))
 
     def __settle_marker(self, path):
+        role = marker_role(path)
         try:
             with open(path, 'rb') as fd:
                 body = json.loads(fd.read())
             receipt = body['receipt']
             txid = receipt['txid']
-            probe = bytes.fromhex(body['probe'])
+            probe = anchor_probe(txid)
         except (ValueError, KeyError, TypeError) as exp:
-            aside = '%s.corrupt-%d' % (path, int(time.time()))
-            logging.warning("Pending anchor receipt marker %s is unreadable (%r); set aside as %s, "
-                            "no receipt written" % (path, exp, aside))
-            os.rename(path, aside)
+            stamp = int(time.time())
+            # The class only: a decoding error's repr carries the bytes it
+            # refused (2026-09-18 corrections review, G3a).
+            logging.warning("%s is unreadable (%s); set aside beside the receipts file with the suffix .corrupt-%d, "
+                            "no receipt written" % (role, type(exp).__name__, stamp))
+            os.rename(path, '%s.corrupt-%d' % (path, stamp))
             return
 
+        on_file = _receipt_on_file(self.anchor_receipts_path, txid)
         if probe in self.calendar:
-            if _receipt_on_file(self.anchor_receipts_path, txid):
+            if on_file:
+                # Found, not yet known to be synced: the append that wrote
+                # it may have stopped or failed at its fsync, and this
+                # marker is the only other copy. Sync before it goes.
+                _sync_receipts(self.anchor_receipts_path)
                 logging.info("Pending anchor receipt for tx %s is already on file; marker removed" % txid)
             else:
                 _append_anchor_receipt(self.anchor_receipts_path, receipt)
                 logging.warning("Anchor receipt for tx %s recovered from the pending marker: the calendar "
                                 "save completed before an earlier stop, the receipt had not been written" % txid)
+        elif on_file:
+            raise ReceiptsAheadOfDatabase(
+                "CALENDAR STORAGE INCONSISTENT: the receipts file holds the receipt of anchor %s, its pending receipt "
+                "marker still stands, and the database does not hold that anchor: the receipts file is newer than db/ "
+                "(copies from different moments). Going on would anchor those records again and receipt them a "
+                "second time. Recovery: restore db/ and the receipts file, with its markers, from one copy taken with "
+                "the calendar stopped. To accept the second receipt instead, remove that marker and reconcile the two "
+                "receipts by hand" % txid)
         else:
             logging.warning("Pending anchor receipt for tx %s discarded: the calendar never saved that "
-                            "anchor's commitments (an earlier stop hit before the save), so they will "
+                            "anchor (an earlier stop hit before the save), so its commitments will "
                             "be re-anchored and receipted under a new txid; nothing is owed for %s"
                             % (txid, txid))
         os.unlink(path)
@@ -603,11 +677,11 @@ class Stamper:
         """Save a fully confirmed timestamp to disk, then receipt it
 
         Marker before the save, receipt after it. A crash before the save
-        leaves a marker whose commitments the calendar does not hold: they
-        re-anchor under a new txid with their own receipt, and the marker
-        is discarded at the next start (settle_pending_receipt) — never a
-        second bill for the same records. A crash after the save leaves a
-        marker whose commitments the calendar holds: the receipt is
+        leaves a marker whose anchor the calendar does not hold: the
+        commitments re-anchor under a new txid with their own receipt, and
+        the marker is discarded at the next start (settle_pending_receipt)
+        — never a second bill for the same records. A crash after the save
+        leaves a marker whose anchor the calendar holds: the receipt is
         recovered from it. Every marker is named by its anchor's txid, so
         an earlier anchor's receipt still owed (its marker standing because
         the receipts file could not be written) survives every later
@@ -631,13 +705,12 @@ class Stamper:
             try:
                 self.settle_pending_receipt()
                 _write_pending_receipt(self.anchor_receipts_path,
-                                       {'receipt': receipt,
-                                        'probe': confirmed_tx.commitment_timestamps[0].msg.hex()})
+                                       {'receipt': receipt, 'probe': anchor_probe(txid).hex()})
             except Exception as exp:
                 # A failed marker write must never break the stamp loop;
                 # without it a stop between the save and the receipt
                 # loses the receipt silently, so say so now.
-                logging.warning("Failed to write pending anchor receipt marker for tx %s: %r" % (txid, exp))
+                logging.warning("Failed to write pending anchor receipt marker for tx %s: %s" % (txid, error_text(exp)))
 
         if watermark is None:
             self.calendar.add_commitment_timestamps(confirmed_tx.commitment_timestamps)
@@ -653,15 +726,15 @@ class Stamper:
                 # A failed receipt write must never break the stamp loop.
                 # The marker stays: the receipt is recovered from it before
                 # the next anchor's marker, or at the next start.
-                logging.warning("Failed to write anchor receipt for tx %s: %r; the pending marker "
-                                "keeps it until it can be written" % (txid, exp))
+                logging.warning("Failed to write anchor receipt for tx %s: %s; the pending marker "
+                                "keeps it until it can be written" % (txid, error_text(exp)))
                 return
             try:
                 os.unlink(marker_path(self.anchor_receipts_path, txid))   # this anchor's marker, never another's
             except FileNotFoundError:
                 pass
             except OSError as exp:
-                logging.warning("Failed to remove pending anchor receipt marker for tx %s: %r" % (txid, exp))
+                logging.warning("Failed to remove pending anchor receipt marker for tx %s: %s" % (txid, error_text(exp)))
 
     def __checkpoint_after(self, confirmed_tx):
         """The journal checkpoint once confirmed_tx is saved: the lowest
@@ -681,17 +754,16 @@ class Stamper:
         never claim more than the database durably holds. Written with the
         database's generation, so a checkpoint kept beside a recreated or
         older-restored database is refused at the next start
-        (Calendar.verify_storage_generation). Atomic via rename: a torn
-        write can never truncate an existing checkpoint. The checkpoint is
-        a convenience: any failure warns and must never break the stamp
-        loop.
+        (Calendar.verify_storage_generation); without a generation to
+        write, nothing is written, since an index alone is a file the next
+        start refuses. Atomic via rename: a torn write can never truncate
+        an existing checkpoint. The checkpoint is a convenience: any
+        failure warns and must never break the stamp loop.
         """
         try:
-            if idx is None:
-                return
             generation = getattr(self.calendar, 'generation', None)
-            if not isinstance(generation, str):
-                generation = None
+            if idx is None or not isinstance(generation, str):
+                return
             write_checkpoint(self.calendar.path + '/journal.known-good', idx, generation)
         except Exception as exp:
             logging.warning("Failed to write journal checkpoint: %r" % exp)
@@ -1064,27 +1136,32 @@ class Stamper:
 
         # A marker left by a stop between an anchor's calendar save and its
         # receipt (or just before the save) is settled before anything else.
+        # A receipt on file for a save the database does not hold is not a
+        # stop's residue but a restore from different moments: the start
+        # fails on it, before anything is anchored a second time.
         try:
             self.settle_pending_receipt()
+        except ReceiptsAheadOfDatabase:
+            raise
         except Exception as exp:
-            logging.error("Settling the pending anchor receipt marker failed: %r; stamping continues"
-                          % (exp,), exc_info=True)
+            logging.error("Settling the pending anchor receipt marker failed: %s; stamping continues"
+                          % error_text(exp), exc_info=True)
 
         if record_counts is None and os.path.exists(self.calendar.path + '/journal.counts'):
             # The sidecar only ever exists because receipts were on: this
             # calendar was receipting its anchors and is now anchoring for
             # free, with nothing downstream to show it. Say so once, loudly.
-            logging.warning("OTSD_ANCHOR_RECEIPTS is unset but %s/journal.counts exists: anchor receipts "
-                            "were on before and are off now; anchors will not be receipted or billed"
-                            % self.calendar.path)
+            logging.warning("OTSD_ANCHOR_RECEIPTS is unset but journal.counts exists: anchor receipts "
+                            "were on before and are off now; anchors will not be receipted or billed")
 
-        path = self.calendar.path + '/journal.known-good'
         try:
-            checkpoint = read_checkpoint(path)
-        except ValueError as exp:
-            raise ValueError("%s is malformed (%s). Recovery: delete the file to rescan the whole journal from index 0 "
-                             "(safe: every commitment the calendar holds is skipped by its membership probe), or restore "
-                             "it from the same backup as db/" % (path, exp))
+            checkpoint = read_checkpoint(self.calendar.path + '/journal.known-good')
+        except (ValueError, OSError) as exp:
+            # Its class and errno, never its text: an OSError's names the path.
+            found = 'is malformed (%s)' % exp if isinstance(exp, ValueError) else 'cannot be read (%s)' % error_text(exp)
+            raise ValueError("journal.known-good %s. Recovery: give the file back its permissions, or delete it to rescan "
+                             "the whole journal from index 0 (safe: every commitment the calendar holds is skipped by "
+                             "its membership probe), or restore it from the same backup as db/" % found)
         idx = checkpoint[0] if checkpoint else 0
         return journal, record_counts, idx
 

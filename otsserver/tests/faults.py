@@ -9,15 +9,16 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""Fault mechanisms the tools' tests share (workflow two, the self-stamp;
-workflow three, the watcher): an exception injected at the n-th call of a
-named function, and a path made unreadable for the test's duration. The
-third use decided the extraction: the two helpers were identical in
-shape at every site. The child processes each module pauses and kills
-stay with their module, because the boundaries they wrap are that tool's
-own functions and a shared runner would only carry the wrapper script as
-a parameter. Every test says which fault model it uses; this file only
-supplies the mechanism, and none of it is a power cut."""
+"""Fault mechanisms the tests share (workflow two, the self-stamp;
+workflow three, the watcher; workflow four, restore and migration): an
+exception injected at the n-th call of a named function, a stop the code
+under test does not handle, and a path made unreadable for the test's
+duration. The third use decided each extraction: the helpers were
+identical in shape at every site. The child processes each module pauses
+and kills stay with their module, because the boundaries they wrap are
+that tool's own functions and a shared runner would only carry the
+wrapper script as a parameter. Every test says which fault model it uses;
+this file only supplies the mechanism, and none of it is a power cut."""
 
 import contextlib
 import errno
@@ -25,6 +26,13 @@ import os
 import stat
 import unittest
 from unittest import mock
+
+
+class Stop(BaseException):
+    """A stop the code under test does not handle: the process is gone at
+    that call. (An OSError there would be a fault the code handles, a
+    different case.) Not an Exception, so no `except Exception` on the way
+    up mistakes it for a failure to log and carry on from."""
 
 
 @contextlib.contextmanager

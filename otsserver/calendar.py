@@ -130,24 +130,50 @@ def read_checkpoint(path):
     generation as 32 hex chars, or None for a file from before generations).
 
     A v1 file (upstream's, and this fork's before 2026-09-15) holds the
-    index alone; a v2 file holds 'INDEX GENERATION'. Anything else raises
-    ValueError: a malformed checkpoint is refused, never guessed at, and
-    the caller stops the whole service.
+    index alone; a v2 file holds 'INDEX GENERATION'. A v1 file is read
+    only so that the calendar can say what it found when it refuses it
+    (Calendar.verify_storage_generation). Anything else raises ValueError:
+    a malformed checkpoint is refused, never guessed at, and the caller
+    stops the whole service. The message says the shape of what was
+    found, never its bytes, and no exception's own text is passed on: an
+    int() that is refused quotes what it was given. A file that cannot be
+    read for any reason but absence raises the OSError: the callers
+    refuse on it with the recovery, by its class and errno (2026-09-18
+    gate review, G2).
     """
     try:
-        with open(path, 'r') as fd:
-            text = fd.read()
+        with open(path, 'rb') as fd:
+            raw = fd.read()
     except FileNotFoundError:
         return None
+    try:
+        text = raw.decode('ascii')
+    except UnicodeDecodeError:
+        raise ValueError('not ASCII text (%d bytes)' % len(raw))
     parts = text.split()
-    if not parts or len(parts) > 2 or not parts[0].isdigit():
-        raise ValueError('not "INDEX" or "INDEX GENERATION": %r' % text[:80])
+    if not parts or len(parts) > 2:
+        raise ValueError('not "INDEX" or "INDEX GENERATION": %d bytes, %d field%s'
+                         % (len(raw), len(parts), '' if len(parts) == 1 else 's'))
+    # The digits themselves, not str.isdigit(), which also takes digits
+    # int() does not and whose ValueError then quotes the field
+    # (2026-09-18 corrections review, G2a).
+    if not parts[0] or len(parts[0]) > 20 or any(c not in '0123456789' for c in parts[0]):
+        raise ValueError('the first field is not a decimal number of at most 20 digits (%d characters)' % len(parts[0]))
     generation = None
     if len(parts) == 2:
         generation = parts[1].lower()
         if len(generation) != 32 or any(c not in '0123456789abcdef' for c in generation):
-            raise ValueError('generation is not 32 hex characters: %r' % text[:80])
+            raise ValueError('the second field is not a generation of 32 hex characters (%d characters)' % len(generation))
     return int(parts[0]), generation
+
+
+def error_text(exp):
+    """An OSError as a message records it: the class and the errno, never
+    its text, which names the path."""
+    text = type(exp).__name__
+    if getattr(exp, 'errno', None):
+        text += ' errno=%d' % exp.errno
+    return text
 
 
 def fsync_dir(path):
@@ -159,11 +185,13 @@ def fsync_dir(path):
         os.close(fd)
 
 
-def write_checkpoint(path, idx, generation=None):
-    """Write journal.known-good atomically: tmp, fsync, rename, fsync dir"""
+def write_checkpoint(path, idx, generation):
+    """Write journal.known-good atomically: tmp, fsync, rename, fsync dir.
+    Always 'INDEX GENERATION': an index without the generation of the
+    database it describes is a file the next start refuses."""
     tmp = path + '.tmp'
     with open(tmp, 'w') as fd:
-        fd.write('%d %s\n' % (idx, generation) if generation else '%d\n' % idx)
+        fd.write('%d %s\n' % (idx, generation))
         fd.flush()
         os.fsync(fd.fileno())
     os.replace(tmp, path)
@@ -225,15 +253,14 @@ class RecordCounts:
                     pass
                 self.fd = None
             if not self.io_failed:
-                logging.warning("Cannot read record-count sidecar %s: %r; "
-                                "counts unknown (summed as 0) until it reads again"
-                                % (self.path, exp))
+                logging.warning("Cannot read the record-count sidecar journal.counts: %r; "
+                                "counts unknown (summed as 0) until it reads again" % (exp,))
                 self.io_failed = True
             return None
 
         if self.io_failed:
             self.io_failed = False
-            logging.info("Record-count sidecar %s is readable again" % self.path)
+            logging.info("The record-count sidecar journal.counts is readable again")
 
         if len(data) != self.RECORD_SIZE:
             return None
@@ -294,9 +321,10 @@ class LevelDbCalendar:
             self.generation = None
             self.adopt_generation(0)
         else:
-            # A database from before generations (pre-2026-09-15): the
-            # Calendar decides, against the checkpoint on file, whether it
-            # can be adopted (verify_storage_generation).
+            # A database from before generations (pre-2026-09-15). It gets
+            # its generation, with watermark 0, only when no checkpoint is
+            # on file and the scan therefore starts at 0
+            # (Calendar.verify_storage_generation).
             self.generation = None
             self.watermark = None
 
@@ -435,22 +463,28 @@ class Calendar:
         os.makedirs(path, exist_ok=True)
         self.path = path
 
-        self.db = LevelDbCalendar(path + '/db')
+        # Messages name the calendar's files by their fixed names and never
+        # the directory they are in: the path is the operator's, it can
+        # name a client, and the operator chose it.
+        try:
+            self.db = LevelDbCalendar(path + '/db')
+        except plyvel.Error as exp:
+            # LevelDB's own message carries the path; the class says enough.
+            self.__refuse('db/ does not open (%s): another process holds it, or its files are not one database '
+                          '(copied while the calendar ran, or restored in part)' % type(exp).__name__, self.DB_RECOVERY)
 
         try:
-            uri_path = self.path + '/uri'
-            with open(uri_path, 'r') as fd:
+            with open(self.path + '/uri', 'r') as fd:
                 self.uri = fd.read().strip()
         except FileNotFoundError as err:
-            logging.error('Calendar URI not yet set; %r does not exist' % uri_path)
+            logging.error('Calendar URI not yet set; the file uri does not exist in the calendar directory')
             sys.exit(1)
 
         try:
-            hmac_key_path = self.path + '/hmac-key'
-            with open(hmac_key_path, 'rb') as fd:
+            with open(self.path + '/hmac-key', 'rb') as fd:
                 self.hmac_key = fd.read()
         except FileNotFoundError as err:
-            logging.error('HMAC secret key not set; %r does not exist' % hmac_key_path)
+            logging.error('HMAC secret key not set; the file hmac-key does not exist in the calendar directory')
             sys.exit(1)
 
         # The checkpoint on file must belong to this database, lie at or
@@ -463,6 +497,7 @@ class Calendar:
         # journal is opened for appending, so a journal found missing is
         # never created beside a checkpoint that names entries it should
         # hold (2026-09-15/16 review F02).
+        self.__check_counts()
         self.checkpoint = self.verify_storage_generation()
         self.journal = JournalWriter(path + '/journal')
 
@@ -470,22 +505,66 @@ class Calendar:
         # where the not-before bound below comes from.
         self.stamper = None
 
-    RECOVERY = ("Recovery: if db/ was restored from a backup or recreated, delete %s and start again: the stamper "
-                "rescans the whole journal from index 0 and re-anchors every commitment the database lacks. The "
-                "re-anchored proofs name later blocks than the originals, whose paths lived only in the lost database. "
-                "If the journal was restored or lost, restore it from the same snapshot as db/ and the checkpoint: "
-                "entries lost with a journal cannot be recovered, and deleting the checkpoint rescans the journal "
-                "that is here. Never copy a journal.known-good from another database.")
+    RECOVERY = ("Recovery: if db/ was restored from a backup or recreated, delete journal.known-good (in the calendar "
+                "directory) and start again: the stamper rescans the whole journal from index 0 and re-anchors every "
+                "commitment the database lacks. The re-anchored proofs name later blocks than the originals, whose "
+                "paths lived only in the lost database. If the journal was restored or lost, restore it from the same "
+                "stopped copy as db/ and the checkpoint: entries lost with a journal cannot be recovered, and deleting "
+                "the checkpoint rescans the journal that is here. Never copy a journal.known-good from another database.")
 
-    def __refuse(self, reason, path):
-        logging.critical("CALENDAR STORAGE INCONSISTENT: %s. %s" % (reason, self.RECOVERY % path))
+    # A checkpoint from before generations (2026-09-15) is an index alone.
+    RESCAN_ONCE = ("Recovery, once: delete journal.known-good (in the calendar directory) and start again. The stamper "
+                   "rescans the whole journal from index 0: every commitment the database holds is skipped, every one "
+                   "it lacks is anchored (later blocks than it would have had), and the next confirmed anchor writes "
+                   "the checkpoint in the current form, with the database's generation.")
+
+    DB_RECOVERY = ("Recovery: stop any other otsd on this calendar. Otherwise restore db/ from a copy taken with the "
+                   "calendar stopped, together with journal, journal.counts and journal.known-good. Without such a "
+                   "copy, move db/ aside and delete journal.known-good: the stamper rescans the whole journal from "
+                   "index 0 and anchors every commitment again, in later blocks; proofs already complete in their "
+                   "holders' hands stay valid, and the original paths in the lost database are not rebuilt.")
+
+    UNREADABLE_RECOVERY = ("Recovery: give journal.known-good (in the calendar directory) back its permissions and "
+                           "start again; or delete it: the stamper rescans the whole journal from index 0, once, and "
+                           "anchors what the database lacks in later blocks.")
+
+    COUNTS_RECOVERY = ("Recovery: restore journal and journal.counts from one copy taken with the calendar stopped; "
+                       "entries lost with a journal cannot be recovered. To go on with the journal that is here, "
+                       "delete journal.counts (and journal.known-good, if the start is then refused for the journal): "
+                       "the counts of entries not yet receipted become unknown and their receipts undercount, never "
+                       "overcount; every commitment the database lacks is anchored, in later blocks.")
+
+    def __refuse(self, reason, recovery=None):
+        logging.critical("CALENDAR STORAGE INCONSISTENT: %s. %s" % (reason, recovery or self.RECOVERY))
         sys.exit(1)
+
+    def __check_counts(self):
+        """journal.counts holds one count per journal entry, each written
+        only after its entry is durable (JournalWriter.submit), so it never
+        describes more entries than the journal holds. When it does, the
+        journal here is older than the sidecar: entries were lost with it,
+        or the two files are copies from different moments, and a count
+        left by a lost entry would be read as a later entry's. One stat of
+        each file; a partial last count still names its entry."""
+        try:
+            counted = -(-os.path.getsize(self.path + '/journal.counts') // RecordCounts.RECORD_SIZE)
+        except FileNotFoundError:
+            return
+        try:
+            entries = os.path.getsize(self.path + '/journal') // Journal.COMMITMENT_SIZE
+        except FileNotFoundError:
+            entries = 0
+        if counted > entries:
+            self.__refuse('journal.counts holds a count for journal entry %d, but the journal holds %d entr%s: the '
+                          'journal is older than its sidecar (entries were lost with it, or the two files were copied '
+                          'at different moments)' % (counted - 1, entries, 'y' if entries == 1 else 'ies'),
+                          self.COUNTS_RECOVERY)
 
     @property
     def generation(self):
         return self.db.generation
 
-    def __check_journal(self, idx, path):
+    def __check_journal(self, idx):
         """A bounded check that the journal is one the checkpoint can
         describe: it holds at least idx entries, and the entry just below
         idx and entry 0 are in the database (every entry below the
@@ -506,21 +585,21 @@ class Calendar:
         except FileNotFoundError:
             entries = 0
         if entries < idx:
-            self.__refuse('%s names journal index %d, but the journal holds %d entr%s: the journal is missing or '
-                          'older than the checkpoint (deleted, or restored from an older backup); new submissions '
-                          'would land below the checkpoint and never be anchored'
-                          % (path, idx, entries, 'y' if entries == 1 else 'ies'), path)
+            self.__refuse('journal.known-good names journal index %d, but the journal holds %d entr%s: the journal is '
+                          'missing or older than the checkpoint (deleted, or restored from an older backup); new '
+                          'submissions would land below the checkpoint and never be anchored'
+                          % (idx, entries, 'y' if entries == 1 else 'ies'))
         journal = Journal(journal_path)
         try:
             for probe in (idx - 1, 0):
                 try:
                     entry = journal[probe]
                 except KeyError:
-                    self.__refuse('%s names journal index %d, but the journal has no entry %d' % (path, idx, probe), path)
+                    self.__refuse('journal.known-good names journal index %d, but the journal has no entry %d' % (idx, probe))
                 if entry not in self.db:
-                    self.__refuse('%s names journal index %d, but the database does not hold journal entry %d: '
-                                  'the journal is not the one the checkpoint describes (restored from elsewhere?), '
-                                  'or db/ is older than the checkpoint' % (path, idx, probe), path)
+                    self.__refuse('journal.known-good names journal index %d, but the database does not hold journal '
+                                  'entry %d: the journal is not the one the checkpoint describes (restored from '
+                                  'elsewhere?), or db/ is older than the checkpoint' % (idx, probe))
         finally:
             journal.read_fd.close()
 
@@ -528,16 +607,24 @@ class Calendar:
         """Check journal.known-good against the database's generation and
         committed watermark, and against the journal (__check_journal);
         returns the checkpoint index the scan may start at (None: from 0),
-        or stops the process with the recovery text. Migration of a
-        database from before generations: a v1 checkpoint (index alone) is
-        adopted only if the journal entry just below it is in the
-        database; the database is then stamped with a generation and that
-        watermark, and the file rewritten as v2."""
-        path = self.path + '/journal.known-good'
+        or stops the process with the recovery text.
+
+        A checkpoint from before generations (an index alone) is refused,
+        whatever the database holds: it does not say which database it
+        describes, and a probe of one entry below it is a guess at the
+        rest. The operator deletes it, once, and the scan starts at 0; a
+        database without a generation gets one then, with watermark 0, in
+        the one batch a new database gets its own. Until 2026-09-17 such a
+        checkpoint was adopted when the entry below it was in the database:
+        two writes, the database then the file, and a stop between them
+        left a start that was refused for the wrong reason."""
         try:
-            checkpoint = read_checkpoint(path)
+            checkpoint = read_checkpoint(self.path + '/journal.known-good')
         except ValueError as exp:
-            self.__refuse('%s is malformed (%s)' % (path, exp), path)
+            self.__refuse('journal.known-good is malformed (%s)' % exp)
+        except OSError as exp:
+            self.__refuse('journal.known-good cannot be read (%s): a restore that lost its permissions, or a disk '
+                          'that does not answer' % error_text(exp), self.UNREADABLE_RECOVERY)
         if checkpoint is None:
             if self.db.generation is None:
                 self.db.adopt_generation(0)
@@ -546,28 +633,19 @@ class Calendar:
             return None
         idx, generation = checkpoint
         if generation is None:
-            if self.db.generation is not None:
-                self.__refuse('%s names journal index %d without a database generation, but db/ carries generation %s: '
-                              'the checkpoint predates this database (db/ was recreated, or an older checkpoint was restored)'
-                              % (path, idx, self.db.generation), path)
-            self.__check_journal(idx, path)
-            self.db.adopt_generation(idx)
-            write_checkpoint(path, idx, self.db.generation)
-            logging.warning("Calendar storage migrated: %s (index %d, the format before generations) adopted as the "
-                            "database's committed watermark after checking that journal entry %d is in the database; "
-                            "generation %s recorded in db/ and in the checkpoint"
-                            % (path, idx, idx - 1, self.db.generation))
-            return idx
+            self.__refuse('journal.known-good holds an index alone (%d), the form before database generations: it '
+                          'does not say which database it describes, so it is not adopted, whatever db/ holds'
+                          % idx, self.RESCAN_ONCE)
         if self.db.generation is None:
-            self.__refuse('%s belongs to database generation %s, but db/ carries none: db/ predates the checkpoint '
-                          '(an older backup restored beside a newer checkpoint)' % (path, generation), path)
+            self.__refuse('journal.known-good belongs to database generation %s, but db/ carries none: db/ predates '
+                          'the checkpoint (an older backup restored beside a newer checkpoint)' % generation)
         if generation != self.db.generation:
-            self.__refuse('%s belongs to database generation %s, but db/ carries %s: db/ was recreated or restored '
-                          'from a different lineage' % (path, generation, self.db.generation), path)
+            self.__refuse('journal.known-good belongs to database generation %s, but db/ carries %s: db/ was recreated '
+                          'or restored from a different lineage' % (generation, self.db.generation))
         if idx > self.db.watermark:
-            self.__refuse('%s names journal index %d, but the database\'s committed watermark is %d: db/ is older than '
-                          'the checkpoint (restored from an older backup?)' % (path, idx, self.db.watermark), path)
-        self.__check_journal(idx, path)
+            self.__refuse('journal.known-good names journal index %d, but the database\'s committed watermark is %d: '
+                          'db/ is older than the checkpoint (restored from an older backup?)' % (idx, self.db.watermark))
+        self.__check_journal(idx)
         return idx
 
     # Warn once while submissions go out without a not-before bound (no

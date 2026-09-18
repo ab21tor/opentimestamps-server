@@ -68,6 +68,7 @@ class Test_checkpoint_written(unittest.TestCase):
     def make_checkpoint_stamper(self):
         stamper = make_stamper(receipts_path=None)
         stamper.calendar.path = self.tmpdir.name
+        stamper.calendar.generation = 'ab' * 16   # no generation, no checkpoint: an index alone is refused at start
         stamper.commitment_idxs = {}
         stamper.journal_cursor = None
         return stamper
@@ -114,6 +115,17 @@ class Test_checkpoint_written(unittest.TestCase):
         stamper.journal_cursor = 4
         drive_depth(stamper, 106)  # 106 - 6 + 1 == 101: the tree confirms
         self.assertEqual(self.known_good(), 3)
+
+    def test_without_a_generation_no_checkpoint_is_written(self):
+        """An index alone is the form before generations, which the next
+        start refuses (2026-09-17 workflow four): it is never written. A
+        real calendar always has a generation; this one is a double."""
+        stamper = self.make_checkpoint_stamper()
+        stamper.calendar.generation = None
+        self.seed(stamper, [0, 1, 2])
+        self.confirm_cycle(stamper)
+        self.assertEqual(stamper.txs_waiting_for_confirmation, {}, 'the anchor itself completed')
+        self.assertIsNone(self.known_good())
 
     def test_checkpoint_write_failure_never_breaks_confirmation(self):
         stamper = self.make_checkpoint_stamper()

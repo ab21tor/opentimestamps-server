@@ -39,16 +39,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-from otsserver.tests.faults import fail_on_call, unreadable
+from otsserver.tests.faults import Stop, fail_on_call, unreadable
 from otsserver.tests.test_watch import ALL_OK, APPLIANCE, NOW, TOOL, cfg_with, review_cfg, watch, watcher_run
 
 BURST = dict(ALL_OK, ssh_unexpected=(False, 'ssh accepted from 1 source not in SSH_KNOWN_SOURCES'))
 SLOW = dict(ALL_OK, mem=(False, 'mem available 100MB'))   # a two-run check
-
-
-class Stop(BaseException):
-    """A stop the tool does not handle: the process is gone at that call.
-    (An OSError there would be a fault the tool handles, a different case.)"""
 
 
 def sent_texts(sender_calls):

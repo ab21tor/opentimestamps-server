@@ -209,7 +209,7 @@ class Test_storage_generation(unittest.TestCase):
         with open(self.known_good, 'w') as fd:
             fd.write('1\n')
         text = self.refuse()
-        self.assertIn('predates this database', text)
+        self.assertIn('an index alone', text)
         self.assertIn('journal.known-good', text)
 
     def test_an_older_database_restored_beside_a_newer_checkpoint_is_refused(self):
@@ -254,33 +254,27 @@ class Test_storage_generation(unittest.TestCase):
                 fd.write(text)
             self.assertIn('malformed', self.refuse())
 
-    def test_a_checkpoint_from_before_generations_is_adopted_only_when_the_entry_below_it_is_held(self):
+    def test_a_checkpoint_from_before_generations_is_refused_whatever_the_database_holds(self):
+        """Until 2026-09-17 (workflow four) it was adopted when the entry
+        below it was in the database. The whole transition, the one-time
+        rescan and its stops included, is in
+        test_restore_calendar.Test_checkpoint_from_before_generations."""
         from otsserver.calendar import META_GENERATION, META_WATERMARK
         self.journal(2)
-
-        def strip_generation():
-            # A database written before generations: keys, no meta.
-            cal = self.open()
-            cal.add_commitment_timestamps([Timestamp(self.entry(0))])
-            cal.db.db.delete(META_GENERATION)
-            cal.db.db.delete(META_WATERMARK)
-            self.close(cal)
-        strip_generation()
-        with open(self.known_good, 'w') as fd:
-            fd.write('1\n')
-        with self.assertLogs(level='WARNING') as captured:
-            cal = self.open()
-        self.assertEqual(cal.checkpoint, 1)
-        self.assertEqual(cal.db.watermark, 1)
-        self.assertRegex(cal.generation, '^[0-9a-f]{32}$')
-        self.assertEqual(read_checkpoint(self.known_good), (1, cal.generation))
-        self.assertTrue(any('migrated' in l for l in captured.output), captured.output)
+        # A database written before generations: keys, no meta.
+        cal = self.open()
+        cal.add_commitment_timestamps([Timestamp(self.entry(0))])
+        cal.db.db.delete(META_GENERATION)
+        cal.db.db.delete(META_WATERMARK)
         self.close(cal)
-        # Entry 1 is not in the database, yet the checkpoint claims it: refused.
-        strip_generation()
-        with open(self.known_good, 'w') as fd:
-            fd.write('2\n')
-        self.assertIn('does not hold journal entry 1', self.refuse())
+        for index in (1, 2):   # the entry below it held, and not held
+            with open(self.known_good, 'w') as fd:
+                fd.write('%d\n' % index)
+            text = self.refuse()
+            self.assertIn('an index alone', text)
+            self.assertIn('Recovery, once', text)
+            with open(self.known_good) as fd:
+                self.assertEqual(fd.read(), '%d\n' % index, 'a refused start rewrites nothing')
 
 
 class Test_journal_boundary(unittest.TestCase):

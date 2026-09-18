@@ -81,8 +81,11 @@ Each rule below is made by the code described in the section it names.
   retried every pass until it lands. Two failures do stop the service,
   loudly, with a nonzero exit so the supervisor restarts it: an aggregator
   round that does not commit, and a stamper that cannot start (a
-  checkpoint it cannot read, or one that disagrees with the database:
-  "Restart checkpoint"). A dead worker never sits behind a live port.
+  checkpoint it cannot read, or a receipt on file for an anchor the
+  database does not hold: "Anchor receipts"). Before either can happen
+  the calendar itself refuses to start on storage that disagrees with
+  itself ("Restart checkpoint"). A dead worker never sits behind a live
+  port.
 - The tools under `ops/` open no listener. Their inputs beyond the
   filesystem are the calendar on loopback, one `journalctl` call
   (self-stamp), bitcoind RPC (headers export) and, for the watcher, the
@@ -475,8 +478,9 @@ Two rules the code keeps:
   lost: one still owed has its marker standing. The receipt is written
   after the calendar save, guarded by a marker named by the anchor:
   before the save the stamper writes `<receipts file>.pending.<txid>`,
-  the receipt line plus one commitment of the anchor's tree, atomically
-  (fsynced, with its directory); after the save it appends the receipt,
+  the receipt line plus the anchor's own key (its txid, as the saved tree
+  carries it), atomically (fsynced, with its directory); after the save it
+  appends the receipt,
   every byte checked (a short write is completed, never taken for a whole
   line), fsyncs the file and its directory, and only then removes that
   marker and no other. Markers are settled one at a time: one that cannot
@@ -494,13 +498,32 @@ Two rules the code keeps:
   steps); a power cut is not simulated, and the fsyncs are what a power
   cut relies on. A marker still present at the next start, or when
   the next anchor confirms, is settled by asking the calendar whether it
-  holds that commitment. If it does, the save completed and the receipt
-  is appended unless its txid is already on file (`recovered from the
-  pending marker`). If it does not, the save never happened; those
-  commitments are still pending and will be re-anchored under a new txid
-  with their own receipt, so this receipt is discarded (`nothing is owed
-  for <txid>`). An unreadable marker is set aside as
-  `<marker>.corrupt-<time>` and warned about.
+  holds that anchor: its txid node, which only its own saved tree puts
+  there. If it does, the save completed and the receipt is appended
+  unless its txid is already on file (`recovered from the pending
+  marker`); a line found on file was written, not known to be synced, so
+  the file and its directory are fsynced again before the marker goes. If
+  it does not, the save never happened; those commitments are still
+  pending and will be re-anchored under a new txid with their own
+  receipt, so this receipt is discarded (`nothing is owed for <txid>`),
+  and no later anchor over the same commitments can ever make this one
+  look saved: a discard whose removal fails is reported and asked again
+  at the next start and before the next marker, and answered the same
+  (until 2026-09-18 the question was one of the tree's commitments, which
+  the next anchor's save answered for, and the receipt was written: five
+  records became seven). An unreadable marker is set aside beside the
+  receipts file as `.corrupt-<time>` and warned about, by the error's
+  class alone. Every message names a marker by its role and its anchor's
+  txid (only when its name's suffix is a txid), never by its file name:
+  the receipts file is named by the operator, and its name can say whose
+  calendar this is. One state is not settled: the txid on file, its
+  marker standing, and the anchor absent from the calendar. No stop
+  leaves that (the receipt follows the save's
+  synchronous write); it means the receipts file is newer than `db/`,
+  copies from different moments, and going on would anchor those records
+  again and receipt them a second time. The stamper's start fails on it
+  (`CALENDAR STORAGE INCONSISTENT`, the service stops, the marker stays)
+  and says what to restore ("Recover").
 
 If `OTSD_ANCHOR_RECEIPTS` is unset while the sidecar already exists, the
 stamper warns at startup that receipts were on before and are off now,
@@ -614,20 +637,47 @@ and two probes, not a proof that the journal is whole: it catches a
 missing or truncated journal and one from another lineage that differs
 at either probed entry, and it assumes the restore rule below. It does
 not detect an older prefix-identical journal that still reaches the
-checkpoint (the entries beyond it are lost, and no check can tell), nor
-one that differs only between the two probed entries; that is why the
-four files are one snapshot ("Recover"), and why deleting the checkpoint
-(a rescan from 0) is the full check. Nothing in
-this check reads a file's timestamp. Recovery is to delete the checkpoint
+checkpoint (the entries beyond it are lost, and only a sidecar from the
+newer moment, below, shows it), nor one that differs only between the two
+probed entries; that is why the four files are one stopped copy
+("Recover"). Deleting the checkpoint (a rescan from 0) reads every entry
+that is here and anchors what the database lacks; it cannot show that
+entries were not lost. Nothing in this check reads a file's timestamp. Recovery is to delete the checkpoint
 and start again: the stamper rescans from index 0 and re-anchors every
-commitment the database lacks ("Recover" for what that costs). Migration
-of a calendar from before this (a file holding the index alone, a
-database without a generation): at the first start the checkpoint is
-adopted only if the journal entry just below it is in the database; the
-database is then stamped with a generation and that watermark and the
-file rewritten in the new form, logged at WARNING; otherwise the start is
-refused with the same recovery text. To skip the adoption, delete the
-checkpoint before the first start: one full rescan.
+commitment the database lacks ("Recover" for what that costs).
+
+Two more things are checked before the journal is opened. `db/` must
+open as one database: files that are not one (a copy taken while the
+calendar ran, a restore that stopped part way) or that another process
+holds are refused as `db/ does not open (<the error's class>)`, with the
+recovery, where LevelDB's own text would name the directory. And
+`journal.counts` must not count more entries than the journal holds: a
+count is written only after its entry is durable, so a sidecar that
+outlasts its journal says that the journal is the older file and has
+lost entries that were acknowledged.
+
+A calendar from before this (a file holding the index alone, a database
+without a generation) is refused at its first start, whatever the
+database holds: an index does not say which database it describes.
+`Recovery, once: delete journal.known-good … and start again`: the next
+start gives the database its generation with watermark 0 and scans from
+index 0 (what the database holds is skipped, what it lacks is anchored);
+the deletion and the generation are once, and the scan from 0 repeats at
+each start until the next confirmed anchor writes the checkpoint in the
+current form. Until 2026-09-17 such a checkpoint was adopted when the
+entry below it was in the database, in two writes; a stop between them
+left a start refused for a reason that had not happened, and the same
+rescan.
+
+A checkpoint that cannot be read for any reason but absence (a restore
+that lost its permissions) is refused the same way, by the error's class
+and errno, with the recovery, at both places that read it, the
+calendar's check and the stamper's open; a malformed one is described by
+its shape (`14 bytes, 3 fields`; `the first field is not a decimal
+number`), never quoted, the index being checked digit by digit before it
+is converted. No message about any of
+this names the calendar's directory or the receipts file: files are
+named by their fixed names, a marker by its role and its anchor's txid.
 
 ### Operator lane
 
@@ -746,7 +796,9 @@ each discloses and is for, field by field, is in `docs/contracts.md`):
 
 - `chain`: the chain's label, 32 hex digits drawn at random when the
   chain began and the same on every manifest after. It names the chain
-  and nothing else.
+  and nothing else. It is drawn once: a run whose newest manifest has no
+  label reads the chain first, and if an earlier manifest has one it
+  refuses ("Recover").
 - `period`: the UTC day covered, `YYYY-MM-DD`; also the file name. It is
   the journal window, not when the books were looked at.
 - `created_at`: the run's clock when the manifest was begun, UTC; every
@@ -1262,17 +1314,78 @@ each day anchored, verifiable with `python3` alone.
 
 ## Recover
 
-What to back up: the calendar directory as one coherent snapshot (`db/`,
-`journal`, `journal.counts` and `journal.known-good` taken together, with
-the calendar stopped or from a filesystem snapshot: a `db/` from one
-moment beside a checkpoint from another is refused at the next start,
-"Restart checkpoint"), `receipts/`, the adapter's `DATA_DIR`,
-`~/selfstamp` whole (`manifests/` and `witnessed/`: a witnessed entry
-whose copy is missing is a verification break), the compose `.env`;
-encrypted, off-host. The inbox's `rejected/` holds what a witness could
+This tree takes no backup; what follows is what a backup of it has to be,
+and what the code does with one that is not (`docs/contracts.md`, section
+10, has each transition and its tests).
+
+**What to back up, and how.** The set: the calendar directory whole
+(`uri`, `hmac-key`, `journal`, `journal.counts`, `db/`,
+`journal.known-good`), `receipts/` with every `.pending.<txid>` marker in
+it, the adapter's `DATA_DIR`, `~/selfstamp` whole (`manifests/` and
+`witnessed/`: a witnessed entry whose copy is missing is a verification
+break; the inbox with its `.claim-…` files), `~/watcher` (`state.json`,
+`outbox.json`, `config`), the compose `.env`, the anchor wallet by Bitcoin
+Core's own means, and the revisions of the code that wrote it all. It is
+one set only if it comes from one moment: stop the adapter, the tools'
+timers and any run of theirs in progress, then the calendar; copy; start
+them again. One filesystem snapshot that covers all of it does as well.
+A copy taken while anything runs is a hot copy, whatever made it and
+whatever it reports, and a backup is a stopped copy that has been
+restored somewhere and has started: a rehearsal. The original resumes
+as soon as the copy is complete (its bytes compared with their source);
+the rehearsal comes after, on a host that can reach no Bitcoin node and
+no wallet (the stamper then waits, logging, and broadcasts nothing), that
+no client and no witness delivers to, with the watcher's `NTFY_URL` empty
+and the self-stamp's outbox delivered nowhere. Under that isolation a
+rehearsal has no effect outside its own directories: the calendar starts
+or refuses, the markers settle into the copy's receipts file, the entries
+the database lacked are pending, `GET /timestamp` answers for the
+commitments it should, `selfstamp.py verify` passes, the watcher's
+`--dry` reads its state. A rehearsal that was not isolated has spent or
+alarmed from the copy, and proves nothing: the copy is not called a
+backup on its account. Making the restored copy the calendar for good is
+"Restoring", below, and then the original never runs again.
+Encrypted, off-host. The inbox's `rejected/` holds what a witness could
 not use, for the operator to look at; it is not part of the chain.
 
-At every start the calendar checks that `journal.known-good` belongs to
+**What a hot copy is to the next start.** The calendar refuses what its
+own files show: a checkpoint read after the database, a journal that does
+not reach the checkpoint, a sidecar read after the journal, a `db/` whose
+files are not one database ("Restart checkpoint"), a receipt read after
+the database while its marker stood ("Anchor receipts"). It cannot see,
+and starts cleanly on: a journal that is older and still reaches the
+checkpoint (what was accepted after it is gone, and its holders are
+answered `Not found` where an entry that is owed says `Pending`);
+receipts newer than the database once their marker has gone (those
+records are anchored and receipted a second time); receipts older than
+the database with no marker copied (that receipt is lost); a watcher
+state read after a transition beside an outbox read before it (the
+alert is in neither file, and the restored watcher owes nothing where
+the live one did); a self-stamp manifest that vouches for a copy the
+copied `witnessed/` did not yet hold (`verify` reports the break; nothing
+rebuilds the copy); and any difference in moment between the calendar,
+the adapter, the self-stamp and the watcher, because nothing identifies
+the set as a whole. Behind
+the gateway the backup is that repository's script, which archives the
+calendar directory while `otsd` runs and whose `ok` is about its own
+members: what it holds of this calendar is a hot copy.
+
+**Restoring.** With nothing running, the whole set into place; Bitcoin
+Core and its wallet; then the calendar, then the adapter, then the timers.
+The old host, if it still exists, never runs as this calendar again: one
+wallet and one `uri` are one calendar. Nothing in the set names a host, so
+another machine is only another place for the same files: `uri`,
+`hmac-key`, the wallet's keys and the self-stamp's label are carried and
+never made again, and locks, the watcher's `status`, `headers.bin` and
+the block chain are made on the new host. Code as new as the code that
+wrote the set, or newer: an older self-stamp continues a labelled chain
+without its label (the current one then refuses to go on until that
+version's manifests have been moved out of `manifests/`, kept; those days
+are a gap), and an older watcher neither delivers nor clears a queue the
+newer one had recorded. A downgrade is not supported.
+
+At every start the calendar checks that `db/` opens, that the sidecar
+does not outlast the journal, that `journal.known-good` belongs to
 `db/`, lies within what it durably holds, and describes the journal that
 is there, and stops with the recovery text if not; the listener is bound
 before any worker starts, so a port that cannot be bound is a start that
@@ -1290,12 +1403,20 @@ What a rebuild cannot give back: a commitment re-anchored after `db/`
 was lost gets a proof naming a later block than its original anchor; the
 original merkle path lived only in the database. Fully anchored proofs
 already handed to clients stay valid on their own; pending proofs whose
-calendar branch was lost upgrade to the later anchor.
+calendar branch was lost upgrade to the later anchor. A pending proof
+whose journal entry is gone (accepted after the backup was taken, or lost
+with an older journal) never completes, and nothing on the box says so:
+the calendar answers `Not found`, and the self-stamp and the adapter read
+every 404 as pending. The self-stamp's is moved aside and the next run
+stamps the manifest again; the adapter's is set aside as its own contract
+describes (A4), and its next start owes the record again.
 
 The on-disk format of `db/` is LevelDB's. A calendar written under the
 previous binding (py-leveldb, before the move to plyvel) opens under the
-current one unchanged; the generation and watermark are added at the
-first start ("Restart checkpoint"), nothing else is migrated.
+current one unchanged. A database from before generations gets its
+generation, with watermark 0, at the first start that finds no checkpoint
+beside it; a checkpoint from that time is refused and deleted once, by
+hand ("Restart checkpoint"). Nothing else is migrated.
 
 When the anchor wallet runs dry the calendar keeps accepting and
 anchoring waits (one error in its log; the watcher's `calendar` check
@@ -1304,8 +1425,13 @@ is an on-chain payment to any address of the wallet.
 
 The self-stamp needs nothing after an interrupted run: the next run
 finishes from the files (a manifest without a proof is submitted, a copy
-no manifest lists is listed, a delivery half consumed is a duplicate). Two
-states are the operator's. A proof that `run` and `verify` report as
+no manifest lists is listed, a delivery half consumed is a duplicate). Three
+states are the operator's. A run that says `refused … the chain has a
+label and its newest manifest … has none` has found manifests that an
+older version of the tool wrote after this one had labelled the chain. A
+label is drawn once, so it writes nothing: move those manifests and their
+proofs out of `manifests/`, keep them, and the chain goes on from its last
+labelled manifest with those days a gap. A proof that `run` and `verify` report as
 `mismatch` (a proof, not of the file beside it) or `malformed` (this
 reader cannot parse it) is reported every run with exit 1 and never
 touched, because only the operator can say whether the manifest or the
@@ -1329,6 +1455,15 @@ file.
 - The deep-reorg detector does not see an anchor re-mined at the same
   height after a restart, and runs only with receipts on; verifying
   anchored proofs against Bitcoin is the check that remains.
+- It takes no backup, and it tells a hot copy from a stopped one only
+  where the copy's own files disagree ("Recover"). Nothing identifies the
+  calendar, the adapter, the self-stamp and the watcher as one set from
+  one moment; a journal that is older and still reaches the checkpoint,
+  and receipts that differ from the database with no marker on file, are
+  not detected; a watcher state copied after a transition beside an
+  outbox copied before it has lost that alert unseen; the holder of a
+  pending proof whose entry is gone is never told. Versions move forward: what an older version does with
+  newer state is measured in the tests and is not a refusal.
 - A digest is counted as a record once per aggregator lifetime and dedupe
   horizon: resubmitted after a restart, or past the horizon, it is
   counted again ("Anchor receipts").
@@ -1391,7 +1526,8 @@ Test modules live under `otsserver/tests/`:
   `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py`,
   `test_claim_kit.py`, `test_stamper_save_retry.py`,
   `test_rpc_privacy.py`, `test_proof_corpus.py`,
-  `test_selfstamp_workflow.py`, `test_watch_observation.py`: regression tests for this branch's delta
+  `test_selfstamp_workflow.py`, `test_watch_observation.py`,
+  `test_restore_calendar.py`, `test_restore_tools.py`: regression tests for this branch's delta
   (launcher flags, the status line and its RPC wiring, stamper-loop
   crash fixes, anchor receipts, anchor cadence, the `/digest`
   Content-Length handling, anchor-receipt record counts and their
@@ -1499,6 +1635,55 @@ Test modules live under `otsserver/tests/`:
   after a stop, malformed fields inside valid JSON crashing every run or
   vanishing, and a configured mount in a message.
 
+  The restore and migration sitting of 2026-09-17 (workflow four,
+  `docs/contracts.md` section 10) adds `test_restore_calendar.py` and
+  `test_restore_tools.py`. The first uses a real calendar on LevelDB, its
+  journal and sidecar, the receipts file and its markers and a stamper
+  that opens and fills from them, with Bitcoin alone doubled. A copy of
+  the whole tree is kept at each boundary between the writes of one
+  submission and one anchor's save, and sets are composed whose members
+  come from different points: that is the sequential copy, and each set
+  is started as `otsd` starts. Other fault models, each named by its
+  class: a table file removed from a copied database; a member left out
+  of a restore; a stop at the n-th write, truncate, fsync, unlink, rename
+  or replace of every settling of a marker and of the checkpoint's
+  publication, every case from a fresh copy, every injection asserted to
+  have fired, every recovery stopped once more, and the number of calls
+  swept asserted; an fsync that fails under the receipt's append. The
+  second runs the two tools as they were before their state changed, from
+  `ops/tests/migration/` (each file's sha256 checked before it is
+  executed), and sweeps the first run of the current tools over restored
+  state the same way. Each defect's regression fails on the code before
+  the fix: a checkpoint from before generations adopted on a probe of one
+  entry; a sidecar that outlasts its journal starting cleanly; a receipt
+  on file for a save the database lacks discarded as `nothing is owed`; a
+  database that does not open ending in a traceback that names the
+  directory; a receipt found on file losing its marker before it was
+  synced; the calendar's directory in every refusal and in the marker,
+  tail and sidecar messages; a labelled chain that an older version had
+  continued given a second label; and, from the sitting's gate review
+  (2026-09-18), a marker whose discard could not be removed satisfied by
+  the next anchor's save of the same commitments (five records receipted
+  as seven, on the real store), a checkpoint that cannot be read ending
+  in a traceback at one reader and a line with the path at the other, a
+  malformed checkpoint quoted into the log, and the receipts file's name
+  in the marker messages; and from the review of those corrections, a
+  digit `int()` does not take (`²`) quoted by `int()` at both readers, a
+  marker of bytes that are not UTF-8 quoted by the decoding error's
+  repr, and a receipts file whose own name holds `.pending.` printed as
+  an anchor. What the files cannot show is pinned as it is,
+  and called a limit: two skews of the receipts against the database, an
+  older journal that still reaches the checkpoint, a journal that differs
+  between the two probes, a watcher state copied after a transition
+  beside an outbox copied before it, and what the older tools do with
+  newer state. A restore under another root completes the pending proofs
+  and settles the owed receipt as a control: that held before. The
+  boundaries swept are the named calls (write, ftruncate, fsync, unlink,
+  rename, replace); the checkpoint is written through a buffered file, so
+  its sweep has no `os.write` to stop at, and a stop injected as an
+  exception unwinds through the code's own cleanup, which a killed
+  process or a power cut does not.
+
 No test module needs a running Bitcoin node. Every module does need the
 full dependency set installed, and `plyvel` is a native build:
 `otsserver/calendar.py` imports it at module level, so without it every
@@ -1511,7 +1696,7 @@ with the LevelDB headers installed (`libleveldb-dev` on Debian, `leveldb`
 from Homebrew on macOS):
 
 ```
-python -m unittest discover -v                       # Ran 334 tests ... OK
+python -m unittest discover -v                       # Ran 382 tests ... OK
 ```
 
 The otsd image has no pytest; where pytest is installed,

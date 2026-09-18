@@ -31,16 +31,27 @@ import tempfile
 import unittest
 from unittest import mock
 
-from bitcoin.core import b2lx
-from opentimestamps.core.timestamp import Timestamp
+from bitcoin.core import CTransaction, CTxIn, CTxOut, COutPoint, b2lx
+from bitcoin.core.script import CScript, OP_RETURN
+from opentimestamps.core.op import OpSHA256
+from opentimestamps.core.timestamp import Timestamp, make_merkle_tree
 
 import otsserver.stamper
-from otsserver.stamper import Stamper, TimestampTx, marker_path, _write_pending_receipt
-from otsserver.tests.test_anchor_receipts import make_stamper, make_tx, make_commitments
+from otsserver.stamper import (Stamper, TimestampTx, marker_path, make_timestamp_from_block_tx,
+                               _write_pending_receipt)
+from otsserver.tests.test_anchor_receipts import make_stamper, make_commitments
+
+
+def nodes(timestamp):
+    yield timestamp.msg
+    for sub in timestamp.ops.values():
+        yield from nodes(sub)
 
 
 class FakeCalendar:
-    """Membership + save, the two calls the receipt path makes"""
+    """Membership + save, the two calls the receipt path makes. The save
+    records every node of each tree, as the real one does; among them the
+    anchor's txid node, which is what settling a marker asks about."""
     def __init__(self):
         self.saved = set()
         self.on_save = None
@@ -52,12 +63,20 @@ class FakeCalendar:
         if self.on_save is not None:
             self.on_save()
         for ts in timestamps:
-            self.saved.add(ts.msg)
+            self.saved.update(nodes(ts))
         self.watermark = watermark
 
 
 def mined(seed, commitments, height=850000, records=3):
-    return TimestampTx(make_tx(seed), None, commitments, 200, height, records)
+    """A mined TimestampTx as __do_bitcoin builds one: the tree over the
+    commitments, its tip in the transaction, the transaction alone in its
+    block, so that every commitment's path runs through the txid node."""
+    tip = make_merkle_tree([c.ops.add(OpSHA256()) for c in commitments])
+    tx = CTransaction([CTxIn(COutPoint(bytes([seed]) * 32, 0), nSequence=0xfffffffe)],
+                      [CTxOut(0, CScript([OP_RETURN, tip.msg]))])
+    anchor = TimestampTx(tx, tip, commitments, 200, height, records)
+    tip.merge(make_timestamp_from_block_tx(anchor, mock.Mock(vtx=[tx], hashMerkleRoot=tx.GetTxid()), height))
+    return anchor
 
 
 class Test_receipt_marker(unittest.TestCase):
@@ -106,7 +125,7 @@ class Test_receipt_marker(unittest.TestCase):
         self.assertTrue(seen['marker'], 'marker must exist while the calendar save runs')
         self.assertEqual(seen['receipts'], [], 'no receipt line before the save')
         self.assertEqual(seen['body']['receipt']['txid'], b2lx(tx.tx.GetTxid()))
-        self.assertIn(seen['body']['probe'], [c.msg.hex() for c in commitments])
+        self.assertEqual(seen['body']['probe'], tx.tx.GetTxid().hex(), "the anchor's own key, for older readers")
         self.assertEqual([r['txid'] for r in self.lines()], [b2lx(tx.tx.GetTxid())])
         self.assertEqual(self.markers(), [], 'marker removed after the receipt')
 
@@ -187,6 +206,44 @@ class Test_receipt_marker(unittest.TestCase):
                          [b2lx(tx.tx.GetTxid()), b2lx(tx2.tx.GetTxid())])
         self.assertEqual(self.markers(), [])
 
+    def test_a_marker_whose_discard_failed_is_never_satisfied_by_a_later_anchor(self):
+        """2026-09-18 gate review, G1. A's save never happened, and the
+        discard of its marker failed (the unlink refused). The same
+        commitments went out again in B, which saved. A is still not owed:
+        the calendar is asked about A's own txid node, which B's tree does
+        not have; the marker is reported and asked about again until it
+        can go. (Before this the question was a commitment of A's tree,
+        which B's save answered for, and A's receipt was written too: five
+        records became seven.) Fault model: an OSError at the unlink."""
+        a = mined(1, make_commitments(3))
+        self.calendar.on_save = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.save(a)
+        self.calendar.on_save = None
+        marker_a, real_unlink = self.marker_of(a), os.unlink
+
+        def refuse_a(path, *args, **kwargs):
+            if path == marker_a:
+                raise PermissionError(13, 'Permission denied', path)
+            return real_unlink(path, *args, **kwargs)
+        fresh = make_stamper(self.receipts)
+        fresh.calendar = self.calendar
+        with mock.patch('otsserver.stamper.os.unlink', side_effect=refuse_a), \
+                self.assertLogs(level='WARNING') as captured:
+            fresh.settle_pending_receipt()         # not owed, but the marker cannot go
+            self.assertTrue(os.path.exists(marker_a))
+            fresh._Stamper__save_confirmed_timestamp_tx(mined(2, make_commitments(3)))   # the same commitments, anchor B
+        b = [r['txid'] for r in self.lines()]
+        self.assertEqual(len(b), 1)
+        self.assertNotEqual(b, [b2lx(a.tx.GetTxid())])
+        self.assertTrue(any('could not be settled' in l and 'PermissionError' in l for l in captured.output), captured.output)
+        self.assertTrue(os.path.exists(marker_a), 'retried, not forgotten')
+        with self.assertLogs(level='WARNING') as captured:
+            fresh.settle_pending_receipt()         # the unlink works again
+        self.assertEqual([r['txid'] for r in self.lines()], b, 'A is never owed: B saved B, not A')
+        self.assertEqual(self.markers(), [])
+        self.assertTrue(any('discarded' in l and b2lx(a.tx.GetTxid()) in l for l in captured.output), captured.output)
+
     def test_no_marker_and_receipts_off_are_no_ops(self):
         self.stamper.settle_pending_receipt()
         self.assertEqual(self.markers(), [])
@@ -252,9 +309,8 @@ class Test_receipt_durability(unittest.TestCase):
 
     def leave_marker(self, tx):
         """The state after a save whose receipt never fully landed."""
-        self.calendar.saved.add(tx.commitment_timestamps[0].msg)
-        _write_pending_receipt(self.receipts, {'receipt': self.receipt_for(tx),
-                                               'probe': tx.commitment_timestamps[0].msg.hex()})
+        self.calendar.add_commitment_timestamps(tx.commitment_timestamps)
+        _write_pending_receipt(self.receipts, {'receipt': self.receipt_for(tx), 'probe': tx.tx.GetTxid().hex()})
 
     def test_a_short_write_is_completed_before_the_marker_goes(self):
         original = os.write
@@ -376,8 +432,7 @@ class Test_marker_per_anchor(unittest.TestCase):
     @staticmethod
     def anchor(seed, first_byte, n):
         """A mined tree whose commitments are distinct from every other anchor's"""
-        return TimestampTx(make_tx(seed), None, [Timestamp(bytes([first_byte + i]) * 32) for i in range(n)],
-                           200, 850000 + seed, 3)
+        return mined(seed, [Timestamp(bytes([first_byte + i]) * 32) for i in range(n)], height=850000 + seed)
 
     def test_a_later_anchors_success_never_removes_an_earlier_anchors_marker(self):
         a, b = self.anchor(1, 0x10, 2), self.anchor(2, 0x20, 3)
@@ -425,12 +480,14 @@ class Test_marker_per_anchor(unittest.TestCase):
 
     def test_a_marker_from_before_per_anchor_names_is_settled(self):
         """Control for the upgrade: the single-name marker a calendar
-        running the previous code may leave behind is read and settled."""
+        running the previous code may leave behind is read and settled. Its
+        `probe` is a commitment, as every marker's was before 2026-09-18:
+        the reader asks about the txid in the receipt, not the field."""
         tx = self.anchor(1, 0x10, 1)
         txid = b2lx(tx.tx.GetTxid())
         receipt = {'txid': txid, 'fee_sats': 200, 'commitments': 1, 'confirmed_height': 850001,
                    'confirmed_at': 1, 'records': 3}
-        self.calendar.saved.add(tx.commitment_timestamps[0].msg)
+        self.calendar.add_commitment_timestamps(tx.commitment_timestamps)
         legacy = self.receipts + '.pending'
         with open(legacy, 'w') as fd:
             fd.write(json.dumps({'receipt': receipt, 'probe': tx.commitment_timestamps[0].msg.hex()}) + '\n')
