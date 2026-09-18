@@ -7,7 +7,9 @@ section it cites; a change to any of them changes this file first
 (CONTRIBUTING.md). Written 2026-09-16 against the 2026-09-15/16 reviews;
 section 9, the self-stamp (workflow two), and section 8 as the watcher's
 full contract (workflow three) added the same day; section 10, restore
-and migration (workflow four), on 2026-09-17.
+and migration (workflow four), on 2026-09-17; the 2026-09-18 cold
+review's corrections (R01, R06, R09, R10, R11, R12, R17, R18) the same
+day, each named where it changed a table.
 
 The words used throughout:
 
@@ -60,7 +62,7 @@ the README. No ambiguous outcome deletes anything: the journal only grows.
 | `journal.counts` | auxiliary | Occurrence counts per journal entry, written after the entry is durable. | A lost count is an undercount, warned once per tree, never an overcount. A sidecar that counts more entries than the journal holds is refused at start: the journal is the older of the two (C6, R1). |
 | receipts file (`OTSD_ANCHOR_RECEIPTS`) | authoritative accounting | One line per saved anchor: what it cost and how many occurrences it carried. The gateway's billing reads it. | Append-only; a torn last line is dropped and recovered from its marker. |
 | `<receipts>.pending.<txid>` | durable evidence of work in progress | A receipt owed for an anchor whose calendar save is under way or done. Settled by asking the database for the anchor's own key, its txid node, which only its saved tree carries: no later anchor over the same commitments answers for it (2026-09-18 gate review, G1). | One marker per anchor. A marker is removed only by the code that settled it or wrote its receipt; a later anchor never touches an earlier anchor's marker (C5). The single-name marker from before 2026-09-16 (`<receipts>.pending`) is still read and settled. |
-| in-memory: `pending_commitments`, `unconfirmed_txs`, `txs_waiting_for_confirmation` | rebuildable | Nothing across a restart. | A restart rebuilds pending from the journal; an in-flight or mined-but-shallow anchor is forgotten and its commitments are re-anchored in a fresh transaction (the forgotten anchor is never receipted; its fee is spent and unaccounted). |
+| in-memory: `pending_commitments`, `unconfirmed_txs`, `txs_waiting_for_confirmation`, `unprocessed_blocks` | rebuildable | Nothing across a restart. `unprocessed_blocks` is the blocks whose headers the stamper has seen and whose bodies it has not yet read (C4). | A restart rebuilds pending from the journal; an in-flight or mined-but-shallow anchor is forgotten and its commitments are re-anchored in a fresh transaction (the forgotten anchor is never receipted; its fee is spent and unaccounted); the block queue is forgotten with the trees it would have invalidated. |
 | the wallet (Bitcoin Core) | external | What was broadcast and what confirmed. | The stamper assumes exclusive use of it. |
 
 ## 3. Who owns unfinished work
@@ -71,7 +73,7 @@ the README. No ambiguous outcome deletes anything: the journal only grows.
 | aggregator → journal | round queue | journal entry fsynced | the journal | the fsync returning; only then `done_event` fires and the 200 goes out |
 | journal → stamper | journal entry | `pending_commitments` (memory) | the journal, still: the stamper's memory is a view rebuilt at every start from the checkpoint onward | never: the journal is the record until the database holds the commitment |
 | stamper → Bitcoin | pending | `unconfirmed_txs` (memory) and the wallet | the journal still owns the obligation; the wallet owns the transaction | none: a restart forgets the transaction and re-anchors |
-| Bitcoin → stamper | mined at height h | `txs_waiting_for_confirmation[h]` (memory) | the journal still | none until the save |
+| Bitcoin → stamper | a header seen (`known_blocks`) | the block's body read and every tree waiting at its height put back to pending (`unprocessed_blocks` emptied); a mined tree in `txs_waiting_for_confirmation[h]` (memory) | the block queue, in memory, until the body is read: no tree is called mature while a block is owed; the journal still owns the commitments | none until the save |
 | stamper → database | mature tree | saved in one synchronous batch with the watermark | the database | the batch returning: from here `commitment in calendar` is true, the fill pass skips the entry, the checkpoint may advance past it |
 | database → receipts | saved | receipt line fsynced, marker removed | the marker while it stands | the receipt line on file, fsynced with its directory |
 | stamper → operator | detector finding | `needs_attention` | the operator; nothing is re-anchored | never clears itself; a restart forgets it (a limitation, README "What it does not do") |
@@ -89,12 +91,12 @@ states again.
 | | |
 |---|---|
 | Authoritative state | the journal (append-only file) |
-| Preconditions | the aggregator loop is alive and has not failed; the body is 1–64 bytes |
+| Preconditions | the aggregator loop is alive and has not failed; `Content-Length` is 1–64 and the body arrives whole: the bytes read are the digest, and a body shorter than declared is a 400 with nothing committed (2026-09-18 cold review R17: the shorter body used to be aggregated and acknowledged as a digest of its own length) |
 | Side effects | one journal entry per second with traffic, fsynced; the count sidecar entry (best effort); the pending timestamp in the response |
 | Acknowledgement point | the 200 is sent after `Journal.submit` returns from `os.fsync` |
-| Ambiguous outcomes | 503 after a 30 s round timeout (may still commit); client timeout after the fsync (committed, unacknowledged); an aggregator round that raises: the process exits 1 and the round's commitment may or may not be in the journal (a failed fsync after the write, a partial write padded to a record at the next start, or nothing), and nothing about the failure point is known to the client |
+| Ambiguous outcomes | 503 after a 30 s round timeout (may still commit); client timeout after the fsync (committed, unacknowledged); an aggregator round that raises: the process exits 1 and the round's commitment may or may not be in the journal (a failed fsync after the write, a partial write padded to a record at the next start, or nothing), and nothing about the failure point is known to the client. Not ambiguous: a peer that closes before its declared body has arrived gets a 400 and owes and is owed nothing |
 | Recovery | the journal needs none: whatever it holds is anchored at the next start, asked for or not; the client resubmits and is deduped inside the horizon (across the restart it is a new commitment, counted again); the supervisor restarts a stopped process |
-| Tests | `test_aggregator_failure`, `test_aggregator_dedupe`, `test_rpc_digest`, `test_anchor_records` |
+| Tests | `test_aggregator_failure`, `test_aggregator_dedupe`, `test_rpc_digest` (with `Test_post_digest_body_length`: the short body on the socketless handler and from a real peer that half-closes), `test_anchor_records` |
 
 ### C2. The fill pass: journal → pending
 
@@ -124,13 +126,13 @@ states again.
 
 | | |
 |---|---|
-| Authoritative state | the chain; memory (`txs_waiting_for_confirmation[height]`) |
+| Authoritative state | the chain; memory (`txs_waiting_for_confirmation[height]`, and `unprocessed_blocks`: the headers seen whose bodies are not yet read) |
 | Preconditions | a new block holds the latest version of the transaction |
-| Side effects | the tree's commitments leave `pending_commitments`; the departure clock is re-armed |
+| Side effects, in order per block | the block is queued when its header is seen (`known_blocks.update_from_proxy`); its body is read; every tree waiting at its height (a block a reorg replaced) has its commitments put back to `pending_commitments`; a mined anchor's commitments leave `pending_commitments` and the departure clock is re-armed; the block leaves the queue. Only when the queue is empty is any tree called mature (C5) |
 | Acknowledgement point | none outside the process |
-| Ambiguous outcomes | a reorg removes the block: the commitments go back to pending (C3 again); a restart forgets the mined tree: its commitments are read as pending again and re-anchored (a second fee, no receipt for the first) |
+| Ambiguous outcomes | a reorg removes the block: the commitments go back to pending (C3 again); a body fetch that raises (a transient RPC error, which the loop logs and survives): that block and every block after it stay queued, the pass ends without a save, and the next pass reads them before anything is saved (2026-09-18 cold review R01: the headers used to count as processed the moment they were seen, so one failed fetch consumed the reorg's notification and the next pass saved the orphaned tree against the new chain's height, receipted it, and owed nothing); a block queued and then itself replaced during the stall: dropped unread, its replacement being among the new blocks; a restart forgets the queue and the mined tree alike: the commitments are read as pending again and re-anchored (a second fee, no receipt for the first) |
 | Recovery | as stated; `is_pending` answers "Timestamped by transaction …; waiting for N confirmations" while the tree waits |
-| Tests | `test_anchor_records`, `test_reorg_detector` |
+| Tests | `test_anchor_records`, `test_reorg_detector`, `test_stamper_block_queue` (the fetch that raises after a reorg, on the real store: continued execution, a second reorg during the stall, the restart, the healthy control, and the commitment anchored again on the new chain with a proof the public library accepts) |
 
 ### C5. Depth reached: save, then receipt
 
@@ -138,13 +140,13 @@ states again.
 |---|---|
 | Authoritative state | the database, one synchronous batch: the tree's timestamps and the watermark (the lowest journal index still outstanding after this save) |
 | Preconditions | `best_height - height + 1 >= --btc-min-confirmations` |
-| Side effects, in order | (1) every marker of an *earlier* anchor still on file is settled, each on its own (a failure leaves that marker standing and is logged); (2) this anchor's marker `<receipts>.pending.<txid>` is written atomically (the receipt line, and the anchor's own key: its txid, as the saved tree carries it); (3) the batch is written; (4) the receipt line is appended, every byte checked, file and directory fsynced; (5) this anchor's marker, and only this anchor's, is unlinked; (6) `journal.known-good` is rewritten with the same watermark and the database's generation |
+| Side effects, in order | (1) every marker of an *earlier* anchor still on file is settled, each on its own (a failure leaves that marker standing and is logged); (2) this anchor's marker `<receipts>.pending.<txid>` is written atomically (the receipt line, and the anchor's own key: its txid, as the saved tree carries it); a marker that cannot be written is a save that does not happen this pass (below); (3) the batch is written; (4) the receipt line is appended, every byte checked, file and directory fsynced; (5) this anchor's marker, and only this anchor's, is unlinked; (6) `journal.known-good` is rewritten with the same watermark and the database's generation |
 | Acknowledgement point | (3): from here `GET /timestamp` serves the proof and the fill pass skips these entries |
-| Ambiguous outcomes | a stop after (2) and before (3): the marker names commitments the database lacks; a stop after (3) before (4): saved, receipt owed, marker standing; a stop after (4) before (5): receipt on file, marker standing; a failed (4): as after (3); a failed (6): the file lags the database (safe: a longer rescan) |
+| Ambiguous outcomes | a stop after (2) and before (3): the marker names commitments the database lacks; a stop after (3) before (4): saved, receipt owed, marker standing; a stop after (4) before (5): receipt on file, marker standing; a failed (4): as after (3); a failed (6): the file lags the database (safe: a longer rescan). A failed (2) is not ambiguous: nothing is saved, the tree is kept and retried every pass exactly as after a failed (3), and a receipts directory that cannot be written therefore delays publication until it can. That delay is the trade-off chosen (2026-09-18 cold review R06): before it the marker's failure was logged and the save went on, and when (4) then failed as well the tree was retired with no marker and no receipt while the message said the marker kept it. The other way to keep publication independent of the receipts store, a record of the owed receipt inside the save's own batch, needs a second durable owner and is not built |
 | Recovery | the question every settling asks is whether the database holds the anchor's own txid node, which only that anchor's saved tree puts there. (2)-(3): it does not, so the receipt is discarded ("nothing is owed") and the commitments re-anchor under another txid; a discard whose unlink fails leaves the marker, reported, asked again at the next start and before the next marker, and answered the same, since the next anchor's tree carries its own node and not this one's (2026-09-18 gate review, G1: the question used to be one of the tree's commitments, which the next anchor's save answered for, and the receipt was written too: five records accepted, seven receipted); (3)-(4): the node is present and the txid is not on file, so the receipt is appended from the marker; (4)-(5): the txid is on file, and the file and its directory are fsynced again before the marker goes: a line found on file was written, not known to be synced, since the append that wrote it may have stopped or failed at its fsync, and the marker is the receipt's only other copy (2026-09-17 workflow four: the marker used to go on sight). The unlink itself has no fsync after it: a marker found again is settled again, the same way. A torn last line is dropped before any append and recovered from its marker. A marker that does not parse is set aside as `<marker>.corrupt-<time>`, warned about, and no receipt is guessed from it. A failed save keeps the tree in memory and every pass retries it; a stop before it lands is C4's restart case. |
 | The state no stop leaves | the txid on file, its marker standing, and the anchor's node **absent** from the database. The receipt is appended only after the save's synchronous batch, so this is not a stop's residue: the receipts file is newer than `db/`, copies from different moments (R1). The stamper's open raises it, the service stops (`CALENDAR STORAGE INCONSISTENT`, exit 1) before anything is anchored, and the marker stays: going on would anchor those records again and receipt them a second time (2026-09-17 workflow four: the marker used to be discarded as `nothing is owed`, beside the receipt). |
-| Invariants pinned | never two receipts for one txid; never a receipt for an anchor whose save did not happen; a marker is settled by its own anchor's save and by nothing else; a marker is removed only after its receipt's line is on file with the file and its directory fsynced by the code that removes it, or after it was found not owed; **a later anchor's failure to settle an earlier marker never removes that marker** (2026-09-15 review F08) |
-| Tests | `test_receipt_marker` (with `test_a_marker_whose_discard_failed_is_never_satisfied_by_a_later_anchor`), `test_anchor_receipts`, `test_stamper_save_retry`, `test_stamper_checkpoint`; `test_restore_calendar.Test_a_recovery_that_is_stopped_again` (every named write, truncate, fsync, unlink and rename call of the settling, from each state a marker can be found in; a discard whose unlink is refused, followed by the next anchor, on the real store), `Test_a_copy_taken_while_the_calendar_writes` (the state no stop leaves) |
+| Invariants pinned | never two receipts for one txid; never a receipt for an anchor whose save did not happen; never a save without its marker on file first; a marker is settled by its own anchor's save and by nothing else; a marker is removed only after its receipt's line is on file with the file and its directory fsynced by the code that removes it, or after it was found not owed; **a later anchor's failure to settle an earlier marker never removes that marker** (2026-09-15 review F08) |
+| Tests | `test_receipt_marker` (with `test_a_marker_whose_discard_failed_is_never_satisfied_by_a_later_anchor`, and `Test_marker_before_save`: the receipts directory unwritable on the real store, the tree kept across passes and saved with marker and receipt once it is writable again, the restart that owes nothing, the append-failure control), `test_anchor_receipts`, `test_stamper_save_retry`, `test_stamper_checkpoint`; `test_restore_calendar.Test_a_recovery_that_is_stopped_again` (every named write, truncate, fsync, unlink and rename call of the settling, from each state a marker can be found in; a discard whose unlink is refused, followed by the next anchor, on the real store), `Test_a_copy_taken_while_the_calendar_writes` (the state no stop leaves) |
 
 ### C6. Start: the storage check, then the scan
 
@@ -154,10 +156,10 @@ states again.
 | Preconditions for serving | all of: `db/` opens as one database; `journal.known-good` can be read, or is absent (an error other than absence, a restore that lost its permissions, is refused by the error's class and errno, with the recovery, at both readers: 2026-09-18 gate review, G2; a malformed file is described by its shape and never quoted, and no exception's own text is passed on: the index is checked digit by digit, in ASCII, before it is converted, since `int()` quotes what it refuses: corrections review, G2a); `journal.counts` counts no more entries than the journal holds (the sidecar is written only after its entry is durable, so more means the journal is the older file: R1); the checkpoint is absent or reads as `INDEX GENERATION`; a generation on file equals the database's; the index is at or below the database's watermark; **the journal holds at least `INDEX` entries, and the entries at `INDEX-1` and at 0 are in the database** (2026-09-15 review F02). A checkpoint that is an index alone, the form before generations, is refused whatever the database holds, with the one-time rescan named; it is never adopted (R3). |
 | What the journal check is | a bounded check, two reads and two probes: it catches a missing journal, one truncated below the checkpoint, and one from another lineage that differs at either probed position. It assumes the restore rule (`db/`, `journal`, `journal.counts`, `journal.known-good` from one stopped copy). It does not detect an older prefix-identical journal that still reaches the checkpoint (the entries beyond it are lost; only a sidecar from the newer moment can tell, and only when it is there), nor one that differs only between the two probed entries. A rescan from 0 reads every entry that is here and anchors what the database lacks; it cannot show that entries were not lost or replaced, and without a checkpoint nothing about the journal is checked at all. R2 pins each of these. |
 | Side effects | on a new database, or one from before generations with no checkpoint on file, its generation with watermark 0, in one synchronous batch; nothing else is written before the checks pass (LevelDB's own open may replay its log into a table), a refused start rewrites no file, and a missing journal is not created while a checkpoint names an index above 0 |
-| Acknowledgement point | the listener is bound only after the checks pass and before any worker thread starts (2026-09-15 review F19): a bind failure exits 1 with nothing running. The receipts are checked a moment later, when the stamper opens (C5, "the state no stop leaves"): a digest accepted in between is in the journal and is anchored once the set is made coherent |
+| Acknowledgement point | every flag is checked before anything else: a `--btc-min-confirmations` below 2 exits 2 from argparse with nothing bound and no worker started (2026-09-18 cold review R18: it used to fail in the stamper's constructor after the aggregator thread had started and the port was bound, and the non-daemon worker kept alive a process that served nothing, which a supervisor never restarts); the listener is bound only after the storage checks pass and before any worker thread starts (2026-09-15 review F19): a bind failure exits 1 with nothing running; a worker whose constructor raises after another has started stops what started, closes the listener and exits 1 (a guard no shipped flag reaches, and not driven by a test). The receipts are checked a moment later, when the stamper opens (C5, "the state no stop leaves"): a digest accepted in between is in the journal and is anchored once the set is made coherent |
 | Ambiguous outcomes | none that the files can show: any disagreement named here stops the process with `CALENDAR STORAGE INCONSISTENT` and the recovery text, exit 1, nothing served. What the files cannot show is R1's and R2's list. No message names the calendar's directory: files are named by their fixed names (2026-09-17 workflow four) |
 | Recovery | delete the checkpoint and start again: the scan begins at 0 and every entry the database lacks is re-anchored (later blocks than the originals). A journal restored from before the copy the database came from has lost the entries between: this is why the README asks for one stopped copy of the set. |
-| Tests | `test_calendar` (`Test_storage_generation`, `Test_journal_boundary`), `test_otsd_launcher` (`Test_process_boundary`), `test_stamper_checkpoint`; `test_restore_calendar` (every refusal, each limit, the messages) |
+| Tests | `test_calendar` (`Test_storage_generation`, `Test_journal_boundary`), `test_otsd_launcher` (`Test_process_boundary`, `Test_invalid_configuration`: depth 1 exits with nothing bound, depth 2 serves), `test_stamper_checkpoint`; `test_restore_calendar` (every refusal, each limit, the messages) |
 
 ### C7. Anchored is not irreversible
 
@@ -174,13 +176,13 @@ confirmation depth is the operator's choice of how much reorg to accept.
 
 | Invariant | Where it holds here | Where it is checked |
 |---|---|---|
-| Conservation of obligations | a journal entry is owned by the journal until the database holds it; a receipt is owned by its marker until the line is on file | C1, C5, C6 tests; `test_receipt_marker` |
-| Ambiguity is a state | unreadable checkpoint: refused, not guessed; a checkpoint that is an index alone: refused, not adopted on a probe; a journal shorter than the checkpoint, or than its own sidecar: refused; a database that does not open: refused with the recovery, not a traceback; a receipt on file for a save the database lacks: the service stops; a failed record count: unknown, summed as 0; a failed RPC in `GET /`: `best_block` null, not a blank 200; a failed journal read in the watcher: a failed check, cursor kept | C5, C6, section 10; `test_restore_calendar`; `test_anchor_records`; `test_rpc_status`; `test_watch` |
+| Conservation of obligations | a journal entry is owned by the journal until the database holds it; a receipt is owned by its marker until the line is on file, and no anchor is saved before its marker is; a block's body is owned by the stamper's queue until it is read, and no tree is called mature before then | C1, C4, C5, C6 tests; `test_receipt_marker`, `test_stamper_block_queue` |
+| Ambiguity is a state | unreadable checkpoint: refused, not guessed; a checkpoint that is an index alone: refused, not adopted on a probe; a journal shorter than the checkpoint, or than its own sidecar: refused; a database that does not open: refused with the recovery, not a traceback; a receipt on file for a save the database lacks: the service stops; a failed record count: unknown, summed as 0; a failed RPC in `GET /`: `best_block` null, not a blank 200; a `POST /digest` body shorter than declared: a 400, never a digest of another length; a block body the node did not return: the block stays owed, not processed; a failed journal read in the watcher: a failed check, cursor kept | C1, C4, C5, C6, section 10; `test_restore_calendar`; `test_anchor_records`; `test_rpc_status`; `test_rpc_digest`; `test_stamper_block_queue`; `test_watch` |
 | Recovery is interruptible | the marker settle is one marker at a time and re-runnable from a stop at any of its writes; a database from before generations gets its generation in one batch, and a start stopped on either side of it adopts once; the checkpoint is published by one rename and either file starts; the tail recovery is idempotent | `test_receipt_marker`, `test_calendar`, `test_restore_calendar.Test_a_recovery_that_is_stopped_again`, `Test_checkpoint_from_before_generations` |
 | Concurrency preserves decisions | one stamper thread mutates the queues; RPC threads read snapshots; the receipts file has one writer; the watcher holds a whole-run lock | `test_rpc_status`, `test_watch` |
-| Safety includes progress | a failed save is retried every pass; an unwritable receipts file never blocks the save; a wedged aggregator round is a 503 and then an exit, not a hang; one failed marker never blocks the next anchor's receipt | `test_stamper_save_retry`, `test_aggregator_failure`, `test_receipt_marker` |
+| Safety includes progress | a failed save is retried every pass; an unwritable receipts file (the append, C5 step 4) never blocks the save, while a marker that cannot be written (step 2) holds the save back until it can be, by choice (C5); a wedged aggregator round is a 503 and then an exit, not a hang; one failed marker never blocks the next anchor's receipt | `test_stamper_save_retry`, `test_aggregator_failure`, `test_receipt_marker` |
 | External effects have retry semantics | a transaction's identity is its txid; a replaced version never gets a receipt; a forgotten transaction is never receipted; the ntfy post is at-least-once from a durable outbox | `test_anchor_receipts`, `test_watch` |
-| Time, capacity, observation | the departure clock is free-running; a full disk fails the round loudly; `process alive` is not `service healthy` (a dead worker stops the process; a bind failure exits) | `test_stamper_cadence`, `test_aggregator_failure`, `test_otsd_launcher` |
+| Time, capacity, observation | the departure clock is free-running; a full disk fails the round loudly; `process alive` is not `service healthy` (a dead worker stops the process; a bind failure exits; a flag the stamper would refuse is refused before any socket or worker exists) | `test_stamper_cadence`, `test_aggregator_failure`, `test_otsd_launcher` |
 | Anchored is not irreversible | C7 | `test_reorg_detector` |
 
 The same invariants in the self-stamp (section 9):
@@ -225,11 +227,24 @@ bytes. Three claims are made about bytes and never confused:
    only `sha256`, `append` and `prepend` (all a calendar emits) and
    refuse the other operations the public client knows; and a varuint
    longer than ten bytes is refused where the client would read it.
+   The attestation tags the client knows are four, and the readers read
+   each payload as the client does: pending (a URI), and the block-header
+   attestations of Bitcoin, Litecoin and Ethereum (one varuint height,
+   read to the payload's end). Any other tag is unknown and its payload
+   opaque, up to 8192 bytes. That is the supported subset, stated: parity
+   with the client on what parses, and Bitcoin alone on what counts.
+   `selfstamp.py`'s reader is linear only (one attestation, no fork
+   marker), by design; `verify_claim.py`'s reads forks. (2026-09-18 cold
+   review R09: the Litecoin and Ethereum tags used to be read as opaque
+   unknowns, so an empty or trailing payload the client refuses parsed
+   here, alone and beside a Bitcoin node.)
 2. **Contains a Bitcoin attestation**: after (1), some attestation node
    carries the Bitcoin block-header tag. A structural fact about the
    file. The words for it are `bitcoin height=N` (self-stamp) and
    `bitcoin_attestation_present` (adapter). Never "anchored" as a claim
-   about the chain, never "verified".
+   about the chain, never "verified". A Litecoin or Ethereum attestation
+   is not one: it reads as unknown, no usable attestation, and no claim
+   about that chain is made or checked.
 3. **Verifies against Bitcoin**: the path from the exhibit's digest
    replays to the merkle root the attestation names, and the block at
    that height, in an authenticated chain of headers, carries that root.
@@ -240,10 +255,13 @@ The corpus that pins (1) and (2) is `ops/tests/proof_corpus.py`, run
 against each reader and against the pinned library in
 `otsserver/tests/test_proof_corpus.py`: accepted shapes, full
 consumption, every strict prefix of every valid proof, one trailing
-byte, malformed payloads, the size limits at their boundaries, unknown
-attestation tags (which parse, and count as no usable attestation), and
-the narrowings above. A reader that disagrees with the library on any
-case the corpus does not name as a narrowing fails the suite.
+byte, malformed payloads (for each of the four known tags: a valid, an
+empty, a trailing and an unterminated payload, alone and beside a
+Bitcoin node), the size limits at their boundaries, unknown attestation
+tags (which parse, and count as no usable attestation), and the
+narrowings above. A reader that disagrees with the library on any case
+the corpus does not name as a narrowing fails the suite; the library is
+the oracle and the suite needs it.
 
 ## 7. Configuration and locking
 
@@ -303,7 +321,7 @@ review left here. The words used:
 | Record | Kind | Authoritative for | Loss or damage |
 |---|---|---|---|
 | `state.json` | authoritative | the delivered set, the per-check run counters and `since` times, the heartbeat day, the egress-drop accumulator, the cursor, and, while the outbox has not been brought into line, the queue owed (the outbox as it must be) | missing: a fresh start (checks failing now alarm once, the journal is read from five minutes back); unreadable: the run does nothing, exit 1; not a state object, or one whose fields are not what the run relies on: set aside as `state.json.corrupt-<12 hex>`, a fresh start with a notice (W8) |
-| `outbox.json` | the delivery queue | the queue as last recorded, less what has been delivered since, oldest first | missing: empty; unreadable: the run does nothing, exit 1; not a list of messages with the two fields delivery needs: set aside, a notice queued (W2) |
+| `outbox.json` | the delivery queue | the queue as last recorded, less what has been delivered since, oldest first | missing: empty; unreadable: the run does nothing, exit 1; not a list of messages with the two fields delivery needs (and, for a cap notice, its count): set aside, a notice queued (W2) |
 | `status` | derived | one line: the time, ok/unknown/degraded, the counts, each failed and unknown check, what is queued | rewritten every run; nothing reads it back |
 | `.lock` | coordination | one run at a time | goes with the descriptor |
 | `watch.log` | diagnostic | the run's account, the addresses of unexpected logins, what was sent and not | nothing is derived from it |
@@ -340,7 +358,7 @@ review left here. The words used:
 |---|---|
 | Authoritative record | `outbox.json` |
 | Preconditions | the lock is held; read before anything is observed |
-| Outcomes | missing: an empty queue; readable and a list of messages, each with a `text` and a `queued` string: the queue; unreadable (any error but absence): `OutboxUnreadable`, the run ends with exit 1 having done nothing (the message names the error class, not the path); readable but anything else, a field of the wrong shape included: the recovery below (2026-09-16 gate review: a message whose `queued` was a list used to stop every run) |
+| Outcomes | missing: an empty queue; readable and a list of messages, each with a `text` and a `queued` string (a cap notice among them with a count under `dropped`, which the fold adds to: 2026-09-18 cold review R12): the queue; unreadable (any error but absence): `OutboxUnreadable`, the run ends with exit 1 having done nothing (the message names the error class, not the path); readable but anything else, a field of the wrong shape included: the recovery below (2026-09-16 gate review: a message whose `queued` was a list used to stop every run) |
 | Recovery, in order | (a) the bytes are copied aside as `outbox.json.corrupt-<12 hex of their sha256>`, atomically; (b) a queue holding one notice (the box name, the reason, the byte count, the aside file's name) replaces the corrupt file in one atomic rename |
 | Ambiguous outcomes | a stop before (b): the corrupt file is still in place and the next run repeats (a) and (b); the same bytes give the same aside name, so no second copy; a stop after (b): the notice is on disk and owed; at no point is the corrupt file gone while the notice exists only in memory |
 | What it does not do | the messages the corrupt bytes held are not recovered; the notice says they may not have been delivered, and the bytes are kept for the operator |
@@ -351,8 +369,8 @@ review left here. The words used:
 | | |
 |---|---|
 | Authoritative record | the journal cursor in `state.json` |
-| Rule | a `journalctl` call that exits nonzero (or times out) reads as no lines and is recorded by label; `journal_read` is then a failed check (two-run confirmation like the others), and the cursor written at W1 (4) is the one the run read from, so the window is read again next run until every query succeeds. The four checks that count that window (`journal_errors`, `ssh_failures`, `egress_drops`, `ssh_unexpected`) are unknown when their query failed and suspended behind `journal_read` (W5): they neither read as ok (2026-09-16 workflow three: they used to count zero) nor alarm on their own. A burst seen by a succeeding query in such a run may be counted again next run, the safe direction. |
-| Tests | `test_watch.Test_observation_failure`; `test_watch_observation.Test_unknown_is_a_state`, `Test_decide_with_unknown` |
+| Rule | a `journalctl` call that exits nonzero (or times out) reads as no lines and is recorded by label; `journal_read` is then a failed check (two-run confirmation like the others), and the cursor written at W1 (4) is the one the run read from, so the window is read again next run until every query succeeds. The three pattern searches (ssh failures, accepted logins, egress drops) are made by the run over the window's lines, never by `journalctl -g`: under `-q` that flag exits 1 when nothing matches, which read as a failed query, so a quiet window froze the cursor and alarmed `journal_read` on a calm box (2026-09-18 cold review R10; systemd v257 `journalctl-show.c`). The four checks that count that window (`journal_errors`, `ssh_failures`, `egress_drops`, `ssh_unexpected`) are unknown when their query failed and suspended behind `journal_read` (W5): they neither read as ok (2026-09-16 workflow three: they used to count zero) nor alarm on their own. A burst seen by a succeeding query in such a run may be counted again next run, the safe direction. |
+| Tests | `test_watch.Test_observation_failure`; `test_watch_observation.Test_unknown_is_a_state`, `Test_decide_with_unknown`, `Test_journal_exit_semantics` (a quiet window against a `journalctl` double that exits 1 to a `-g` query: no query carries `-g`, the patterns are counted here, the cursor moves; a failing query keeps it) |
 
 ### W4. The observations, check by check
 
@@ -366,7 +384,9 @@ heartbeat or the receipts, and a JSON list from `/health`, used to stop
 the run). A positive verdict needs the fields it is about: a fresh file
 without them is unknown. Every check's failed and unknown answers are
 shown in the status line and the heartbeat; unknown alarms like failed
-after the same runs (W5), except where an owner speaks for it.
+after the same runs (W5), except where an owner speaks for it. The
+`anchor_age` row's order rule is pinned by
+`test_watch_observation.Test_receipt_order`.
 
 | Check | Source | ok | failed | unknown | Owner | Runs |
 |---|---|---|---|---|---|---|
@@ -383,7 +403,7 @@ after the same runs (W5), except where an owner speaks for it.
 | `journal_errors` | `journalctl -p err` since the cursor, system and user | at most `JOURNAL_ERRORS` | more | the query failed | `journal_read` | burst |
 | `ssh_failures` | `journalctl -u ssh` since the cursor, failures | at most `SSH_FAILURES` | more | the query failed | `journal_read` | burst |
 | `journal_read` | every `journalctl` query of the run | all succeeded | one failed (named; the window is kept) | — | — | 2 |
-| `anchor_age` | the last line of `RECEIPTS` | `confirmed_at` within `ANCHOR_MAX_H` | older | file missing; unreadable; not UTF-8 or not JSON lines; no receipt yet (a new host, until its first anchor) | — | 2 |
+| `anchor_age` | every line of `RECEIPTS`: the newest `confirmed_at`, since a receipt recovered from its marker is appended after later anchors' lines (C5; 2026-09-18 cold review R11: the last line used to be taken for the newest, and a recovery made a fresh anchor read as stale) | the newest `confirmed_at` within `ANCHOR_MAX_H` | older | file missing; unreadable; not UTF-8 or not JSON lines; a `confirmed_at` that is not a finite number; no receipt yet (a new host, until its first anchor) | — | 2 |
 | `reboot_wanted` | `/run/reboot-required`; `/lib/modules` against `uname` | no file, newest kernel running | the file is set; a newer kernel installed | the module list unreadable | — | 2 |
 | `egress_drops` | `journalctl -k` `egress-drop` since the cursor | at most `EGRESS_DROPS` | more | the query failed | `journal_read` | burst |
 | `dhcp_lease` | `nmcli` `DHCP4.OPTION` expiry | at least `DHCP_MIN_H` left | less | no expiry from `nmcli` | — | 2 |
@@ -433,9 +453,9 @@ assumption stated in "Assumptions and limits").
 | | |
 |---|---|
 | Authoritative record | `state.json` |
-| Outcomes at load | missing: a fresh state; unreadable (any error but absence): `StateUnreadable`, the run does nothing and exits 1 (the message names the error class, not the path); not a JSON object, or an object whose fields are not what the run relies on (`valid_state`: `delivered` a list of names, `fail_runs` and `ok_runs` counters by name, `since` times by name, `heartbeat_day` a string, `drops_acc` a count, `cursors.journal` a number, `owed` a list of messages; a field may be absent, never of another shape): the bytes are copied aside as `state.json.corrupt-<12 hex of their sha256>` (first, a name from the bytes so a repeat writes the same file), the run goes on from a fresh state, and one notice is owed saying what a fresh state cannot know: the checks that were failing (they alarm again once), the journal since the last good run (read from five minutes back, not from where it stopped), and any alert the old state still owed, which is in the aside file only (2026-09-16 gate review: a counter of the wrong shape used to stop every run, and a malformed owed entry used to be dropped without a word). A dry run sets nothing aside: it names the problem in the log and goes on from an empty state in memory. |
+| Outcomes at load | missing: a fresh state; unreadable (any error but absence): `StateUnreadable`, the run does nothing and exits 1 (the message names the error class, not the path); not a JSON object, or an object whose fields are not what the run relies on (`valid_state`: `delivered` a list of names, `fail_runs` and `ok_runs` counters by name, `since` finite numbers by name, `heartbeat_day` a string, `drops_acc` a count, `cursors.journal` a finite number, `owed` a list of messages with a count under `dropped` on a cap notice; a field may be absent, never of another shape; finite means an int, or a float that is neither infinity nor NaN: JSON's `1e309` reads as infinity, passed the type check and failed `int()` on every run past the quarantine, 2026-09-18 cold review R12): the bytes are copied aside as `state.json.corrupt-<12 hex of their sha256>` (first, a name from the bytes so a repeat writes the same file), the run goes on from a fresh state, and one notice is owed saying what a fresh state cannot know: the checks that were failing (they alarm again once), the journal since the last good run (read from five minutes back, not from where it stopped), and any alert the old state still owed, which is in the aside file only (2026-09-16 gate review: a counter of the wrong shape used to stop every run, and a malformed owed entry used to be dropped without a word). A dry run sets nothing aside: it names the problem in the log and goes on from an empty state in memory. |
 | Ambiguous outcomes | a stop after the aside copy and before the record: the corrupt file is still in place and the next run repeats the copy (same name) and the notice; the record replaces the corrupt file, so the notice is owed exactly once (2026-09-16 workflow three: a corrupt state used to stop every run with a traceback, which nothing but the heartbeat's absence would show) |
-| Postconditions tested | `test_watch_observation.Test_state_recovery` |
+| Postconditions tested | `test_watch_observation.Test_state_recovery`, `Test_numeric_poison` (an infinite cursor or since time set aside and the run going on; a finite float cursor kept; a cap notice without a count refused at both files) |
 
 ### W9. Two runs
 

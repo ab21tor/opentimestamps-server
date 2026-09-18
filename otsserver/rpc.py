@@ -109,6 +109,16 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
             return
 
         digest = self.rfile.read(content_length)
+        if len(digest) != content_length:
+            # The peer closed before the declared body arrived. What did
+            # arrive is not a digest of another length (2026-09-18 cold
+            # review R17: the shorter body was aggregated and acknowledged).
+            # Nothing is committed, so a 400 promises nothing.
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'body shorter than Content-Length')
+            return
 
         try:
             timestamp = self.aggregator.submit(digest, counted=counted)

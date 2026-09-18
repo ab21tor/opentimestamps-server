@@ -222,5 +222,54 @@ class Test_bind_failure(unittest.TestCase):
         self.assertNotIn('Starting aggregator loop', out, 'no worker may start before the bind')
         self.assertNotIn('Starting stamper loop', out, 'no worker may start before the bind')
 
+
+class Test_invalid_configuration(unittest.TestCase):
+    """2026-09-18 cold review R18: a --btc-min-confirmations the help
+    forbids used to fail inside the stamper's constructor, after the
+    aggregator thread had started and the listener was bound, and the
+    non-daemon worker kept the process alive behind a port that served
+    nothing; a supervisor saw no exit. Now every flag is checked before a
+    socket or a worker exists: argparse exits 2 with the message and
+    nothing bound. Driven at the process boundary, with the valid depth
+    as the control."""
+
+    setUp = Test_process_boundary.setUp
+    tearDown = Test_process_boundary.tearDown
+    request = Test_process_boundary.request
+    wait_serving = Test_process_boundary.wait_serving
+
+    def start(self, *extra):
+        self.proc = subprocess.Popen(
+            [sys.executable, OTSD, '--calendar', self.cal, '--rpc-address', '127.0.0.1', '--rpc-port', str(self.port)]
+            + list(extra),
+            env=dict(os.environ, HOME=self.home), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return self.proc
+
+    def test_a_confirmation_depth_of_one_exits_at_once_with_nothing_bound(self):
+        self.start('--btc-min-confirmations', '1')
+        try:
+            out, _ = self.proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            out, _ = self.proc.communicate(timeout=10)
+            self.fail('otsd stayed alive after refusing its configuration:\n' + out)
+        self.assertNotEqual(self.proc.returncode, 0, out)
+        self.assertIn('--btc-min-confirmations must be greater than 1', out)
+        self.assertNotIn('AssertionError', out)
+        self.assertNotIn('Starting aggregator loop', out, 'no worker may start before the flags are checked')
+        self.assertNotIn('Starting stamper loop', out)
+        with self.assertRaises(OSError):
+            socket.create_connection(('127.0.0.1', self.port), timeout=1).close()
+
+    def test_a_confirmation_depth_of_two_serves(self):
+        self.start('--btc-min-confirmations', '2')
+        self.wait_serving()
+        status, body = self.request('GET', '/unknown')
+        self.assertEqual(status, 404)
+        self.proc.kill()
+        out, _ = self.proc.communicate(timeout=10)
+        self.assertIn('Starting stamper loop', out)
+
+
 if __name__ == "__main__":
     unittest.main()

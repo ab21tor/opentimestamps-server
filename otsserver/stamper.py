@@ -492,6 +492,11 @@ class Stamper:
     # cannot complete); None while it runs. otsd reads it at exit.
     failure = None
 
+    # Blocks whose headers are known and whose bodies have not been read
+    # yet, oldest first (__do_bitcoin). Class-level default for the same
+    # test-double reason; the real instance owns a list.
+    unprocessed_blocks = ()
+
     @staticmethod
     def __create_new_timestamp_tx_template(outpoint, txout_value, change_scriptPubKey):
         """Create a new timestamp transaction template
@@ -676,17 +681,19 @@ class Stamper:
     def __save_confirmed_timestamp_tx(self, confirmed_tx, watermark=None):
         """Save a fully confirmed timestamp to disk, then receipt it
 
-        Marker before the save, receipt after it. A crash before the save
-        leaves a marker whose anchor the calendar does not hold: the
-        commitments re-anchor under a new txid with their own receipt, and
-        the marker is discarded at the next start (settle_pending_receipt)
-        — never a second bill for the same records. A crash after the save
-        leaves a marker whose anchor the calendar holds: the receipt is
-        recovered from it. Every marker is named by its anchor's txid, so
-        an earlier anchor's receipt still owed (its marker standing because
-        the receipts file could not be written) survives every later
-        anchor: what a crash or a full disk can lose is a receipt's
-        timeliness, never the receipt; what it can never do is bill twice.
+        Marker before the save, receipt after it, and no save without its
+        marker. A crash before the save leaves a marker whose anchor the
+        calendar does not hold: the commitments re-anchor under a new txid
+        with their own receipt, and the marker is discarded at the next
+        start (settle_pending_receipt) — never a second bill for the same
+        records. A crash after the save leaves a marker whose anchor the
+        calendar holds: the receipt is recovered from it. Every marker is
+        named by its anchor's txid, so an earlier anchor's receipt still
+        owed (its marker standing because the receipts file could not be
+        written) survives every later anchor: what a crash or a full disk
+        can lose is a receipt's timeliness, never the receipt; what it can
+        never do is bill twice. A marker that cannot be written at all is
+        a save that waits (below).
 
         watermark, when given, is the journal checkpoint this save makes
         true; the calendar commits it in the same synchronous batch as the
@@ -702,15 +709,22 @@ class Stamper:
                        'confirmed_height': confirmed_tx.height,
                        'confirmed_at': int(time.time()),
                        'records': confirmed_tx.records}
-            try:
-                self.settle_pending_receipt()
-                _write_pending_receipt(self.anchor_receipts_path,
-                                       {'receipt': receipt, 'probe': anchor_probe(txid).hex()})
-            except Exception as exp:
-                # A failed marker write must never break the stamp loop;
-                # without it a stop between the save and the receipt
-                # loses the receipt silently, so say so now.
-                logging.warning("Failed to write pending anchor receipt marker for tx %s: %s" % (txid, error_text(exp)))
+            # Earlier anchors' markers first, each on its own (one that
+            # cannot be settled is logged and left standing); then this
+            # anchor's marker. A marker that cannot be written is a save
+            # that does not happen this pass: the error reaches
+            # __save_mature_trees, which keeps the tree and retries every
+            # pass. A receipts directory that cannot be written therefore
+            # delays publication; it never retires a receipt that nothing
+            # durable owns (2026-09-18 cold review R06: the failure used to
+            # be logged and the save went on, and when the append after it
+            # failed too the tree was retired with no marker and no
+            # receipt). The other durable owner would be a record of the
+            # owed receipt inside the save's own batch; the delay is the
+            # smaller change and is the one the contract states (C5).
+            self.settle_pending_receipt()
+            _write_pending_receipt(self.anchor_receipts_path,
+                                   {'receipt': receipt, 'probe': anchor_probe(txid).hex()})
 
         if watermark is None:
             self.calendar.add_commitment_timestamps(confirmed_tx.commitment_timestamps)
@@ -773,10 +787,13 @@ class Stamper:
 
         A tree leaves txs_waiting_for_confirmation only after its save has
         returned, i.e. after the calendar's synchronous write; a save that
-        raises keeps the tree, logged once, and every pass retries every
-        mature unsaved tree, whether or not a new block arrived, until it
-        lands. Only then are its record counts and journal indexes
-        released and the checkpoint advanced.
+        raises (the calendar's write, or the receipt marker before it)
+        keeps the tree, logged once, and every pass retries every mature
+        unsaved tree, whether or not a new block arrived, until it lands.
+        Only then are its record counts and journal indexes released and
+        the checkpoint advanced. Called only once every known block's body
+        has been read (__do_bitcoin): a tree whose block a reorg replaced
+        is back in pending before anything is called mature.
         """
         if not self.txs_waiting_for_confirmation:
             return
@@ -789,10 +806,13 @@ class Stamper:
                 self.__save_confirmed_timestamp_tx(confirmed_tx, watermark)
             except Exception as exp:
                 if not self.save_failed_warned:
-                    logging.error("Calendar save failed for tx %s (%d timestamps): %r; the tree is kept and "
+                    # The error by its class and errno, never its text: a
+                    # marker that could not be written names the receipts
+                    # file in it, a database error names the directory.
+                    logging.error("Calendar save failed for tx %s (%d timestamps): %s; the tree is kept and "
                                   "retried every pass until it lands"
-                                  % (b2lx(confirmed_tx.tx.GetTxid()), len(confirmed_tx.commitment_timestamps), exp),
-                                  exc_info=True)
+                                  % (b2lx(confirmed_tx.tx.GetTxid()), len(confirmed_tx.commitment_timestamps),
+                                     error_text(exp)))
                     self.save_failed_warned = True
                 continue
             if self.save_failed_warned:
@@ -869,8 +889,27 @@ class Stamper:
         new_blocks = self.known_blocks.update_from_proxy(proxy)
         best_height = new_blocks[-1][0] if new_blocks else self.known_blocks.best_block_height()
 
+        # Observed is not processed. known_blocks holds the headers seen;
+        # this queue owns each block's body until it has been read and
+        # every tree waiting at its height has been put back to pending. A
+        # fetch that raises leaves that block and every block after it
+        # queued for the next pass, and no tree is saved as mature while a
+        # block is still owed (2026-09-18 cold review R01: the header
+        # cursor advanced before the bodies were read, so one failed fetch
+        # consumed a reorg's notification, and the next pass saved the
+        # orphaned tree against the new chain's height). update_from_proxy
+        # appends from the fork point up, so a block still queued at or
+        # above the first new height was itself replaced: its replacement
+        # is among the new blocks, and it is dropped unread.
         for (block_height, block_hash) in new_blocks:
             logging.info("New block %s at height %d" % (b2lx(block_hash), block_height))
+        if new_blocks:
+            fork = new_blocks[0][0]
+            self.unprocessed_blocks = [b for b in self.unprocessed_blocks if b[0] < fork]
+        self.unprocessed_blocks = list(self.unprocessed_blocks) + list(new_blocks)
+
+        while self.unprocessed_blocks:
+            block_height, block_hash = self.unprocessed_blocks[0]
 
             # If there already are txs waiting for confirmation at this
             # block_height, there was a reorg and those pending commitments now
@@ -891,7 +930,8 @@ class Stamper:
                 try:
                     block = proxy.getblock(block_hash)
                 except KeyError:
-                    # Must have been a reorg or something, return
+                    # Must have been a reorg or something, return: the block
+                    # stays queued and is asked for again next pass
                     logging.error("Failed to get block")
                     return
                 except BrokenPipeError:
@@ -950,8 +990,13 @@ class Stamper:
 
                 break
 
-        # Save every mined tree that is deep enough, including any kept back
-        # by an earlier failed save (retried on every pass, new block or not).
+            # This block's body is read and its height's tree, if a reorg
+            # replaced it, is back in pending: the block is done.
+            del self.unprocessed_blocks[0]
+
+        # Every known block is processed. Save every mined tree that is deep
+        # enough, including any kept back by an earlier failed save (retried
+        # on every pass, new block or not).
         self.__save_mature_trees(best_height)
 
         # If we don't have any new blocks, and we have any unconfirmed
@@ -1291,7 +1336,11 @@ class Stamper:
         self.conf_target = conf_target
         self.relay_feerate = relay_feerate
         self.min_confirmations = min_confirmations
-        assert self.min_confirmations > 1
+        if not self.min_confirmations > 1:
+            # otsd refuses the flag before any socket or worker exists;
+            # this guard is for every other caller, and a ValueError is
+            # not stripped by -O as an assert would be.
+            raise ValueError("min_confirmations must be greater than 1, got %r" % (min_confirmations,))
         self.min_tx_interval = min_tx_interval
         self.max_fee = max_fee
         self.max_pending = max_pending
@@ -1301,6 +1350,7 @@ class Stamper:
         self.anchor_receipts_path = os.getenv("OTSD_ANCHOR_RECEIPTS") or None
 
         self.known_blocks = KnownBlocks()
+        self.unprocessed_blocks = []
         self.unconfirmed_txs = []
 
         self.pending_commitments = OrderedSet()

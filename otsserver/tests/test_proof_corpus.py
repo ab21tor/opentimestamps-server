@@ -149,6 +149,36 @@ class Test_corpus_against_the_library(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(library_verdict(data)[0], 'invalid')
 
+    def test_every_attestation_type_the_client_knows_is_read_as_the_client_reads_it(self):
+        """2026-09-18 cold review R09: the Litecoin and Ethereum tags are
+        known to the client and read as one varuint height; the readers
+        here took them for opaque unknown tags, so a payload the client
+        refuses (empty, a trailing byte) parsed, alone and beside a
+        Bitcoin node. For each of the four tags: a valid payload, an empty
+        one, a trailing byte, an unterminated varuint; alone for both
+        readers, beside a Bitcoin node for the tree reader (the linear
+        reader refuses every fork by design). The verdict is the library's,
+        computed here. A valid Litecoin or Ethereum payload reads as
+        unknown: no usable attestation, and no claim about that chain."""
+        tags = (('pending', corpus.PENDING_TAG, corpus.vb(corpus.URI)), ('bitcoin', corpus.BITCOIN_TAG, corpus.vu(7)),
+                ('litecoin', corpus.LITECOIN_TAG, corpus.vu(7)), ('ethereum', corpus.ETHEREUM_TAG, corpus.vu(7)))
+        for name, tag, valid in tags:
+            for shape, payload in (('valid', valid), ('empty', b''), ('trailing', valid + b'\x00'), ('unterminated', b'\x80')):
+                alone = corpus.head() + corpus.att(tag, payload)
+                beside = corpus.head() + b'\xff' + corpus.att(tag, payload) + corpus.append(b'\x44') + corpus.sha() + corpus.bitcoin(850000)
+                with self.subTest(tag=name, payload=shape):
+                    lib = library_verdict(alone)
+                    self.assertEqual(lib[0], 'parses' if shape == 'valid' else 'invalid', lib)
+                    self.assertEqual(claim_verdict(alone)[0], lib[0], claim_verdict(alone))
+                    self.assertEqual(selfstamp_verdict(alone)[0], lib[0], selfstamp_verdict(alone))
+                    self.assertEqual(claim_verdict(beside)[0], library_verdict(beside)[0])
+                    self.assertEqual(selfstamp_verdict(beside)[0], 'invalid', 'the linear reader refuses forks')
+                    if shape == 'valid':
+                        kind = {'pending': 'pending', 'bitcoin': 'bitcoin'}.get(name, 'unknown')
+                        self.assertEqual(claim_verdict(alone)[1][0][0], kind)
+                        self.assertEqual(selfstamp_verdict(alone)[1][0][0], kind)
+                        self.assertEqual(claim_verdict(alone), lib)
+
 
 if __name__ == "__main__":
     unittest.main()

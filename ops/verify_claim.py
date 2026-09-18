@@ -74,6 +74,11 @@ ATTESTATION_MARKER = 0x00
 FORK_MARKER = 0xff
 PENDING_TAG = bytes.fromhex('83dfe30d2ef90c8e')
 BITCOIN_TAG = bytes.fromhex('0588960d73d71901')
+# The other two block-header attestations the public client knows
+# (Litecoin; Ethereum under dubious/): one varuint height, read to its
+# end as the client reads it, and no usable attestation here (2026-09-18
+# cold review R09).
+HEIGHT_TAGS = (BITCOIN_TAG, bytes.fromhex('06869a0d73d71b45'), bytes.fromhex('30fe8087b5c7ead7'))
 OP_NAMES = {OP_SHA256: 'sha256', OP_APPEND: 'append', OP_PREPEND: 'prepend'}
 # The public client's limits (opentimestamps 0.4.x), mirrored so that
 # "parses" means the same here as there; ops/tests/proof_corpus.py holds
@@ -151,8 +156,10 @@ def read_varbytes(data, pos, max_len, min_len=0):
 
 def _read_attestation(data, pos, msg, path):
     """The attestation whose marker byte was just read: (Attestation, end).
-    A known payload is consumed to its last byte; a pending URI is at most
-    MAX_URI bytes of URI_CHARS; an unknown tag is kept as 'unknown:<hex>'."""
+    A known payload (pending, and the three block-header tags) is consumed
+    to its last byte; a pending URI is at most MAX_URI bytes of URI_CHARS;
+    only Bitcoin is a usable attestation; every other tag, the Litecoin
+    and Ethereum ones included, is kept as 'unknown:<hex>'."""
     atag = data[pos:pos + 8]
     if len(atag) != 8:
         raise ProofError('truncated attestation tag')
@@ -165,11 +172,12 @@ def _read_attestation(data, pos, msg, path):
         if any(b not in URI_CHARS for b in uri):
             raise ProofError('pending uri has a character outside the allowed set')
         return Attestation('pending', None, uri.decode('ascii'), msg, tuple(path)), pos
-    if atag == BITCOIN_TAG:
+    if atag in HEIGHT_TAGS:
         height, end = read_varuint(payload, 0)
         if end != len(payload):
-            raise ProofError('trailing bytes in the bitcoin attestation')
-        return Attestation('bitcoin', height, None, msg, tuple(path)), pos
+            raise ProofError('trailing bytes in the block header attestation')
+        if atag == BITCOIN_TAG:
+            return Attestation('bitcoin', height, None, msg, tuple(path)), pos
     return Attestation('unknown:' + atag.hex(), None, None, msg, tuple(path)), pos
 
 

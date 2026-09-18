@@ -943,5 +943,203 @@ class Test_messages_name_no_identity(unittest.TestCase):
                 self.assertNotIn('client-acme-7731', line, line)
 
 
+# --- W3: journalctl's exit status is the query's, not the match's (R10) --------------------------
+
+class Test_journal_exit_semantics(unittest.TestCase):
+    """W3 (2026-09-18 cold review R10). Under -q, `journalctl -g PATTERN`
+    exits 1 when nothing matches (systemd v257, journalctl-show.c), so a
+    quiet window used to read as a failed query: the cursor never moved
+    and journal_read alarmed on every calm box. The patterns are matched
+    here now, over the window's lines, and a nonzero exit is a failed
+    query. Fault model: a command double that answers as journalctl does
+    (exit 1, no output, to a -g query that matches nothing; the window's
+    lines to the others); a double that fails every query."""
+
+    SSH = ("Sep 18 10:00:01 box sshd[1]: Accepted publickey for ops from 203.0.113.7 port 5 ssh2\n"
+           "Sep 18 10:00:02 box sshd[2]: Failed password for root from 198.51.100.9 port 6 ssh2\n"
+           "Sep 18 10:00:03 box sshd[3]: Invalid user admin from 198.51.100.9 port 7\n"
+           "Sep 18 10:00:04 box sshd[4]: Connection closed by 198.51.100.9 port 7\n")
+    KERNEL = ("Sep 18 10:00:05 box kernel: egress-drop IN= OUT=eth0 DST=203.0.113.9\n"
+              "Sep 18 10:00:06 box kernel: usb 1-1: new device\n")
+
+    def journalctl_like(self, seen):
+        def command(cmd, **kwargs):
+            if cmd[0] != 'journalctl':
+                return 0, ''
+            seen.append(cmd)
+            if '-g' in cmd:
+                return 1, ''          # no match under -q: exit 1 and silence
+            if '-u' in cmd:
+                return 0, self.SSH
+            if '-k' in cmd:
+                return 0, self.KERNEL
+            return 0, ''              # -p err: a quiet window
+        return command
+
+    def config(self):
+        cfg = review_cfg(NTFY_URL='')
+        for key in watch.SKIP_WHEN_EMPTY.values():
+            cfg[key] = ''
+        return cfg
+
+    def test_the_patterns_are_matched_here_and_a_quiet_window_is_a_successful_read(self):
+        seen = []
+        with mock.patch.object(watch, 'run', side_effect=self.journalctl_like(seen)), \
+                mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')):
+            o = watch.observe(self.config(), NOW, {'journal': NOW - 300})
+        self.assertEqual(len(seen), 5, 'every journal query was made')
+        self.assertFalse(any('-g' in cmd for cmd in seen), 'no query asks journalctl to match the pattern')
+        self.assertEqual(o['journal_failed'], [])
+        self.assertEqual(o['journal_errors'], 0)
+        self.assertEqual(o['ssh_failures'], 2)
+        self.assertEqual(o['ssh_sources'], ['203.0.113.7'])
+        self.assertEqual(o['egress_drops'], 1)
+        checks = watch.evaluate(o, self.config())
+        self.assertIs(checks['journal_read'][0], True)
+        self.assertIs(checks['ssh_failures'][0], True)
+
+    def run_three(self, command):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            (d / 'state.json').write_text(json.dumps({'cursors': {'journal': NOW - 300}}))
+            with mock.patch.multiple(watch, WATCH_DIR=str(d), STATE=str(d / 'state.json'), STATUS=str(d / 'status')), \
+                    mock.patch.object(watch, 'load_config', return_value=self.config()), \
+                    mock.patch.object(watch, 'run', side_effect=command), \
+                    mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')), \
+                    mock.patch.object(watch.time, 'time', return_value=NOW), mock.patch.object(watch, 'log'):
+                codes = [watch.real_run(False) for _ in range(3)]
+            return codes, json.loads((d / 'state.json').read_text())
+
+    def test_three_quiet_runs_move_the_cursor_and_alarm_nothing(self):
+        codes, state = self.run_three(lambda cmd, **kw: (1, '') if cmd[0] == 'journalctl' and '-g' in cmd else (0, ''))
+        self.assertEqual(codes, [0, 0, 0])
+        self.assertEqual(state['cursors']['journal'], NOW, 'a quiet window is read; the cursor moves past it')
+        self.assertNotIn('journal_read', state['delivered'])
+
+    def test_a_query_that_fails_still_keeps_the_cursor(self):
+        codes, state = self.run_three(lambda cmd, **kw: (2, ''))
+        self.assertEqual(state['cursors']['journal'], NOW - 300, 'the unread window is read again next run')
+        self.assertIn('journal_read', state['delivered'])
+
+
+# --- W4: the newest confirmation, not the last line (R11) -----------------------------------------
+
+class Test_receipt_order(unittest.TestCase):
+    """W4 anchor_age (2026-09-18 cold review R11). C5 lets a receipt
+    recovered from its marker be appended after later anchors' lines, and
+    the check used to take the last line as the newest confirmation, so a
+    recovery made a fresh anchor read as stale. Now the age is from the
+    newest confirmed_at; a confirmed_at that is not a finite number makes
+    the file unparseable and the check unknown. Fault model: receipts
+    files written in the orders C5 allows; malformed values."""
+
+    def observe(self, lines):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            receipts = d / 'receipts.jsonl'
+            receipts.write_text(''.join(
+                (l if isinstance(l, str) else json.dumps({'txid': '%064x' % i, 'confirmed_at': l})) + '\n'
+                for i, l in enumerate(lines)))
+            cfg = review_cfg(RECEIPTS=str(receipts))
+            for key in watch.SKIP_WHEN_EMPTY.values():
+                if key != 'RECEIPTS':
+                    cfg[key] = ''
+            with mock.patch.object(watch, 'run', return_value=(0, '')), \
+                    mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')):
+                o = watch.observe(cfg, NOW, {})
+            return o, watch.evaluate(o, cfg)['anchor_age']
+
+    def test_a_receipt_recovered_late_does_not_make_a_fresh_anchor_stale(self):
+        o, verdict = self.observe([NOW - 3600, NOW - 50 * 3600])
+        self.assertEqual(o['anchors'], 2)
+        self.assertEqual(o['anchor_age_h'], 1.0, 'append order is not confirmation order')
+        self.assertIs(verdict[0], True, verdict)
+
+    def test_the_chronological_control_and_genuine_staleness(self):
+        self.assertIs(self.observe([NOW - 50 * 3600, NOW - 3600])[1][0], True)
+        self.assertIs(self.observe([NOW - 50 * 3600])[1][0], False)
+        self.assertIs(self.observe([NOW - 50 * 3600, NOW - 40 * 3600])[1][0], False, 'the newest is still too old')
+
+    def test_a_confirmed_at_that_is_not_a_finite_number_is_unparseable_not_an_age(self):
+        for bad in ('"yesterday"', 'true', 'null', '1e309', '[1]'):
+            with self.subTest(confirmed_at=bad):
+                o, verdict = self.observe([NOW - 3600, '{"txid": "%064x", "confirmed_at": %s}' % (7, bad)])
+                self.assertEqual(o['receipts_error'], 'unparseable')
+                self.assertIsNone(o['anchor_age_h'])
+                self.assertIsNone(verdict[0])
+                self.assertIn('unknown', verdict[1])
+
+
+# --- W8: numbers the run cannot use (R12) ----------------------------------------------------------
+
+class Test_numeric_poison(unittest.TestCase):
+    """W8 (2026-09-18 cold review R12). JSON's 1e309 decodes to infinity,
+    which passed the state's type check and then failed int(cursor) on
+    every run, past the quarantine; a cap notice whose `dropped` was not
+    a number passed the message check and crashed the fold. Now a cursor
+    or a since time must be a finite number and a cap notice's count a
+    count; what is refused follows the existing aside-and-notice path.
+    Fault model: state and outbox files with those values."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.dir = pathlib.Path(self.tmpdir.name)
+        self.state = self.dir / 'state.json'
+
+    def asides(self, prefix='state.json.corrupt-'):
+        return sorted(p for p in self.dir.iterdir() if p.name.startswith(prefix))
+
+    def test_an_infinite_cursor_or_since_time_is_set_aside_and_the_run_goes_on(self):
+        for raw in (b'{"cursors":{"journal":1e309}}', b'{"since":{"mem":1e309},"delivered":["mem"],"fail_runs":{"mem":2}}'):
+            with self.subTest(raw=raw):
+                for p in list(self.dir.iterdir()):
+                    p.unlink()
+                self.state.write_bytes(raw)
+                sent = []
+                with watcher_run(self.dir, SLOW, lambda _, t: sent.append(t) or (True, 'ok')):
+                    rc = watch.real_run(False)
+                self.assertEqual(rc, 0)
+                self.assertEqual([p.read_bytes() for p in self.asides()], [raw])
+                self.assertEqual(len(sent), 1, sent)
+                self.assertIn('state.json could not be read', sent[0])
+                st = json.loads(self.state.read_text())
+                self.assertTrue(watch.valid_state(st))
+                self.assertEqual(st['cursors']['journal'], NOW)
+
+    def test_a_finite_float_cursor_is_still_a_valid_state(self):
+        self.state.write_bytes(b'{"cursors":{"journal":1788599700.5}}')
+        with watcher_run(self.dir, ALL_OK, lambda *_: (True, 'ok')):
+            self.assertEqual(watch.real_run(False), 0)
+        self.assertEqual(self.asides(), [])
+        self.assertEqual(json.loads(self.state.read_text())['cursors']['journal'], NOW)
+
+    def test_a_cap_notice_needs_a_count(self):
+        notice = {'text': 'drop notice', 'queued': 'old', 'cap': True}
+        self.assertTrue(watch.valid_messages([dict(notice, dropped=2)]))
+        for bad in ([], '2', True, None, 2.0):
+            with self.subTest(dropped=bad):
+                self.assertFalse(watch.valid_messages([dict(notice, dropped=bad)]), 'enqueue adds to dropped')
+        self.assertFalse(watch.valid_messages([notice]))
+        self.assertTrue(watch.valid_messages([{'text': 'alert', 'queued': 'later'}]), 'an ordinary message needs no count')
+
+    def test_the_valid_cap_control_folds(self):
+        messages = [{'text': 'drop notice', 'queued': 'old', 'cap': True, 'dropped': 2}]
+        result, dropped = watch.enqueue(messages + [{'text': 'alert', 'queued': 'later'}] * 201, [], review_cfg(), 'now')
+        self.assertEqual(len(result), watch.OUTBOX_MAX)
+        self.assertGreater(result[0]['dropped'], 2)
+        self.assertEqual(dropped, 2)
+
+    def test_an_outbox_holding_such_a_notice_is_set_aside_with_a_notice_and_the_run_goes_on(self):
+        (self.dir / 'outbox.json').write_bytes(b'[{"text": "drop notice", "queued": "old", "cap": true, "dropped": []}]')
+        sent = []
+        with watcher_run(self.dir, BURST, lambda _, t: sent.append(t) or (True, 'ok')):
+            rc = watch.real_run(False)
+        self.assertEqual(rc, 0, sent)
+        self.assertEqual(len(self.asides('outbox.json.corrupt-')), 1)
+        self.assertTrue(any('outbox.json could not be read' in t for t in sent), sent)
+        self.assertTrue(any('DEGRADED' in t for t in sent), 'the run went on to its own alert')
+
+
 if __name__ == "__main__":
     unittest.main()

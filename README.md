@@ -467,15 +467,22 @@ each second's tree carried, no digests.
 
 Two rules the code keeps:
 
-- A receipt write failure never breaks anchoring. The stamper logs one
-  warning and continues; the calendar save always happens, and the
-  receipt stays in the pending marker until it can be written.
+- A receipt append failure never breaks anchoring: the save has
+  happened, the stamper logs one warning, and the receipt stays in the
+  pending marker until it can be written. A marker that cannot be
+  written is the other case: the save does not happen that pass, the
+  tree is kept and retried every pass, and a receipts directory that
+  cannot be written delays publication until it can. That is the
+  trade-off `docs/contracts.md` C5 states; until 2026-09-18 the save
+  went on without its marker, and when the append then failed too the
+  tree was retired with nothing to own its receipt (cold review R06).
 - A confirmed tree leaves memory only once its calendar save has
   returned (LevelDB's synchronous write). A save that fails is logged
   once, the tree is kept, and every pass, new block or not, retries every
   mature unsaved tree until it lands; nothing accepted is dropped.
-- No crash writes two receipts for the same records, and no receipt is
-  lost: one still owed has its marker standing. The receipt is written
+- No crash writes two receipts for the same records, and no receipt of
+  a saved anchor is lost: no anchor is saved before its marker is on
+  file, and one still owed has its marker standing. The receipt is written
   after the calendar save, guarded by a marker named by the anchor:
   before the save the stamper writes `<receipts file>.pending.<txid>`,
   the receipt line plus the anchor's own key (its txid, as the saved tree
@@ -1527,7 +1534,8 @@ Test modules live under `otsserver/tests/`:
   `test_claim_kit.py`, `test_stamper_save_retry.py`,
   `test_rpc_privacy.py`, `test_proof_corpus.py`,
   `test_selfstamp_workflow.py`, `test_watch_observation.py`,
-  `test_restore_calendar.py`, `test_restore_tools.py`: regression tests for this branch's delta
+  `test_restore_calendar.py`, `test_restore_tools.py`,
+  `test_stamper_block_queue.py`: regression tests for this branch's delta
   (launcher flags, the status line and its RPC wiring, stamper-loop
   crash fixes, anchor receipts, anchor cadence, the `/digest`
   Content-Length handling, anchor-receipt record counts and their
@@ -1576,6 +1584,18 @@ Test modules live under `otsserver/tests/`:
   (`ops/tests/proof_corpus.py`) run against both readers under `ops/`
   and against the `opentimestamps` library as the oracle
   (`test_proof_corpus.py`; `docs/contracts.md`, "The proof parser").
+  The 2026-09-18 cold review's calendar and watcher findings likewise: a
+  block body the node did not return kept owed, with a reorg and a
+  restart, and no orphan saved (`test_stamper_block_queue.py`); a receipt
+  marker that cannot be written holding the save back until it can
+  (`test_receipt_marker.py`, `test_anchor_receipts.py`); a `/digest`
+  body shorter than declared refused, over a real half-closed connection
+  too (`test_rpc_digest.py`); a confirmation depth the help forbids
+  refused before anything is bound (`test_otsd_launcher.py`); the
+  watcher's quiet journal window, the newest receipt rather than the
+  last line, and infinite numbers in its state (`test_watch_observation.py`);
+  and the Litecoin and Ethereum attestation payloads read as the library
+  reads them (`test_proof_corpus.py`).
   Every durability test injects failures at the write boundary or kills
   the process; none simulates a power cut.
 

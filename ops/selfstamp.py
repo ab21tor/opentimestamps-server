@@ -126,6 +126,13 @@ ATTESTATION_MARKER = 0x00
 FORK_MARKER = 0xff
 PENDING_TAG = bytes.fromhex('83dfe30d2ef90c8e')
 BITCOIN_TAG = bytes.fromhex('0588960d73d71901')
+# The other two block-header attestations the public client knows
+# (LitecoinBlockHeaderAttestation; EthereumBlockHeaderAttestation under
+# dubious/). Their payload is one varuint height, read to its end exactly
+# as the client reads it; they are not usable attestations here and read
+# as unknown (2026-09-18 cold review R09: they used to be opaque, so an
+# empty or trailing payload the client refuses parsed).
+HEIGHT_TAGS = (BITCOIN_TAG, bytes.fromhex('06869a0d73d71b45'), bytes.fromhex('30fe8087b5c7ead7'))
 
 # The public client's limits (opentimestamps 0.4.x), mirrored so that
 # "parses" means the same here as there; the corpus in ops/tests/
@@ -234,8 +241,10 @@ def read_varbytes(data, pos, max_len, min_len=0):
 
 def read_attestation(data, pos):
     """The attestation whose marker byte was just read: (kind, value, end).
-    A known payload is consumed to its last byte; a pending URI is at most
-    MAX_URI bytes of URI_CHARS; an unknown tag is kept as ('unknown', hex)."""
+    A known payload (pending, and the three block-header tags) is consumed
+    to its last byte; a pending URI is at most MAX_URI bytes of URI_CHARS;
+    only Bitcoin is a usable attestation; every other tag, the Litecoin
+    and Ethereum ones included, is kept as ('unknown', hex)."""
     atag = data[pos:pos + 8]
     if len(atag) != 8:
         raise OtsError('truncated attestation tag')
@@ -248,11 +257,12 @@ def read_attestation(data, pos):
         if any(b not in URI_CHARS for b in uri):
             raise OtsError('pending uri has a character outside the allowed set')
         return 'pending', uri.decode('ascii'), pos
-    if atag == BITCOIN_TAG:
+    if atag in HEIGHT_TAGS:
         height, end = read_varuint(payload, 0)
         if end != len(payload):
-            raise OtsError('trailing bytes in the bitcoin attestation')
-        return 'bitcoin', height, pos
+            raise OtsError('trailing bytes in the block header attestation')
+        if atag == BITCOIN_TAG:
+            return 'bitcoin', height, pos
     return 'unknown', atag.hex(), pos
 
 

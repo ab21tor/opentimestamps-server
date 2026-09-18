@@ -155,24 +155,26 @@ class Test_anchor_receipts(unittest.TestCase):
             self.assertEqual(init_stamper().anchor_receipts_path,
                              self.receipts_path)
 
-    def test_write_failure_does_not_break_confirmation(self):
+    def test_a_marker_that_cannot_be_written_is_a_save_that_does_not_happen(self):
+        """2026-09-18 cold review R06 (C5). Until this change the marker's
+        failure was a warning and the save went on: with the receipt
+        append failing after it, the tree was retired with no marker and
+        no receipt. Now the marker's error is the save's error: nothing is
+        saved, the tree stays owned, and __save_mature_trees retries it
+        every pass (test_receipt_marker.Test_marker_before_save has the
+        continued execution and the restart on the real store). The append
+        failing after a save is the other direction, and still never
+        blocks the save (test_receipt_marker)."""
         bad_path = os.path.join(self.tmpdir.name, 'no-such-dir', 'r.jsonl')
         stamper = make_stamper(bad_path)
-        (_, _, final), mined_tx = simulate_rbf_cycle(stamper)
+        _, mined_tx = simulate_rbf_cycle(stamper)
 
-        with self.assertLogs(level='WARNING') as captured:
-            save(stamper, stamper.txs_waiting_for_confirmation.pop(850000))
+        with self.assertRaises(OSError):
+            save(stamper, mined_tx)
 
-        stamper.calendar.add_commitment_timestamps.assert_called_once_with(
-            mined_tx.commitment_timestamps)
-        # Two writes fail on an unwritable path — the pending marker before
-        # the save and the receipt after it — and each warns, naming the tx.
-        warnings = [r for r in captured.records
-                    if r.levelname == 'WARNING'
-                    and 'anchor receipt' in r.getMessage()]
-        self.assertEqual(len(warnings), 2, captured.output)
-        for w in warnings:
-            self.assertIn(b2lx(final.GetTxid()), w.getMessage())
+        stamper.calendar.add_commitment_timestamps.assert_not_called()
+        self.assertEqual(stamper.txs_waiting_for_confirmation, {850000: mined_tx}, 'the tree is still owned')
+        self.assertEqual(os.listdir(self.tmpdir.name), [], 'nothing written anywhere')
 
     def test_append_only_existing_bytes_untouched(self):
         stamper = make_stamper(self.receipts_path)

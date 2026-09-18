@@ -89,7 +89,9 @@ import errno
 import fcntl
 import glob
 import json
+import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -370,27 +372,33 @@ def observe(cfg, now, cursors, want_updates=False):
     # exit, a timeout) is recorded in journal_failed and reads as no lines,
     # never as no events: evaluate turns the list into the journal_read
     # check, and real_run keeps the cursor at journal_since until every
-    # query succeeds (2026-09-15/16 review F09).
+    # query succeeds (2026-09-15/16 review F09). The pattern searches are
+    # made here, over the window's lines, not by journalctl's -g: with -q
+    # that flag exits 1 when nothing matches, and a quiet window read as a
+    # failed query, so the cursor never moved and journal_read alarmed
+    # (2026-09-18 cold review R10; systemd v257 journalctl-show.c).
     o["journal_since"] = int(cursors.get("journal", now - 300))
     since = "@%d" % o["journal_since"]
     o["journal_failed"] = []
 
-    def journal(label, *args):
+    def journal(label, *args, pattern=None):
         rc, out = run(["journalctl"] + list(args))
         if rc != 0:
             o["journal_failed"].append(label)
             return ""
-        return out
+        if pattern is None:
+            return out
+        return "\n".join(l for l in out.splitlines() if re.search(pattern, l))
     o["journal_errors"] = sum(len(journal("errors" + ("(user)" if scope else ""),
                                           *(scope + ["-p", "err", "--since", since, "-q", "--no-pager"])).splitlines())
                               for scope in ([], ["--user"]))
-    o["ssh_failures"] = len(journal("ssh-failures", "-u", "ssh", "--since", since, "-q", "--no-pager", "-g",
-                                    "Failed password|Invalid user|authentication failure|maximum authentication attempts").splitlines())
+    o["ssh_failures"] = len(journal("ssh-failures", "-u", "ssh", "--since", since, "-q", "--no-pager",
+                                    pattern="Failed password|Invalid user|authentication failure|maximum authentication attempts").splitlines())
     # accepted ssh logins since the last run, by source address (zone suffix stripped)
-    acc = journal("ssh-accepted", "-u", "ssh", "--since", since, "-q", "--no-pager", "-g", "Accepted publickey")
+    acc = journal("ssh-accepted", "-u", "ssh", "--since", since, "-q", "--no-pager", pattern="Accepted publickey")
     o["ssh_sources"] = sorted({l.split(" from ", 1)[1].split()[0].split("%")[0] for l in acc.splitlines() if " from " in l})
     # refused outbound since the last run: the host firewall logs "egress-drop*" at warn, rate-limited
-    o["egress_drops"] = len(journal("egress", "-k", "--since", since, "-q", "--no-pager", "-g", "egress-drop").splitlines())
+    o["egress_drops"] = len(journal("egress", "-k", "--since", since, "-q", "--no-pager", pattern="egress-drop").splitlines())
     # dhcp: hours until the lease expires (renewal happens at half-life, so under 6 h means a renewal was missed)
     o["dhcp_lease_left_h"] = None
     if cfg["DHCP_IFACE"]:
@@ -431,11 +439,19 @@ def observe(cfg, now, cursors, want_updates=False):
         except OSError:
             o["receipts_error"] = "unreadable"
         else:
+            # The newest confirmation, not the last line: a receipt
+            # recovered from its marker is appended after later anchors'
+            # lines (C5), and the last line used to make a fresh anchor
+            # read as stale (2026-09-18 cold review R11). A confirmed_at
+            # that is not a finite number makes the file unparseable.
             try:
                 lines = [json.loads(l) for l in raw.decode("utf-8").splitlines() if l.strip()]
                 o["anchors"] = len(lines)
                 if lines:
-                    o["anchor_age_h"] = (now - lines[-1]["confirmed_at"]) / 3600.0
+                    times = [l["confirmed_at"] for l in lines]
+                    if not all(_finite(t) for t in times):
+                        raise ValueError("confirmed_at is not a finite number")
+                    o["anchor_age_h"] = (now - max(times)) / 3600.0
             except (ValueError, KeyError, TypeError, UnicodeDecodeError):
                 o["anchors"], o["anchor_age_h"], o["receipts_error"] = None, None, "unparseable"
     try:
@@ -853,22 +869,34 @@ class StateUnreadable(Exception):
 
 
 def valid_messages(data):
-    """A list of messages, each with the two fields delivery relies on"""
+    """A list of messages, each with the two fields delivery relies on,
+    and a cap notice with the count enqueue adds to (2026-09-18 cold
+    review R12: a `dropped` that was not a number crashed the fold)"""
     return isinstance(data, list) and all(
-        isinstance(m, dict) and isinstance(m.get("text"), str) and isinstance(m.get("queued"), str) for m in data)
+        isinstance(m, dict) and isinstance(m.get("text"), str) and isinstance(m.get("queued"), str)
+        and (not m.get("cap") or _count(m.get("dropped"))) for m in data)
 
 
 def _count(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def _finite(v):
+    """A number the run can do arithmetic on and convert: an int, or a
+    float that is finite. JSON's 1e309 decodes to infinity, which passes
+    a type check and then fails int() (2026-09-18 cold review R12)."""
+    if isinstance(v, bool):
+        return False
+    return isinstance(v, int) or (isinstance(v, float) and math.isfinite(v))
+
+
 def valid_state(data):
     """A state object whose fields, where present, are what the run relies
     on: a list of check names delivered; run counters by check; `since`
-    times by check; a heartbeat day; the drop accumulator; the cursors;
-    the owed queue as a list of messages. Older states may lack any of
-    them; a field of the wrong shape makes the file corrupt, and it is set
-    aside rather than half read."""
+    times by check, finite; a heartbeat day; the drop accumulator; the
+    cursors, finite; the owed queue as a list of messages. Older states
+    may lack any of them; a field of the wrong shape makes the file
+    corrupt, and it is set aside rather than half read."""
     if not isinstance(data, dict):
         return False
     if not isinstance(data.get("delivered", []), list) or not all(isinstance(n, str) for n in data.get("delivered", [])):
@@ -878,8 +906,7 @@ def valid_state(data):
         if not isinstance(runs, dict) or not all(isinstance(k, str) and _count(v) for k, v in runs.items()):
             return False
     since = data.get("since", {})
-    if not isinstance(since, dict) or not all(isinstance(k, str) and isinstance(t, (int, float)) and not isinstance(t, bool)
-                                              for k, t in since.items()):
+    if not isinstance(since, dict) or not all(isinstance(k, str) and _finite(t) for k, t in since.items()):
         return False
     if "heartbeat_day" in data and not isinstance(data["heartbeat_day"], str):
         return False
@@ -888,7 +915,7 @@ def valid_state(data):
     cursors = data.get("cursors", {})
     if not isinstance(cursors, dict):
         return False
-    if "journal" in cursors and (isinstance(cursors["journal"], bool) or not isinstance(cursors["journal"], (int, float))):
+    if "journal" in cursors and not _finite(cursors["journal"]):
         return False
     if data.get("owed") is not None and not valid_messages(data["owed"]):
         return False

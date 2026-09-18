@@ -21,26 +21,43 @@ the aggregator.
 
 The test fails on the pre-fix code: the handler read the 4 KiB body,
 submitted it, and answered from whatever the aggregator returned.
+
+Test_post_digest_body_length (2026-09-18 cold review R17): the handler
+checked the declared Content-Length and not the bytes it read, so a peer
+that closed after one byte of a declared 32 had that one byte aggregated
+and acknowledged as a digest. Now a body shorter than declared is a 400
+with nothing submitted, on a socketless handler and over a real TCP
+connection half-closed by the peer.
 """
 
+import os
+import socket
+import threading
 import unittest
 from io import BytesIO
+from unittest import mock
+
+from opentimestamps.core.notary import PendingAttestation
+from opentimestamps.core.timestamp import Timestamp
 
 import otsserver.rpc
 
 
 class RecordingAggregator:
-    """Records every submit(); the test asserts none happen."""
+    """Records every submit(); answers a pending timestamp of the digest."""
 
     def __init__(self):
         self.submitted = []
 
-    def submit(self, digest):
+    def submit(self, digest, counted=True):
         self.submitted.append(digest)
+        timestamp = Timestamp(digest)
+        timestamp.attestations.add(PendingAttestation('http://127.0.0.1:14788'))
+        return timestamp
 
 
-def drive_post_digest(content_length_header, body=b""):
-    """Run do_POST('/digest') on a socketless handler; return (head, body, aggregator)."""
+def drive_post_digest(content_length_header, body=b"", path="/digest"):
+    """Run do_POST on a socketless handler; return (head, body, aggregator)."""
     handler_cls = otsserver.rpc.RPCRequestHandler
     handler = handler_cls.__new__(handler_cls)
     aggregator = RecordingAggregator()
@@ -48,7 +65,7 @@ def drive_post_digest(content_length_header, body=b""):
     handler.rfile = BytesIO(body)
     handler.wfile = BytesIO()
     handler.headers = {"Content-Length": content_length_header}
-    handler.path = "/digest"
+    handler.path = path
     handler.command = "POST"
     handler.request_version = "HTTP/1.0"
     handler.requestline = "POST /digest HTTP/1.0"
@@ -83,6 +100,62 @@ class Test_post_digest_content_length_parse(unittest.TestCase):
         self.assertTrue(head.startswith(b"HTTP/1.0 400"), head[:40])
         self.assertIn(b"invalid Content-Length", body)
         self.assertEqual(aggregator.submitted, [])
+
+
+class Test_post_digest_body_length(unittest.TestCase):
+    """2026-09-18 cold review R17: the bytes read, not the length declared,
+    are the digest. Fault model: a body shorter than its Content-Length,
+    on the socketless handler and from a real peer that half-closes."""
+
+    def test_a_body_shorter_than_declared_is_refused_before_aggregation(self):
+        head, body, aggregator = drive_post_digest("32", body=b"x")
+        self.assertTrue(head.startswith(b"HTTP/1.0 400"), head[:40])
+        self.assertIn(b"shorter than Content-Length", body)
+        self.assertEqual(aggregator.submitted, [])
+
+    def test_the_operator_lane_refuses_it_the_same_way(self):
+        with mock.patch.dict(os.environ, {"OTSD_OPERATOR_LANE": "1"}):
+            head, body, aggregator = drive_post_digest("32", body=b"x" * 31, path="/operator/digest")
+        self.assertTrue(head.startswith(b"HTTP/1.0 400"), head[:40])
+        self.assertEqual(aggregator.submitted, [])
+
+    def test_the_whole_declared_body_is_the_digest(self):
+        head, body, aggregator = drive_post_digest("32", body=b"x" * 32)
+        self.assertTrue(head.startswith(b"HTTP/1.0 200"), head[:40])
+        self.assertEqual(aggregator.submitted, [b"x" * 32])
+
+    def over_tcp(self, body, declared):
+        """POST /digest over a real connection, declaring `declared` bytes,
+        sending `body`, then half-closing; returns (status line, aggregator)."""
+        aggregator = RecordingAggregator()
+        server = otsserver.rpc.StampServer(("127.0.0.1", 0), aggregator, None)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with socket.create_connection(server.server_address, timeout=5) as sock:
+                sock.sendall(("POST /digest HTTP/1.0\r\nContent-Length: %d\r\n\r\n" % declared).encode() + body)
+                sock.shutdown(socket.SHUT_WR)
+                out = b""
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    out += chunk
+            return out.split(b"\r\n")[0], aggregator
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join()
+
+    def test_a_peer_that_closes_early_gets_a_400_and_nothing_is_aggregated(self):
+        status, aggregator = self.over_tcp(b"x", 32)
+        self.assertIn(b"400", status)
+        self.assertEqual(aggregator.submitted, [])
+
+    def test_a_peer_that_sends_the_whole_body_is_acknowledged(self):
+        status, aggregator = self.over_tcp(b"x" * 32, 32)
+        self.assertIn(b"200", status)
+        self.assertEqual(aggregator.submitted, [b"x" * 32])
 
 
 if __name__ == "__main__":

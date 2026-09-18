@@ -40,6 +40,8 @@ import otsserver.stamper
 from otsserver.stamper import (Stamper, TimestampTx, marker_path, make_timestamp_from_block_tx,
                                _write_pending_receipt)
 from otsserver.tests.test_anchor_receipts import make_stamper, make_commitments
+import otsserver.tests.test_stamper_block_queue as block_queue   # the real-store fixtures
+from otsserver.stamper import pending_markers
 
 
 def nodes(timestamp):
@@ -496,6 +498,130 @@ class Test_marker_per_anchor(unittest.TestCase):
         self.assertEqual([r['txid'] for r in self.lines()], [txid])
         self.assertFalse(os.path.exists(legacy))
         self.assertEqual(self.markers(), [])
+
+
+class Test_marker_before_save(unittest.TestCase):
+    """C5 (2026-09-18 cold review R06): a marker that cannot be written is
+    a save that does not happen. Before this change the failure was logged
+    and the save went on; when the receipt append then failed too, the
+    tree was retired with no marker and no receipt, and the message said
+    the marker kept a receipt no marker held. Now the error reaches
+    __save_mature_trees, the tree is kept and retried every pass, and a
+    receipts directory that cannot be written delays publication (the
+    trade-off C5 states) rather than retiring a receipt nothing durable
+    owns. Fault model: the receipts directory made unwritable (chmod 500,
+    listable; skipped as root, who writes anything) and restored; a stop
+    as a fresh Stamper on the same calendar; a real journal, database and
+    receipts file. Not a power cut."""
+
+    def unwritable(self, directory):
+        if os.geteuid() == 0:
+            raise unittest.SkipTest('running as root: permission faults cannot be injected')
+        directory.chmod(0o500)
+
+        def restore():
+            try:
+                directory.chmod(0o700)
+            except FileNotFoundError:
+                pass   # the fixture is gone already
+        self.addCleanup(restore)
+        return restore
+
+    def save_pass(self, s, best_height):
+        s._Stamper__save_mature_trees(best_height)
+
+    def test_a_marker_that_cannot_be_written_keeps_the_tree_until_it_can(self):
+        with block_queue.calendar_fixture() as (d, cal, rp):
+            msg = block_queue.submit(cal)
+            tree = block_queue.mined(msg)
+            s = block_queue.stamper(cal, rp)
+            s.txs_waiting_for_confirmation = {102: tree}
+            s.commitment_idxs = {msg: 0}
+            s.commitment_records = {msg: 5}
+            s.journal_cursor = 1
+            restore = self.unwritable(rp.parent)
+            with self.assertLogs(level='ERROR') as captured:
+                self.save_pass(s, 107)
+            message = ' '.join(r.getMessage() for r in captured.records)
+            self.assertIn('kept and retried', message)
+            self.assertIn('PermissionError errno=13', message)
+            self.assertNotIn(str(rp.parent), message, 'the receipts directory is never named')
+            self.assertEqual(s.txs_waiting_for_confirmation, {102: tree}, 'the tree is still owned')
+            self.assertNotIn(msg, cal, 'publication waits for the marker')
+            self.assertEqual(pending_markers(str(rp)), [])
+            self.assertEqual(block_queue.receipts(rp), [])
+            self.assertEqual(s.commitment_idxs, {msg: 0}, 'the journal index stays outstanding')
+            # The outage goes on: kept again, and quietly (warned once).
+            with self.assertNoLogs(level='ERROR'):
+                self.save_pass(s, 107)
+            self.assertEqual(s.txs_waiting_for_confirmation, {102: tree})
+            self.assertNotIn(msg, cal)
+            # The directory is writable again: marker, save, receipt, marker gone.
+            restore()
+            with self.assertLogs(level='INFO') as captured:
+                self.save_pass(s, 107)
+            self.assertTrue(any('succeeding again' in r.getMessage() for r in captured.records), captured.output)
+            self.assertIn(msg, cal)
+            self.assertEqual(s.txs_waiting_for_confirmation, {})
+            self.assertEqual([r['txid'] for r in block_queue.receipts(rp)], [b2lx(tree.tx.GetTxid())])
+            self.assertEqual(pending_markers(str(rp)), [])
+
+    def test_a_restart_during_the_outage_owes_nothing_and_anchors_again(self):
+        """The failed pass, then a stop. Nothing was saved, so nothing is
+        owed: the next start finds no marker and writes no receipt, reads
+        the commitment from the journal as pending, and anchors it again
+        (C4's restart case)."""
+        with block_queue.calendar_fixture() as (d, cal, rp):
+            msg = block_queue.submit(cal)
+            tree = block_queue.mined(msg)
+            s = block_queue.stamper(cal, rp)
+            s.txs_waiting_for_confirmation = {102: tree}
+            s.commitment_idxs = {msg: 0}
+            s.commitment_records = {msg: 5}
+            s.journal_cursor = 1
+            restore = self.unwritable(rp.parent)
+            with self.assertLogs(level='ERROR'):
+                self.save_pass(s, 107)
+            self.assertNotIn(msg, cal)
+            restore()
+            block_queue.close(cal)
+            chain = block_queue.Chain()
+            restored, fresh = block_queue.restarted(d, chain)
+            try:
+                self.assertIsNone(fresh.failure)
+                self.assertEqual(pending_markers(str(rp)), [])
+                self.assertEqual(block_queue.receipts(rp), [])
+                self.assertNotIn(msg, restored)
+                self.assertIn(msg, fresh.pending_commitments, 'read from the journal as pending again')
+                self.assertEqual(fresh.txs_waiting_for_confirmation, {})
+            finally:
+                block_queue.close(restored)
+            cal.__init__(str(d / 'calendar'))
+
+    def test_the_append_failure_control_recovers_the_receipt_from_the_marker(self):
+        """The other direction, on the real store: the marker is written,
+        the save happens, the append fails; the marker keeps the receipt
+        and a later settling writes it once."""
+        with block_queue.calendar_fixture() as (d, cal, rp):
+            msg = block_queue.submit(cal)
+            tree = block_queue.mined(msg)
+            s = block_queue.stamper(cal, rp)
+            s.txs_waiting_for_confirmation = {102: tree}
+            s.commitment_idxs = {msg: 0}
+            s.commitment_records = {msg: 5}
+            s.journal_cursor = 1
+            with mock.patch('otsserver.stamper._append_anchor_receipt', side_effect=OSError('append unavailable')):
+                with self.assertLogs(level='WARNING'):
+                    self.save_pass(s, 107)
+            self.assertIn(msg, cal, 'an unwritable receipts file never blocks the save')
+            self.assertEqual(s.txs_waiting_for_confirmation, {})
+            self.assertEqual(len(pending_markers(str(rp))), 1)
+            self.assertEqual(block_queue.receipts(rp), [])
+            s.settle_pending_receipt()
+            s.settle_pending_receipt()
+            self.assertEqual([r['txid'] for r in block_queue.receipts(rp)], [b2lx(tree.tx.GetTxid())])
+            self.assertEqual(pending_markers(str(rp)), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -106,6 +106,14 @@ elif args.btc_net == 'regtest':
 if not (1 <= args.btc_conf_target <= 1008):
     args.parser.error("--btc-conf-target must be in range 1 <= N <= 1008")
 
+# Every flag is checked before a socket is bound or a worker started: a
+# value the stamper's constructor refused used to fail after the aggregator
+# thread and the listener existed, and the non-daemon worker kept a process
+# alive behind a bound port that served nothing (2026-09-18 cold review
+# R18). argparse exits 2 with the message, nothing running.
+if args.btc_min_confirmations < 2:
+    args.parser.error("--btc-min-confirmations must be greater than 1")
+
 exit_event = threading.Event()
 
 calendar_path = os.path.expanduser(args.calendar_path)
@@ -124,15 +132,28 @@ except OSError as exp:
                      % (args.rpc_address, args.rpc_port, exp))
     sys.exit(1)
 
-aggregator = otsserver.calendar.Aggregator(calendar, exit_event)
-
-stamper = otsserver.stamper.Stamper(calendar, exit_event,
-                                    args.btc_conf_target,
-                                    args.btc_min_relay_feerate,
-                                    args.btc_min_confirmations,
-                                    args.btc_min_tx_interval,
-                                    args.btc_max_fee * bitcoin.core.COIN,
-                                    args.max_pending)
+# The workers, each starting its own thread. A constructor that raises
+# after an earlier worker has started stops what started, closes the
+# listener and exits 1: never a live process behind a bound port that
+# serves nothing (2026-09-18 cold review R18).
+aggregator = None
+try:
+    aggregator = otsserver.calendar.Aggregator(calendar, exit_event)
+    stamper = otsserver.stamper.Stamper(calendar, exit_event,
+                                        args.btc_conf_target,
+                                        args.btc_min_relay_feerate,
+                                        args.btc_min_confirmations,
+                                        args.btc_min_tx_interval,
+                                        args.btc_max_fee * bitcoin.core.COIN,
+                                        args.max_pending)
+except Exception as exp:
+    logging.critical("otsd: a worker could not be created (%s: %s); stopping what started, nothing served, exiting 1"
+                     % (type(exp).__name__, exp))
+    exit_event.set()
+    server.server_close()
+    if aggregator is not None:
+        aggregator.thread.join(10)
+    sys.exit(1)
 
 calendar.stamper = stamper
 server.attach_aggregator(aggregator)
