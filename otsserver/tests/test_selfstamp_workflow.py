@@ -429,7 +429,7 @@ class Test_amnesia(SelfstampCase):
         repeating it (gate review, P4)."""
         bad = json.dumps({'schema': 'selfstamp/3', 'chain': self.MARK, 'seq': 1, 'period': '2026-09-01'}).encode()
         with self.assertRaises(ValueError):
-            selfstamp._parse_foreign_manifest(bad)
+            selfstamp._parse_manifest(bad)
         inbox, witnessed, log = self.root / 'inbox', self.root / 'witnessed', []
         inbox.mkdir()
         (inbox / 'x.json').write_bytes(bad)

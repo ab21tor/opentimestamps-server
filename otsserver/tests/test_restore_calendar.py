@@ -799,7 +799,7 @@ class Test_a_recovery_that_is_stopped_again(CalendarCase):
         try:
             stamper = make_stamper(receipts_path(box))
             stamper.calendar = cal
-            stamper.settle_pending_receipt()
+            stamper.settle_pending_receipts()
         finally:
             close(cal)
 
@@ -945,7 +945,7 @@ class Test_a_recovery_that_is_stopped_again(CalendarCase):
         self.assertNotIn(self.txids['B'], [line['txid'] for line in lines])
         self.assertTrue(os.path.exists(marker_b), 'retried, not forgotten')
         with self.assertLogs(level='WARNING') as logs:
-            stamper.settle_pending_receipt()              # the unlink works again
+            stamper.settle_pending_receipts()              # the unlink works again
         self.assertEqual(receipt_lines(box)[0], lines, 'B is never owed')
         self.assertEqual(markers(box), [])
         self.assertTrue(any('discarded' in line and self.txids['B'] in line for line in logs.output), logs.output)

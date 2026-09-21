@@ -552,7 +552,7 @@ class Stamper:
                                 [CTxOut(0, CScript([OP_RETURN, new_commitment]))],
                                 nLockTime=new_min_block_height)
 
-    def settle_pending_receipt(self):
+    def settle_pending_receipts(self):
         """Settle every pending-receipt marker left by an earlier stop
 
         A marker (see __save_confirmed_timestamp_tx) holds the receipt. The
@@ -697,7 +697,7 @@ class Stamper:
         marker. A crash before the save leaves a marker whose anchor the
         calendar does not hold: the commitments re-anchor under a new txid
         with their own receipt, and the marker is discarded at the next
-        start (settle_pending_receipt) — never a second bill for the same
+        start (settle_pending_receipts) — never a second bill for the same
         records. A crash after the save leaves a marker whose anchor the
         calendar holds: the receipt is recovered from it. Every marker is
         named by its anchor's txid, so an earlier anchor's receipt still
@@ -732,7 +732,7 @@ class Stamper:
             # the owed receipt inside the save's own batch; the delay is
             # the smaller mechanism and is the one the contract states
             # (docs/contracts.md, C5).
-            self.settle_pending_receipt()
+            self.settle_pending_receipts()
             _write_pending_receipt(self.anchor_receipts_path,
                                    {'receipt': receipt, 'probe': anchor_probe(txid).hex()})
 
@@ -778,7 +778,7 @@ class Stamper:
         never claim more than the database durably holds. Written with the
         database's generation, so a checkpoint kept beside a recreated or
         older-restored database is refused at the next start
-        (Calendar.verify_storage_generation); without a generation to
+        (Calendar.verify_checkpoint); without a generation to
         write, nothing is written, since an index alone is a file the next
         start refuses. Atomic via rename: a torn write can never truncate
         an existing checkpoint. The checkpoint is a convenience: any
@@ -1199,7 +1199,7 @@ class Stamper:
         # stop's residue but a restore from different moments: the start
         # fails on it, before anything is anchored a second time.
         try:
-            self.settle_pending_receipt()
+            self.settle_pending_receipts()
         except ReceiptsAheadOfDatabase:
             raise
         except Exception as exp:

@@ -132,7 +132,7 @@ def read_checkpoint(path):
     A v1 file (upstream's form) holds the index alone; a v2 file holds
     'INDEX GENERATION'. A v1 file is read only so that the calendar can
     say what it found when it refuses it
-    (Calendar.verify_storage_generation). Anything else raises ValueError:
+    (Calendar.verify_checkpoint). Anything else raises ValueError:
     a malformed checkpoint is refused, never guessed at, and the caller
     stops the whole service. The message says the shape of what was
     found, never its bytes, and no exception's own text is passed on: an
@@ -320,7 +320,7 @@ class LevelDbCalendar:
         else:
             # A database from before generations. It gets its generation,
             # with watermark 0, only when no checkpoint is on file and the
-            # scan therefore starts at 0 (Calendar.verify_storage_generation).
+            # scan therefore starts at 0 (Calendar.verify_checkpoint).
             self.generation = None
             self.watermark = None
 
@@ -494,7 +494,7 @@ class Calendar:
         # never created beside a checkpoint that names entries it should
         # hold.
         self.__check_counts()
-        self.checkpoint = self.verify_storage_generation()
+        self.checkpoint = self.verify_checkpoint()
         self.journal = JournalWriter(path + '/journal')
 
         # The stamper, set by otsd once both exist: its view of the chain is
@@ -599,7 +599,7 @@ class Calendar:
         finally:
             journal.read_fd.close()
 
-    def verify_storage_generation(self):
+    def verify_checkpoint(self):
         """Check journal.known-good against the database's generation and
         committed watermark, and against the journal (__check_journal);
         returns the checkpoint index the scan may start at (None: from 0),
