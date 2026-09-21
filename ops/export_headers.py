@@ -18,9 +18,9 @@ re-exported, and logged.
 One writer at a time: the run holds an exclusive lock (<out>.lock, flock,
 across processes) and a second run, the timer's or a manual one, is
 refused with exit 1. Every byte is written by a checked loop (os.write
-may write less than asked, and a short write taken for a whole batch
-would report headers on file that are not), the file is fsynced after
-each batch and its directory after the run. A file that ends in part of a header (an interrupted append) is cut
+may write less than asked: a short write used to be reported as a whole
+batch), the file is fsynced after each batch and its directory after the
+run. A file that ends in part of a header (an interrupted append) is cut
 back to its last whole header and the run goes on from there, logged;
 nothing is ever repaired by hand.
 

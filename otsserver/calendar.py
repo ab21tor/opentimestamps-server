@@ -129,16 +129,17 @@ def read_checkpoint(path):
     """journal.known-good: None when absent, else (journal index, database
     generation as 32 hex chars, or None for a file from before generations).
 
-    A v1 file (upstream's form) holds the index alone; a v2 file holds
-    'INDEX GENERATION'. A v1 file is read only so that the calendar can
-    say what it found when it refuses it
+    A v1 file (upstream's, and this fork's before 2026-09-15) holds the
+    index alone; a v2 file holds 'INDEX GENERATION'. A v1 file is read
+    only so that the calendar can say what it found when it refuses it
     (Calendar.verify_storage_generation). Anything else raises ValueError:
     a malformed checkpoint is refused, never guessed at, and the caller
     stops the whole service. The message says the shape of what was
     found, never its bytes, and no exception's own text is passed on: an
     int() that is refused quotes what it was given. A file that cannot be
     read for any reason but absence raises the OSError: the callers
-    refuse on it with the recovery, by its class and errno.
+    refuse on it with the recovery, by its class and errno (2026-09-18
+    gate review, G2).
     """
     try:
         with open(path, 'rb') as fd:
@@ -154,7 +155,8 @@ def read_checkpoint(path):
         raise ValueError('not "INDEX" or "INDEX GENERATION": %d bytes, %d field%s'
                          % (len(raw), len(parts), '' if len(parts) == 1 else 's'))
     # The digits themselves, not str.isdigit(), which also takes digits
-    # int() does not and whose ValueError then quotes the field.
+    # int() does not and whose ValueError then quotes the field
+    # (2026-09-18 corrections review, G2a).
     if not parts[0] or len(parts[0]) > 20 or any(c not in '0123456789' for c in parts[0]):
         raise ValueError('the first field is not a decimal number of at most 20 digits (%d characters)' % len(parts[0]))
     generation = None
@@ -292,19 +294,20 @@ class RecordCountsWriter(RecordCounts):
 # when the database is created, so a recreated or restored database is a
 # different one. watermark: the journal index below which every commitment
 # is in this database, written in the same synchronous batch as the
-# confirmed timestamps that make it true.
+# confirmed timestamps that make it true (2026-09-15 review, "storage
+# generation").
 META_PREFIX = b'\x00meta/'
 META_GENERATION = META_PREFIX + b'generation'
 META_WATERMARK = META_PREFIX + b'watermark'
 
 
 class LevelDbCalendar:
-    # plyvel, not py-leveldb: py-leveldb's last release (0.201) bundles
-    # LevelDB 1.19 statically and does not compile past Python 3.11.
-    # plyvel links the system libleveldb; the on-disk format is LevelDB's
-    # either way, so a calendar written under py-leveldb opens here
-    # unchanged (README "Unit tests"). The API differences are all in
-    # this class.
+    # plyvel, not py-leveldb (2026-09-14; the same switch as upstream PR
+    # #111): py-leveldb's last release (0.201) bundles LevelDB 1.19
+    # statically and does not compile past Python 3.11. plyvel links the
+    # system libleveldb; the on-disk format is LevelDB's either way, so a
+    # calendar written under py-leveldb opens here unchanged (restore drill,
+    # README "Unit tests"). The API differences are all in this class.
     def __init__(self, path):
         self.db = plyvel.DB(path, create_if_missing=True)
         raw = self.db.get(META_GENERATION)
@@ -318,9 +321,10 @@ class LevelDbCalendar:
             self.generation = None
             self.adopt_generation(0)
         else:
-            # A database from before generations. It gets its generation,
-            # with watermark 0, only when no checkpoint is on file and the
-            # scan therefore starts at 0 (Calendar.verify_storage_generation).
+            # A database from before generations (pre-2026-09-15). It gets
+            # its generation, with watermark 0, only when no checkpoint is
+            # on file and the scan therefore starts at 0
+            # (Calendar.verify_storage_generation).
             self.generation = None
             self.watermark = None
 
@@ -492,7 +496,7 @@ class Calendar:
         # the checkpoint, where the scan never looks). Checked before the
         # journal is opened for appending, so a journal found missing is
         # never created beside a checkpoint that names entries it should
-        # hold.
+        # hold (2026-09-15/16 review F02).
         self.__check_counts()
         self.checkpoint = self.verify_storage_generation()
         self.journal = JournalWriter(path + '/journal')
@@ -508,7 +512,7 @@ class Calendar:
                 "stopped copy as db/ and the checkpoint: entries lost with a journal cannot be recovered, and deleting "
                 "the checkpoint rescans the journal that is here. Never copy a journal.known-good from another database.")
 
-    # A checkpoint from before generations is an index alone.
+    # A checkpoint from before generations (2026-09-15) is an index alone.
     RESCAN_ONCE = ("Recovery, once: delete journal.known-good (in the calendar directory) and start again. The stamper "
                    "rescans the whole journal from index 0: every commitment the database holds is skipped, every one "
                    "it lacks is anchored (later blocks than it would have had), and the next confirmed anchor writes "
@@ -610,10 +614,10 @@ class Calendar:
         describes, and a probe of one entry below it is a guess at the
         rest. The operator deletes it, once, and the scan starts at 0; a
         database without a generation gets one then, with watermark 0, in
-        the one batch a new database gets its own. Adopting such a
-        checkpoint when the entry below it is in the database would take
+        the one batch a new database gets its own. Until 2026-09-17 such a
+        checkpoint was adopted when the entry below it was in the database:
         two writes, the database then the file, and a stop between them
-        would leave a start refused for the wrong reason."""
+        left a start that was refused for the wrong reason."""
         try:
             checkpoint = read_checkpoint(self.path + '/journal.known-good')
         except ValueError as exp:
@@ -757,7 +761,7 @@ class Aggregator:
                 self.calendar.submit(digests_commitment, records=records)
             except Exception as exp:
                 # A round that did not commit (a full disk failing the
-                # journal fsync, for one) must not leave the
+                # journal fsync was the reproduction) must not leave the
                 # thread dead behind a live HTTP server: every later
                 # submit() would wait forever and the status would still
                 # show a live chain. Say so, wake the waiters with a

@@ -40,14 +40,15 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
     """Largest digest that can be POSTed for timestamping"""
 
     # Socket timeout for every read on a connection: a peer that opens a
-    # connection and never sends (or never finishes) its request cannot
-    # pin a handler thread until it closes.
+    # connection and never sends (or never finishes) its request no longer
+    # pins a handler thread until it closes (full review N15, 2026-09-08).
     timeout = 60
 
     digest_queue = None
 
     # What the calendar logs about a request: a fixed route token and the
-    # status code, never the peer's address and never the request line. The
+    # status code, never the peer's address and never the request line
+    # (2026-09-15 review, P2 "privacy promise fails on error paths"). The
     # base class writes both to stderr, where docker/journald keeps them;
     # an unknown path can carry record content, a peer address is a client
     # identity. log_message is the base class's one sink, so every path
@@ -110,9 +111,9 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
         digest = self.rfile.read(content_length)
         if len(digest) != content_length:
             # The peer closed before the declared body arrived. What did
-            # arrive is not a digest of another length, and must not be
-            # aggregated as one. Nothing is committed, so a 400 promises
-            # nothing.
+            # arrive is not a digest of another length (2026-09-18 cold
+            # review R17: the shorter body was aggregated and acknowledged).
+            # Nothing is committed, so a 400 promises nothing.
             self.send_response(400)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
@@ -265,7 +266,8 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
         every checked anchor is where its receipt says), plus the pending
         queue and the in-flight anchor. Built in full before the response
         is committed, so a failure is a status that says so, never an
-        empty 200.
+        empty 200. The donation homepage this replaced (2026-09-11) is
+        gone with its qrcode/pystache/simplejson dependencies.
         """
         stamper = self.calendar.stamper
         status = {
@@ -284,10 +286,11 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
         try:
             # Per-op socket timeout (connect + each recv): a hung-transport
             # detector, not a render budget. Must clear the Tor bridge's
-            # TTFB (~1-2s) and its transient circuit stalls, which a 5s
-            # timeout did not. Paired with the gateway health probe's read
-            # timeout (timestamp-gateway main.py, timeout=(5, 45)), which
-            # must outlast a full status: change the two together.
+            # TTFB (~1-2s) and its transient circuit stalls, which cut ~11%
+            # of renders when this sat at 5s (2026-07-17). Paired with the
+            # gateway health probe's read timeout (timestamp-gateway
+            # main.py, timeout=(5, 45)), which must outlast a full status:
+            # change the two together.
             proxy = make_proxy(timeout=30)
             status['best_block'] = b2lx(proxy.getbestblockhash())
             status['block_height'] = proxy.getblockcount()
@@ -314,8 +317,9 @@ class RPCRequestHandler(http.server.BaseHTTPRequestHandler):
             self.get_timestamp()
         elif self.path == '/tip':
             self.get_tip()
-        # Upstream's /experimental/backup/ is not served: it exposed the
-        # calendar's data unauthenticated.
+        # Upstream's /experimental/backup/ is gone from this fork (2026-09-08):
+        # it served calendar data unauthenticated, and the replication
+        # tooling behind it (otsd-backup.py, otsserver/backup.py) ran nowhere.
         else:
             self.send_response(404)
             self.send_header('Content-Type', 'text/plain')
@@ -343,10 +347,10 @@ class StampServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
     def attach_aggregator(self, aggregator):
         """otsd binds the listener before it starts the workers, so the
-        aggregator arrives after the bind: a bind that fails then leaves
-        no worker thread alive behind no port. Nothing is served until
-        serve_until_exit starts the serving thread, so no request can see
-        it missing."""
+        aggregator arrives after the bind (2026-09-15/16 review F19: a
+        bind failure used to leave the non-daemon worker threads alive
+        behind no port). Nothing is served until serve_until_exit starts
+        the serving thread, so no request can see it missing."""
         self.RequestHandlerClass.aggregator = aggregator
 
     def handle_error(self, request, client_address):
@@ -364,12 +368,13 @@ def serve_until_exit(server, exit_event, workers=(), poll=0.5, join_timeout=10):
     """Serve HTTP until exit_event is set, then shut the server down
 
     A worker (the aggregator, the stamper) that fails past recovery sets
-    exit_event: the listener stops, the socket closes, the workers are
-    joined (bounded) and 1 is returned, so the process exits nonzero and
-    the supervisor restarts it; a dead worker never sits behind a live
-    port the supervisor sees nothing wrong with. A KeyboardInterrupt
-    performs the same shutdown and propagates to the caller (otsd exits 0
-    on it).
+    exit_event; before 2026-09-15 nothing consumed it while the listener
+    kept serving, so a dead worker sat behind a live port and the
+    supervisor saw nothing to restart. Now the listener stops, the socket
+    closes, the workers are joined (bounded) and 1 is returned: the
+    process exits nonzero and the supervisor restarts it. A
+    KeyboardInterrupt performs the same shutdown and propagates to the
+    caller (otsd exits 0 on it).
     """
     thread = threading.Thread(target=server.serve_forever, name='http', daemon=True)
     thread.start()

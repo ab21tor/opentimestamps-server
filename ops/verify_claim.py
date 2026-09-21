@@ -51,8 +51,8 @@ an easy chain can never pass as Bitcoin by accident.
 
 The proof parser follows the OpenTimestamps detached-proof format; the
 serialization primitives are copied from ops/selfstamp.py in this tree
-and extended with the fork marker, so proofs the ots client upgraded
-(pending attestation kept beside the bitcoin path) parse too.
+(2026-09-14) and extended with the fork marker, so proofs the ots client
+upgraded (pending attestation kept beside the bitcoin path) parse too.
 """
 
 import argparse
@@ -76,7 +76,8 @@ PENDING_TAG = bytes.fromhex('83dfe30d2ef90c8e')
 BITCOIN_TAG = bytes.fromhex('0588960d73d71901')
 # The other two block-header attestations the public client knows
 # (Litecoin; Ethereum under dubious/): one varuint height, read to its
-# end as the client reads it, and no usable attestation here.
+# end as the client reads it, and no usable attestation here (2026-09-18
+# cold review R09).
 HEIGHT_TAGS = (BITCOIN_TAG, bytes.fromhex('06869a0d73d71b45'), bytes.fromhex('30fe8087b5c7ead7'))
 OP_NAMES = {OP_SHA256: 'sha256', OP_APPEND: 'append', OP_PREPEND: 'prepend'}
 # The public client's limits (opentimestamps 0.4.x), mirrored so that
