@@ -103,8 +103,8 @@ class Test_corpus_against_the_readers(unittest.TestCase):
 
     def test_the_readers_never_raise_anything_but_their_own_error(self):
         """A reader that lets IndexError or UnicodeDecodeError out turns a
-        bad input into a crash of whatever called it. Only the reader's own
-        error class may escape."""
+        bad input into a crash of whatever called it (2026-09-15/16 review
+        F13, F14). Only the reader's own error class may escape."""
         import random
         rng = random.Random(20260916)
         shapes = [data for _, data, verdict, _, _ in corpus.cases() if verdict == 'parses']
@@ -150,11 +150,11 @@ class Test_corpus_against_the_library(unittest.TestCase):
                 self.assertEqual(library_verdict(data)[0], 'invalid')
 
     def test_every_attestation_type_the_client_knows_is_read_as_the_client_reads_it(self):
-        """The Litecoin and Ethereum tags are known to the client and read as
-        one varuint height; readers that took them for opaque unknown tags
-        would parse a payload the client refuses (empty, a trailing byte),
-        alone and beside a Bitcoin node. For each of the four tags: a
-        valid payload, an empty
+        """2026-09-18 cold review R09: the Litecoin and Ethereum tags are
+        known to the client and read as one varuint height; the readers
+        here took them for opaque unknown tags, so a payload the client
+        refuses (empty, a trailing byte) parsed, alone and beside a
+        Bitcoin node. For each of the four tags: a valid payload, an empty
         one, a trailing byte, an unterminated varuint; alone for both
         readers, beside a Bitcoin node for the tree reader (the linear
         reader refuses every fork by design). The verdict is the library's,

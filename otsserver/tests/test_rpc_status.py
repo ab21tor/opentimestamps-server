@@ -9,7 +9,9 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""GET / is one JSON line: the calendar's status.
+"""GET / is one JSON line: the calendar's status (green review 2026-09-11,
+item 17, which dropped the donation homepage and its qrcode, pystache and
+simplejson dependencies).
 
 The line is what the watcher (ops/watch.py), the self-stamp's float reader
 (ops/selfstamp.py) and the gateway's /health read: best_block is the proof
@@ -152,7 +154,7 @@ class Test_status(unittest.TestCase):
     def test_status_rpc_timeout_is_thirty_seconds(self):
         """The per-op RPC timeout is a hung-transport detector, not a render
         budget: it must clear the Tor bridge's transient circuit stalls
-        (which a 5s timeout did not) and
+        (which cut ~11% of renders while this sat at 5s, 2026-07-17) and
         stays paired with the gateway probe's 45s read timeout, which must
         outlast a full status. Pin the value so neither moves alone."""
         seen = []

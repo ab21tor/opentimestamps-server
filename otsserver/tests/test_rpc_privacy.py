@@ -9,8 +9,8 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""No peer address and no request line ever reach stderr or the log,
-on the error paths included.
+"""No peer address and no request line ever reach stderr or the log
+(2026-09-15 review, P2 "privacy promise fails on error paths").
 
 BaseHTTPRequestHandler writes "IP - - [date] request line status" to
 stderr for every response, and send_error quotes the malformed request it

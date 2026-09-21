@@ -81,7 +81,7 @@ class Test_LevelDbCalendar(unittest.TestCase):
 
 
 class Test_LevelDbCalendar_storage(unittest.TestCase):
-    """Pinned when the binding moved from py-leveldb to plyvel:
+    """Pinned when the binding moved from py-leveldb to plyvel (2026-09-14):
     the two behaviours the rest of the server relies on and a binding could
     change. rpc.py answers 404 on the KeyError; the stamper's confirmed
     saves must be on disk before the receipt is written."""
@@ -123,10 +123,10 @@ print(b'foo' in cal, b'foobar' in cal, cal[b'foo'] == t)
 
 
 class Test_storage_generation(unittest.TestCase):
-    """Rebuilding an absent database beside a retained checkpoint must not
-    skip old work: db/ carries a generation and a committed watermark,
-    journal.known-good names the generation, and Calendar refuses to
-    start when they disagree. No file timestamps are read anywhere."""
+    """2026-09-15 review, P1 "rebuilding an absent database with a retained
+    checkpoint skips old work": db/ now carries a generation and a committed
+    watermark, journal.known-good names the generation, and Calendar refuses
+    to start when they disagree. No file timestamps are read anywhere."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -203,7 +203,7 @@ class Test_storage_generation(unittest.TestCase):
         self.close(cal)
 
     def test_a_lost_database_beside_a_kept_checkpoint_is_refused(self):
-        # Journal entry 0 exists, the checkpoint
+        # The review's reproduction: journal entry 0 exists, the checkpoint
         # says everything below 1 is anchored, db/ is absent.
         self.journal(1)
         with open(self.known_good, 'w') as fd:
@@ -255,8 +255,8 @@ class Test_storage_generation(unittest.TestCase):
             self.assertIn('malformed', self.refuse())
 
     def test_a_checkpoint_from_before_generations_is_refused_whatever_the_database_holds(self):
-        """Not adopted even when the entry below it is in the database.
-        The whole transition, the one-time
+        """Until 2026-09-17 (workflow four) it was adopted when the entry
+        below it was in the database. The whole transition, the one-time
         rescan and its stops included, is in
         test_restore_calendar.Test_checkpoint_from_before_generations."""
         from otsserver.calendar import META_GENERATION, META_WATERMARK
@@ -278,11 +278,11 @@ class Test_storage_generation(unittest.TestCase):
 
 
 class Test_journal_boundary(unittest.TestCase):
-    """A checkpoint saying "everything below 3 is in the database" about a
-    journal that is no longer the one it describes: were a missing
-    journal recreated or a shorter one accepted, the scan would start at
-    3 and every new submission would land at index 0, 1, 2, accepted
-    durably and never anchored. The
+    """2026-09-15/16 review F02: the checkpoint said "everything below 3 is
+    in the database" about a journal that was no longer the one it
+    described. Before this change a missing journal was recreated and a
+    shorter one accepted, the scan started at 3, and every new submission
+    landed at index 0, 1, 2: accepted durably, never anchored. Now the
     journal must reach the checkpoint and agree with the database at the
     entry below it, or the start is refused with the recovery text; a
     missing journal is never created while a checkpoint names an index
@@ -369,7 +369,7 @@ class Test_journal_boundary(unittest.TestCase):
         self.assertIn('does not hold journal entry 2', text)
 
     def test_a_coherent_restart_scans_the_next_submission(self):
-        """Control:
+        """Control, and the corrected form of the review's reproduction:
         with the journal intact the restart is accepted, the checkpoint
         honoured, and a submission made after it is read by the stamper's
         first fill pass (Bitcoin stubbed, nothing else)."""

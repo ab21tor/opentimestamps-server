@@ -9,10 +9,12 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""Fault mechanisms the tests share: an exception injected at the n-th
-call of a named function, a stop the code under test does not handle, and
-a path made unreadable for the test's duration. The child processes each
-module pauses
+"""Fault mechanisms the tests share (workflow two, the self-stamp;
+workflow three, the watcher; workflow four, restore and migration): an
+exception injected at the n-th call of a named function, a stop the code
+under test does not handle, and a path made unreadable for the test's
+duration. The third use decided each extraction: the helpers were
+identical in shape at every site. The child processes each module pauses
 and kills stay with their module, because the boundaries they wrap are
 that tool's own functions and a shared runner would only carry the
 wrapper script as a parameter. Every test says which fault model it uses;

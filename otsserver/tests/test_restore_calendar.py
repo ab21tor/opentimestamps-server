@@ -348,7 +348,7 @@ class Test_a_copy_taken_while_the_calendar_writes(CalendarCase):
 
     def test_a_copy_taken_at_any_one_point_restores(self):
         """Control: a copy of the whole tree at one instant is what a stop
-        leaves, and every recovery of the calendar applies to it."""
+        leaves, and every recovery of workflow one applies to it."""
         for point in sorted(os.listdir(os.path.join(self.tmpdir.name, 'at'))):
             with self.subTest(point=point):
                 box = self.compose('one-' + point, point)
@@ -378,13 +378,13 @@ class Test_a_copy_taken_while_the_calendar_writes(CalendarCase):
         close(cal)
 
     def test_a_checkpoint_read_after_the_database_is_refused(self):
-        """Control (the start's storage check): the database read before B's save,
+        """Control (workflow one's check): the database read before B's save,
         the checkpoint after it."""
         text = self.refused(self.compose('skew', 'entry-4', checkpoint='B-checkpointed'))
         self.assertIn('older than the checkpoint', text)
 
     def test_a_journal_read_before_the_checkpoint_is_refused_when_it_does_not_reach_it(self):
-        """Control (the start's storage check): the journal and its sidecar read
+        """Control (workflow one's check): the journal and its sidecar read
         at three entries, the rest after B's checkpoint at 4."""
         text = self.refused(self.compose('skew', 'B-checkpointed', journal='entry-2', counts='entry-2'))
         self.assertIn('the journal holds 3 entries', text)
@@ -393,7 +393,9 @@ class Test_a_copy_taken_while_the_calendar_writes(CalendarCase):
         """The journal was read at three entries and the sidecar a moment
         later, with entry 3's count in it. The sidecar is written only
         after its entry is durable, so it is a witness: the journal here
-        has lost an entry that was acknowledged."""
+        has lost an entry that was acknowledged. (Before workflow four the
+        start was clean, and the stale count waited for the next entry
+        3.)"""
         text = self.refused(self.compose('skew', 'entry-2', counts='entry-3'))
         self.assertIn('journal.counts holds a count for journal entry 3', text)
         self.assertIn('the journal holds 3 entries', text)
@@ -412,9 +414,9 @@ class Test_a_copy_taken_while_the_calendar_writes(CalendarCase):
         """The database was read before B's save; the receipts directory
         after B's receipt was appended and before its marker went. No stop
         leaves that: the receipt follows the save's synchronous batch.
-        Discarding the marker as `nothing is owed` beside a receipt on
-        file would send entries 2 and 3 on to a second anchor and a
-        second receipt."""
+        (Before workflow four the marker was discarded as `nothing is
+        owed`, beside a receipt on file, and entries 2 and 3 went on to a
+        second anchor and a second receipt.)"""
         box = self.compose('skew', 'B-marker', receipts='B-receipted')
         text = self.refused(box)
         self.assertIn(self.txids['B'], text)
@@ -460,9 +462,9 @@ class Test_a_copy_taken_while_the_calendar_writes(CalendarCase):
         close(cal)
 
     def test_a_database_that_does_not_open_is_refused_with_the_recovery_and_no_path(self):
-        """A table file missing from the copied database: refused with the
-        recovery, never a traceback out of Calendar() with LevelDB's
-        message, which names the directory."""
+        """A table file missing from the copied database. (Before workflow
+        four this was a traceback out of Calendar(), with LevelDB's
+        message, which names the directory, and no recovery.)"""
         box = self.compose('torn', 'B-checkpointed')
         tables = sorted(name for name in os.listdir(os.path.join(box, 'calendar', 'db')) if name.endswith('.ldb'))
         self.assertTrue(tables, 'the fixture must hold a table file')
@@ -475,7 +477,7 @@ class Test_a_copy_taken_while_the_calendar_writes(CalendarCase):
 
 
 class Test_an_older_journal_beside_a_newer_database(CalendarCase):
-    """R2: what the bounded journal check of the start (C6) detects, and
+    """R2: what the bounded journal check of workflow one (C6) detects, and
     what it does not, each case pinned as it is. Fault model: members of
     the set taken from different points of the story."""
 
@@ -666,7 +668,7 @@ class Test_a_restore_onto_a_fresh_host(CalendarCase):
 
 
 class Test_checkpoint_from_before_generations(CalendarCase):
-    """R3. A calendar as an earlier release left it: a database
+    """R3. A calendar as the code before 2026-09-15 left it: a database
     without a generation and journal.known-good holding an index alone.
     It is refused whatever the database holds; the operator deletes the
     file, once; the start after that gives the database its generation with
@@ -700,8 +702,8 @@ class Test_checkpoint_from_before_generations(CalendarCase):
             db.close()
 
     def test_it_is_refused_with_the_one_time_rescan_named_and_nothing_is_written(self):
-        """The entry below the index IS in the database, which is not enough
-        to adopt it (that would be the database stamped, then the file
+        """The entry below the index IS in the database: until workflow four
+        that was enough to adopt it (the database stamped, then the file
         rewritten: two writes)."""
         before = journal_entries(self.box)
         text = self.refused(self.box)
@@ -715,8 +717,8 @@ class Test_checkpoint_from_before_generations(CalendarCase):
         self.refused(self.box)      # and again: a refusal is not a step
 
     def test_the_format_that_replaced_it_is_not_one_the_old_reader_reads(self):
-        """Old code, given the new file: the earlier stamper read the
-        checkpoint as int(text.strip()) (c5f6545, stamper.py:925) with
+        """Old code, given the new file: before 2026-09-15 the stamper read
+        the checkpoint as int(text.strip()) (c5f6545, stamper.py:925) with
         only FileNotFoundError caught. 'INDEX GENERATION' is not an int:
         that reader raises, in the stamper's thread, behind a listener
         that stays up (the defect fcbafb6 fixed). The expression is quoted
@@ -812,7 +814,7 @@ class Test_a_recovery_that_is_stopped_again(CalendarCase):
         with open(receipts_path(torn), 'ab') as fd:
             fd.write(b'{"txid": "%s", "fee_sa' % b.encode())
         boxes['saved, the append torn'] = (torn, [a, b])
-        # The single marker name of earlier releases (R4): still settled, once.
+        # The one marker name of before 2026-09-16 (R4): still settled, once.
         old = self.compose('f-old-name', 'B-saved')
         receipts = receipts_path(old)
         os.rename(marker_path(receipts, b), marker_path(receipts))
@@ -876,8 +878,8 @@ class Test_a_recovery_that_is_stopped_again(CalendarCase):
     def test_a_receipt_found_on_file_is_synced_before_its_marker_goes(self):
         """The append's fsync failed (an OSError): the line is on file, not
         known to be synced, and its marker stays. The next settling finds
-        the line, never removing the marker on sight and the receipt's only
-        other copy with it."""
+        the line. (Before workflow four it removed the marker on sight,
+        and the receipt's only other copy with it.)"""
         box = self.compose('unsynced', 'B-saved')
         receipts = receipts_path(box)
         with fail_on_call(otsserver.stamper.os, 'fsync', 1) as hit, self.assertLogs(level='WARNING') as logs:
@@ -912,7 +914,7 @@ class Test_a_recovery_that_is_stopped_again(CalendarCase):
         self.assertEqual(self.txids_on_file(box), [self.txids['A'], self.txids['B']])
 
     def test_a_discard_the_next_anchor_cannot_turn_into_a_receipt(self):
-        """On the real store: B's marker stands
+        """2026-09-18 gate review, G1, on the real store. B's marker stands
         and B's save never happened; the discard's unlink is refused, an
         OSError the settling handles: the marker is reported and stays.
         The same commitments go out again in C, which saves. B's marker is
@@ -985,8 +987,9 @@ class Test_messages_name_no_path(CalendarCase):
     """No message of a restore, a migration or a recovery names the
     directory the calendar or its receipts are in: the path is the
     operator's and can name a client. Every box here is under a directory
-    named PRIVATE, and every record logged, at any level, is read. A
-    traceback, which Python
+    named PRIVATE, and every record logged, at any level, is read. (Before
+    workflow four each refusal, the marker and tail messages and the
+    sidecar's warnings carried the path.) A traceback, which Python
     prints for an error nothing expected, names source files and is not
     one of these messages."""
 
@@ -1075,10 +1078,11 @@ class Test_messages_name_no_path(CalendarCase):
         self.assertNotIn(PRIVATE, text)
 
     def test_a_checkpoint_that_cannot_be_read_is_refused_by_its_class_at_both_readers(self):
-        """A restore that lost the file's permissions. Both readers refuse
-        with the recovery, naming the error's class and errno, never the
-        path: no traceback out of Calendar(), no CRITICAL line with the
-        path inside the error's text. Fault model: chmod 000."""
+        """2026-09-18 gate review, G2: a restore that lost the file's
+        permissions. Both readers refuse with the recovery, naming the
+        error's class and errno, never the path. (Before: a traceback out
+        of Calendar(), and the stamper's CRITICAL line with the path inside
+        the error's text.) Fault model: chmod 000."""
         box = self.compose('unreadable', 'B-checkpointed')
         self.addCleanup(unreadable(os.path.join(box, 'calendar', 'journal.known-good')))
         text = self.refused(box)
@@ -1091,10 +1095,11 @@ class Test_messages_name_no_path(CalendarCase):
         self.assertNotIn(PRIVATE, text)
 
     def test_a_malformed_checkpoint_is_described_not_quoted(self):
-        """The refusal must not echo what the file held, and a digit int()
-        does not take (`²` passes str.isdigit) must not make int() quote
-        the field at either reader. Neither reader passes an exception's
-        text on."""
+        """2026-09-18 gate review, G2: the refusal used to echo up to 80
+        characters of whatever the file held; and its corrections review,
+        G2a: a digit int() does not take (`²` passes str.isdigit) made
+        int() quote the field at both readers. Neither reader passes an
+        exception's text on."""
         cases = {  # what the file holds: what both readers say of it
             b'synthetic-private-text-copied-to-the-wrong-file\n': 'the first field is not a decimal number of at most 20 digits (47 characters)',
             b'one two three\n': 'not "INDEX" or "INDEX GENERATION": 14 bytes, 3 fields',
@@ -1117,12 +1122,12 @@ class Test_messages_name_no_path(CalendarCase):
                 self.assertIn('is malformed (%s)' % words, said)
 
     def test_a_marker_that_does_not_parse_is_named_by_role_and_error_class_only(self):
-        """A marker of bytes that are not UTF-8 must not be logged with the
-        decoding error's repr, which carries the bytes; and a receipts
-        file whose own name holds `.pending.` followed by 56 characters
-        gives its single-name marker a 64-character suffix that must not
-        be printed as an anchor. The class alone, and an anchor only when
-        the suffix is a txid."""
+        """2026-09-18 corrections review, G3a and G3b: a marker of bytes
+        that are not UTF-8 used to be logged with the decoding error's
+        repr, which carries the bytes; and a receipts file whose own name
+        holds `.pending.` followed by 56 characters gave its single-name
+        marker a 64-character suffix that was printed as an anchor. Now
+        the class alone, and an anchor only when the suffix is a txid."""
         private = b'ACME LAB PRIVATE CONTENT'
         box = self.compose('binary-marker', 'B-saved')
         with open(marker_path(receipts_path(box), self.txids['B']), 'wb') as fd:
@@ -1149,9 +1154,10 @@ class Test_messages_name_no_path(CalendarCase):
             self.assertIn('the pending receipt marker under the old single name is unreadable (JSONDecodeError)', text)
 
     def test_the_receipts_files_name_is_in_no_message(self):
-        """OTSD_ANCHOR_RECEIPTS is the operator's choice, and its name can say
-        whose calendar this is. Every message about a marker names its
-        role and its anchor's txid instead, never its file name."""
+        """2026-09-18 gate review, G3: OTSD_ANCHOR_RECEIPTS is the operator's
+        choice, and its name can say whose calendar this is. Every message
+        about a marker names its role and its anchor's txid instead. (The
+        first close named a marker by its file name.)"""
         name, default = 'Acme-lab-receipts.jsonl', RECEIPTS
 
         def renamed(box):

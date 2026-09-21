@@ -9,7 +9,7 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""The not-before bound.
+"""The not-before bound (green review 2026-09-11, item 10).
 
 Calendar.submit appends the hash of the newest block the stamper has seen,
 then sha256, immediately before the time prefix. A block hash cannot be

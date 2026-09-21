@@ -9,7 +9,7 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""ops/watch.py: the watcher's observation contract
+"""ops/watch.py, workflow three: the watcher's observation contract
 (docs/contracts.md, section 8, tables W1-W9), each transition pinned
 beside its failure cases.
 
@@ -21,12 +21,13 @@ made unreadable by chmod; a real child process paused at a named
 boundary and killed with SIGKILL; a sender that fails. None is a power
 cut, and no test orders events with a sleep.
 
-Thirteen failure modes (malformed bytes or an unexpected shape at a
-source stopping the run; a failed read behind a fresh file reading as
-ok; a heartbeat or a RECOVERED saying all clear from the alarm set
-rather than the verdicts; the cap decided again on replay; malformed
-fields inside valid JSON crashing or vanishing; a configured mount in a
-message) are kept here as permanent regressions.
+The 2026-09-16 gate review's thirteen assertions (malformed bytes or an
+unexpected shape at a source stopping the run; a failed read behind a
+fresh file reading as ok; a heartbeat or a RECOVERED saying all clear
+from the alarm set rather than the verdicts; the cap decided again on
+replay; malformed fields inside valid JSON crashing or vanishing; a
+configured mount in a message) are kept here as permanent regressions,
+in this module's shape.
 """
 
 import json
@@ -162,7 +163,8 @@ class Test_unknown_is_a_state(unittest.TestCase):
     def test_malformed_bytes_at_a_source_are_unknown_and_stop_nothing(self):
         """observe against real files: invalid UTF-8 in the adapter heartbeat
         and in the receipts is that check's unknown, the other sources are
-        still observed, and a run with such a source ends normally."""
+        still observed, and a run with such a source ends normally (gate
+        review, 1)."""
         with tempfile.TemporaryDirectory() as tmp:
             d = pathlib.Path(tmp)
             cfg = box_cfg()
@@ -195,7 +197,8 @@ class Test_unknown_is_a_state(unittest.TestCase):
     def test_a_failed_read_behind_a_fresh_file_is_unknown_not_ok(self):
         """The marker comes from the read itself: a fresh feeder log whose
         tail fails or holds no poll line, a fresh adapter heartbeat with no
-        breaker field, a Tor heartbeat whose warning-window query fails."""
+        breaker field, a Tor heartbeat whose warning-window query fails
+        (gate review, 2)."""
         with tempfile.TemporaryDirectory() as tmp:
             d = pathlib.Path(tmp)
             cfg = box_cfg()
@@ -380,7 +383,7 @@ class Test_decide_with_unknown(unittest.TestCase):
 
     def test_the_heartbeat_names_a_failing_check_before_its_alarm_is_confirmed(self):
         """A first failed observation is not a healthy reading: the alarm
-        waits for the second run, the heartbeat does not."""
+        waits for the second run, the heartbeat does not (gate review, 3)."""
         cfg = cfg_with(NAME='box', **APPLIANCE)
         ok = {n: (True, '') for n in watch.ORDER}
         low = dict(ok, mem=(False, 'mem available 100MB'))
@@ -398,7 +401,8 @@ class Test_decide_with_unknown(unittest.TestCase):
 
     def test_recovered_does_not_say_all_ok_while_another_check_is_not(self):
         """The alarm set emptying is the transition and is said; "all N
-        checks ok" is said only when every verdict is ok now."""
+        checks ok" is said only when every verdict is ok now (gate
+        review, 3)."""
         cfg = cfg_with(NAME='box', **APPLIANCE)
         ok = {n: (True, '') for n in watch.ORDER}
         low = dict(ok, mem=(False, 'mem available 100MB'))
@@ -565,7 +569,7 @@ class Test_recording_boundaries(unittest.TestCase):
     def test_a_stop_after_the_outbox_write_keeps_the_cap_decision_on_replay(self):
         """205 messages owed and the outbox empty: the record keeps 199 and a
         notice of 6 drops; a stop before the record is cleared must not
-        make the next run drop again or reorder. Fault
+        make the next run drop again or reorder (gate review, 4). Fault
         model: a stop injected at the state write that clears the record."""
         owed = [{'text': 'alert %03d' % n, 'queued': '2026-09-%02dT%02d:%02d:00Z' % (1 + n // 1440, n // 60 % 24, n % 60)}
                 for n in range(watch.OUTBOX_MAX + 5)]
@@ -777,7 +781,7 @@ class Test_state_recovery(unittest.TestCase):
     def test_a_state_object_with_a_field_of_the_wrong_shape_is_set_aside_and_reported(self):
         """Valid JSON, wrong fields: counters as a list, an owed message as a
         bare string, a cursor as text. Each is set aside with a notice, and
-        a bare string under owed is never silently dropped."""
+        a bare string under owed is never silently dropped (gate review, 5)."""
         for raw in (b'{"fail_runs": []}', b'{"owed": ["undelivered alert"]}', b'{"cursors": {"journal": "yesterday"}}'):
             with self.subTest(raw=raw):
                 for p in list(self.dir.iterdir()):
@@ -807,7 +811,7 @@ class Test_state_recovery(unittest.TestCase):
 
     def test_a_dry_run_sets_nothing_aside(self):
         """--dry inspects: a corrupt state is named in the log and nothing is
-        written but the status."""
+        written but the status (gate review, documentation correction)."""
         self.state.write_bytes(b'{not json')
         logged = []
         with watcher_run(self.dir, ALL_OK, lambda *_: (True, 'ok'), quiet=False), \
@@ -903,7 +907,7 @@ class Test_messages_name_no_identity(unittest.TestCase):
 
     def test_a_configured_mount_never_leaves_in_a_message(self):
         """The disk checks publish their role and the measurement; the mount
-        is configuration."""
+        is configuration (gate review, 6)."""
         private = '/mnt/Example-Client-Laboratory/archive'
         cfg = cfg_with(NAME='box', DISK_ROOT=private, **{k: v for k, v in APPLIANCE.items()})
         checks = watch.evaluate({'disk': {private: 99.0}}, cfg)
@@ -942,12 +946,12 @@ class Test_messages_name_no_identity(unittest.TestCase):
 # --- W3: journalctl's exit status is the query's, not the match's (R10) --------------------------
 
 class Test_journal_exit_semantics(unittest.TestCase):
-    """W3. Under -q, `journalctl -g PATTERN` exits 1 when nothing matches
-    (systemd v257, journalctl-show.c), so a quiet window would read as a
-    failed query, the cursor never moving and journal_read alarming on
-    every calm box. The patterns are matched here, over the window's
-    lines, and a nonzero exit is a failed query. Fault model: a command
-    double that answers as journalctl does
+    """W3 (2026-09-18 cold review R10). Under -q, `journalctl -g PATTERN`
+    exits 1 when nothing matches (systemd v257, journalctl-show.c), so a
+    quiet window used to read as a failed query: the cursor never moved
+    and journal_read alarmed on every calm box. The patterns are matched
+    here now, over the window's lines, and a nonzero exit is a failed
+    query. Fault model: a command double that answers as journalctl does
     (exit 1, no output, to a -g query that matches nothing; the window's
     lines to the others); a double that fails every query."""
 
@@ -1021,11 +1025,11 @@ class Test_journal_exit_semantics(unittest.TestCase):
 # --- W4: the newest confirmation, not the last line (R11) -----------------------------------------
 
 class Test_receipt_order(unittest.TestCase):
-    """W4 anchor_age. C5 lets a receipt recovered from its marker be
-    appended after later anchors' lines, so a check that took the last
-    line as the newest confirmation would read a fresh anchor as stale
-    after a recovery. The age is from the newest confirmed_at; a
-    confirmed_at that is not a finite number makes
+    """W4 anchor_age (2026-09-18 cold review R11). C5 lets a receipt
+    recovered from its marker be appended after later anchors' lines, and
+    the check used to take the last line as the newest confirmation, so a
+    recovery made a fresh anchor read as stale. Now the age is from the
+    newest confirmed_at; a confirmed_at that is not a finite number makes
     the file unparseable and the check unknown. Fault model: receipts
     files written in the orders C5 allows; malformed values."""
 
@@ -1069,10 +1073,10 @@ class Test_receipt_order(unittest.TestCase):
 # --- W8: numbers the run cannot use (R12) ----------------------------------------------------------
 
 class Test_numeric_poison(unittest.TestCase):
-    """W8. JSON's 1e309 decodes to infinity, which passes a type check
-    and would then fail int(cursor) on every run, past the quarantine; a
-    cap notice whose `dropped` is not a number would pass a message check
-    and crash the fold. A cursor
+    """W8 (2026-09-18 cold review R12). JSON's 1e309 decodes to infinity,
+    which passed the state's type check and then failed int(cursor) on
+    every run, past the quarantine; a cap notice whose `dropped` was not
+    a number passed the message check and crashed the fold. Now a cursor
     or a since time must be a finite number and a cap notice's count a
     count; what is refused follows the existing aside-and-notice path.
     Fault model: state and outbox files with those values."""

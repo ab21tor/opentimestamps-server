@@ -12,10 +12,10 @@
 """ops/watch.py — the box health watcher, loaded by path like selfstamp.
 
 The fixture scenarios under ops/tests/watch/ (26 written for the Pi's hosted
-shape, three for the appliance shape) drive evaluate/decide/heartbeat with
-the sender stubbed, exactly as `watch.py --test` does. The unit tests pin
-what the fork's script does beyond the fixtures: an empty knob skips its
-check and its count,
+shape on 2026-09-04 and 2026-09-07, three for the appliance shape) drive
+evaluate/decide/heartbeat with the sender stubbed, exactly as
+`watch.py --test` does. The unit tests pin what changed when the script moved
+into this fork (2026-09-11): an empty knob skips its check and its count,
 the calendar check's verdicts, the sats parser, and the box name in every
 message. Nothing here touches the network, docker, systemd or the journal.
 """
@@ -124,7 +124,7 @@ class Test_calendar_check(unittest.TestCase):
                          (False, "calendar needs attention: " + gone + "; anchor 4a4a mined again"))
         self.assertEqual(self.verdict(True, dict(ok, needs_attention=[]), "20000"), (True, ""))
         self.assertEqual(self.verdict(True, ok), (False, "anchor wallet 22015 sats < 100000"))
-        # A balance that cannot be read is unknown, never ok and not a failure.
+        # A balance that cannot be read is unknown (workflow three), never ok and not a failure.
         self.assertEqual(self.verdict(True, dict(ok, balance="lots")), (None, "calendar unknown: balance unreadable"))
 
     def test_parse_sats(self):
@@ -162,8 +162,8 @@ class Test_names(unittest.TestCase):
 
 
 class Test_outbox(unittest.TestCase):
-    """A failed one-shot security alert is never lost: every message is
-    written to the outbox before the
+    """2026-09-15 review, P2 "a failed one-shot security alert is
+    permanently lost": every message is written to the outbox before the
     journal cursor moves, delivered oldest first, retried by every later
     run until it lands; the run exits 1 while anything is undelivered."""
 
@@ -216,7 +216,7 @@ class Test_outbox(unittest.TestCase):
         self.assertIn('journal', json.loads(self.state.read_text())['cursors'])
 
     def test_the_cursor_moves_only_once_the_burst_is_on_disk(self):
-        """The burst is on disk in state.json, in the
+        """Since workflow three the burst is on disk in state.json, in the
         same write that moves the cursor (under "owed"), before the outbox
         is written: an outbox that cannot be written leaves the burst owed
         by the state, the cursor moved, and the message queued by the next
@@ -251,8 +251,8 @@ class Test_outbox(unittest.TestCase):
         self.assertIn('journal', json.loads(self.state.read_text())['cursors'])
 
     def test_the_outbox_is_bounded(self):
-        """The bound is OUTBOX_MAX entries, and the drop is the first
-        message in line, never silent."""
+        """The bound is OUTBOX_MAX entries, and since workflow three the
+        drop is the first message in line, never silent."""
         self.outbox.write_text(json.dumps([{'text': 'old %d' % i, 'queued': ''} for i in range(watch.OUTBOX_MAX + 5)]))
         codes, sent = self.runs(self.cfg(), [self.BURST], [(False, 'down')])
         self.assertEqual(codes, [1])
@@ -294,10 +294,10 @@ def watcher_run(directory, checks, send, now=NOW, quiet=True):
 
 
 class Test_observation_failure(unittest.TestCase):
-    """A journalctl call that fails must not read as zero events with the
-    cursor moving past a window nobody read: a failed read is a failed
-    check (journal_read) and the cursor stays where it was until every
-    journal query succeeds."""
+    """2026-09-15/16 review F09: a journalctl call that fails used to read
+    as zero events, and the cursor moved past the window nobody read. Now
+    a failed read is a failed check (journal_read) and the cursor stays
+    where it was until every journal query succeeds."""
 
     def observe_with(self, journal_rc):
         config = box_cfg()
@@ -347,11 +347,11 @@ class Test_observation_failure(unittest.TestCase):
 
 
 class Test_outbox_read_failure(unittest.TestCase):
-    """An outbox that cannot be read must not become an empty queue whose
-    next write replaces the undelivered messages: only a missing file is
-    an empty queue, an unreadable one fails the run with nothing touched,
-    and bytes that are not a message list are set aside for inspection
-    and reported as an alert."""
+    """2026-09-15/16 review F10: an outbox that could not be read used to
+    become an empty queue, and the next write replaced the undelivered
+    messages. Now only a missing file is an empty queue: an unreadable one
+    fails the run with nothing touched, and bytes that are not a message
+    list are set aside for inspection and reported as an alert."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -396,9 +396,9 @@ class Test_outbox_read_failure(unittest.TestCase):
 
 
 class Test_run_lock(unittest.TestCase):
-    """Two overlapping runs must not read the same queue with the later
-    writer replacing the other's messages: a run holds an exclusive lock
-    on the state directory for its whole duration;
+    """2026-09-15/16 review F11: two overlapping runs used to read the same
+    queue and the later writer replaced the other's messages. Now a run
+    holds an exclusive lock on the state directory for its whole duration;
     a second run waits up to watch.LOCK_WAIT seconds, then exits 1 with
     'locked' and nothing written. Two real processes; the first is paused
     inside its sender while the second tries."""
@@ -446,11 +446,11 @@ def _child_run(directory, lock_wait):
 
 
 class Test_outbox_recovery_interrupted(unittest.TestCase):
-    """The corrupt-outbox recovery is itself interruptible. Moving the
-    corrupt file aside and only later persisting the notice in the
-    replacement queue would let a stop between the two leave an aside
-    file nobody reports and an empty queue. The aside copy is written
-    first, under a name derived from
+    """The corrupt-outbox recovery is itself interruptible (close-gate
+    correction, 2026-09-16). The first version moved the corrupt file
+    aside and only later persisted the notice in the replacement queue;
+    a stop between the two left an aside file nobody reports and an empty
+    queue. Now the aside copy is written first, under a name derived from
     the bytes, and the notice replaces the corrupt file in one rename: a
     stop before the rename leaves the corrupt file to be found again, a
     stop after it leaves the notice on disk. Exception injection at the

@@ -156,11 +156,11 @@ class Test_anchor_receipts(unittest.TestCase):
                              self.receipts_path)
 
     def test_a_marker_that_cannot_be_written_is_a_save_that_does_not_happen(self):
-        """C5. Were the marker's failure a warning with the save going on, a
-        receipt append failing after it would retire the tree with no
-        marker and no receipt. The marker's error is the save's error:
-        nothing is saved, the tree stays owned, and __save_mature_trees
-        retries it
+        """2026-09-18 cold review R06 (C5). Until this change the marker's
+        failure was a warning and the save went on: with the receipt
+        append failing after it, the tree was retired with no marker and
+        no receipt. Now the marker's error is the save's error: nothing is
+        saved, the tree stays owned, and __save_mature_trees retries it
         every pass (test_receipt_marker.Test_marker_before_save has the
         continued execution and the restart on the real store). The append
         failing after a save is the other direction, and still never

@@ -19,7 +19,7 @@ Driven via subprocess: otsd is a script, and both runs exit early at
 calendar-identity loading (the calendar's uri missing) — which is AFTER the
 mkdir — so the dotdir's presence is fully decided by exit time either way.
 
-Test_process_boundary: the real otsd process, with a
+Test_process_boundary (2026-09-15 review): the real otsd process, with a
 real calendar directory and no bitcoind, must exit 1 with its listener
 closed when the aggregator fails, and refuse to start (exit 1, the
 recovery text on its log) when journal.known-good is malformed or older
@@ -194,11 +194,11 @@ class Test_process_boundary(unittest.TestCase):
 
 
 class Test_bind_failure(unittest.TestCase):
-    """Were otsd to start the aggregator and stamper threads and only then
-    bind the listener, a bind failure would escape as a traceback while
-    the non-daemon workers kept the process alive with no listener, and a
-    supervisor would see a running service that served nothing. The
-    listener is bound before any
+    """2026-09-15/16 review F19: before this change otsd started the
+    aggregator and stamper threads and only then bound the listener; a
+    bind failure escaped as a traceback while the non-daemon workers kept
+    the process alive with no listener, so a supervisor saw a running
+    service that served nothing. Now the listener is bound before any
     worker starts, and a bind failure exits 1 with nothing running."""
 
     setUp = Test_process_boundary.setUp
@@ -224,11 +224,11 @@ class Test_bind_failure(unittest.TestCase):
 
 
 class Test_invalid_configuration(unittest.TestCase):
-    """A --btc-min-confirmations the help forbids must not fail inside the
-    stamper's constructor, after the aggregator thread has started and the
-    listener is bound, with the non-daemon worker keeping the process
-    alive behind a port that serves nothing and a supervisor seeing no
-    exit. Every flag is checked before a
+    """2026-09-18 cold review R18: a --btc-min-confirmations the help
+    forbids used to fail inside the stamper's constructor, after the
+    aggregator thread had started and the listener was bound, and the
+    non-daemon worker kept the process alive behind a port that served
+    nothing; a supervisor saw no exit. Now every flag is checked before a
     socket or a worker exists: argparse exits 2 with the message and
     nothing bound. Driven at the process boundary, with the valid depth
     as the control."""
