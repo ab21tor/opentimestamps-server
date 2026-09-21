@@ -268,7 +268,7 @@ NOW = 1788600000
 ALL_OK = {name: (True, '') for name in watch.ORDER}
 
 
-def box_cfg(**over):
+def review_cfg(**over):
     cfg = dict(watch.DEFAULTS, HEARTBEAT_HOUR='99', NAME='box', NTFY_URL='http://ntfy.invalid/box')
     cfg.update(over)
     return cfg
@@ -280,7 +280,7 @@ def watcher_run(directory, checks, send, now=NOW, quiet=True):
     replaced by the given checks and the sender by `send`."""
     patches = [mock.patch.multiple(watch, WATCH_DIR=str(directory), STATE=str(directory / 'state.json'),
                                    STATUS=str(directory / 'status')),
-               mock.patch.object(watch, 'load_config', return_value=box_cfg()),
+               mock.patch.object(watch, 'load_config', return_value=review_cfg()),
                mock.patch.object(watch, 'observe', return_value={}),
                mock.patch.object(watch, 'evaluate', return_value=checks),
                mock.patch.object(watch, 'send', side_effect=send),
@@ -300,7 +300,7 @@ class Test_observation_failure(unittest.TestCase):
     where it was until every journal query succeeds."""
 
     def observe_with(self, journal_rc):
-        config = box_cfg()
+        config = review_cfg()
         for key in watch.SKIP_WHEN_EMPTY.values():
             config[key] = ''
         seen = []
@@ -310,7 +310,7 @@ class Test_observation_failure(unittest.TestCase):
                 seen.append(cmd)
                 return journal_rc, ''
             return 0, ''
-        with mock.patch.object(watch, 'run_command', side_effect=command), \
+        with mock.patch.object(watch, 'run', side_effect=command), \
                 mock.patch.object(watch, 'kernel_versions', return_value=('same', 'same')):
             observation = watch.observe(config, NOW, {'journal': NOW - 300})
         self.assertEqual(len(seen), 5, 'every journal query was made')
@@ -473,10 +473,10 @@ class Test_outbox_recovery_interrupted(unittest.TestCase):
 
     def test_a_stop_right_after_the_quarantine_keeps_the_notice(self):
         self.outbox.write_bytes(b'{not a message list')
-        first = watch.load_outbox(box_cfg())          # the run stops here, before it writes anything else
+        first = watch.load_outbox(review_cfg())          # the run stops here, before it writes anything else
         self.assertEqual(len(first), 1)
         self.assertIn('outbox', first[0]['text'])
-        again = watch.load_outbox(box_cfg())          # the next run
+        again = watch.load_outbox(review_cfg())          # the next run
         self.assertEqual([m['text'] for m in again], [first[0]['text']],
                          'the notice is on disk the moment the corrupt file is gone')
         self.assertEqual(len(self.asides()), 1)
@@ -495,13 +495,13 @@ class Test_outbox_recovery_interrupted(unittest.TestCase):
             return real_replace(src, dst)
         with mock.patch.object(watch.os, 'replace', side_effect=fail_once):
             with self.assertRaises(OSError):
-                watch.load_outbox(box_cfg())
+                watch.load_outbox(review_cfg())
         self.assertEqual(self.outbox.read_bytes(), b'{not a message list', 'the corrupt file is still there to be found')
         self.assertEqual(len(self.asides()), 1, 'the aside copy was made before the replacement')
-        queue = watch.load_outbox(box_cfg())
+        queue = watch.load_outbox(review_cfg())
         self.assertEqual(len(queue), 1)
         self.assertEqual(len(self.asides()), 1, 'the same bytes get the same aside name: no second copy')
-        self.assertEqual(watch.load_outbox(box_cfg()), queue, 'and the notice stays until delivered')
+        self.assertEqual(watch.load_outbox(review_cfg()), queue, 'and the notice stays until delivered')
 
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == '--child':

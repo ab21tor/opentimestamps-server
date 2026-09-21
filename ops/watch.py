@@ -231,9 +231,9 @@ def load_config():
     return cfg
 
 
-def run_command(cmd, timeout=30):
+def run(cmd, timeout=30):
     try:
-        p = subprocess.run_command(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout
     except Exception as e:
         return -1, "exc %r" % (e,)
@@ -268,7 +268,7 @@ def kernel_versions():
 
 def pending_updates():
     """(total, security) from the apt cache only (no network); ~1 s, so heartbeat runs only."""
-    rc, out = run_command(["apt", "list", "--upgradable"], timeout=60)
+    rc, out = run(["apt", "list", "--upgradable"], timeout=60)
     if rc != 0:
         return None, None
     lines = [l for l in out.splitlines() if "/" in l and not l.startswith("Listing")]
@@ -313,14 +313,14 @@ def observe(cfg, now, cursors, want_updates=False):
                                                         {"Accept": "application/json"})
     o["containers"] = None
     if cfg["CONTAINERS"]:
-        rc, out = run_command(["docker", "ps", "--format", "{{.Names}} {{.Status}}"])
+        rc, out = run(["docker", "ps", "--format", "{{.Names}} {{.Status}}"])
         o["containers"] = {l.split(" ", 1)[0]: l.split(" ", 1)[1] for l in out.splitlines() if " " in l} if rc == 0 else None
     o["units_system"] = {}
     for u in [u for u in cfg["UNITS_SYSTEM"].split(",") if u]:
-        o["units_system"][u] = run_command(["systemctl", "is-active", u])[1].strip()
+        o["units_system"][u] = run(["systemctl", "is-active", u])[1].strip()
     o["units_user"] = {}
     for u in [u for u in cfg["UNITS_USER"].split(",") if u]:
-        o["units_user"][u] = run_command(["systemctl", "--user", "is-active", u])[1].strip()
+        o["units_user"][u] = run(["systemctl", "--user", "is-active", u])[1].strip()
     o["disk"] = {}
     for key in ("DISK_ROOT", "DISK_BOOT"):
         if not cfg[key]:
@@ -342,7 +342,7 @@ def observe(cfg, now, cursors, want_updates=False):
     o["feeder_age"], o["feeder_err_polls"], o["feeder_error"], o["feeder_tail_error"] = None, None, None, None
     if cfg["FEEDER_LOG"]:
         o["feeder_age"], o["feeder_error"] = file_age(cfg["FEEDER_LOG"], now)
-        rc, out = run_command(["tail", "-n", cfg["FEEDER_ERR_POLLS"], cfg["FEEDER_LOG"]])
+        rc, out = run(["tail", "-n", cfg["FEEDER_ERR_POLLS"], cfg["FEEDER_LOG"]])
         if rc != 0:
             o["feeder_tail_error"] = "tail failed"
         else:
@@ -382,7 +382,7 @@ def observe(cfg, now, cursors, want_updates=False):
     o["journal_failed"] = []
 
     def journal(label, *args, pattern=None):
-        rc, out = run_command(["journalctl"] + list(args))
+        rc, out = run(["journalctl"] + list(args))
         if rc != 0:
             o["journal_failed"].append(label)
             return ""
@@ -402,7 +402,7 @@ def observe(cfg, now, cursors, want_updates=False):
     # dhcp: hours until the lease expires (renewal happens at half-life, so under 6 h means a renewal was missed)
     o["dhcp_lease_left_h"] = None
     if cfg["DHCP_IFACE"]:
-        rc, out = run_command(["nmcli", "-t", "-f", "DHCP4.OPTION", "dev", "show", cfg["DHCP_IFACE"]])
+        rc, out = run(["nmcli", "-t", "-f", "DHCP4.OPTION", "dev", "show", cfg["DHCP_IFACE"]])
         for l in out.splitlines():
             if "expiry = " in l:
                 try:
@@ -412,7 +412,7 @@ def observe(cfg, now, cursors, want_updates=False):
     # tor: a heartbeat (every 6 h) or a bootstrap line in the window, its circuit count, and recent no-network warnings
     o["tor_alive_lines"], o["tor_circuits"], o["tor_net_warn"] = None, None, None
     if cfg["TOR_CONTAINER"]:
-        rc, out = run_command(["docker", "logs", "--since", cfg["TOR_HB_MAX_H"] + "h", cfg["TOR_CONTAINER"]])
+        rc, out = run(["docker", "logs", "--since", cfg["TOR_HB_MAX_H"] + "h", cfg["TOR_CONTAINER"]])
         if rc == 0:
             alive = [l for l in out.splitlines() if "Bootstrapped 100%" in l or "Heartbeat: Tor's uptime" in l]
             o["tor_alive_lines"] = len(alive)
@@ -422,12 +422,12 @@ def observe(cfg, now, cursors, want_updates=False):
                     o["tor_circuits"] = int(hb[-1].split("with ", 1)[1].split(" circuits")[0])
                 except (IndexError, ValueError):
                     pass
-            rc2, out2 = run_command(["docker", "logs", "--since", cfg["TOR_WARN_MIN"] + "m", cfg["TOR_CONTAINER"]])
+            rc2, out2 = run(["docker", "logs", "--since", cfg["TOR_WARN_MIN"] + "m", cfg["TOR_CONTAINER"]])
             o["tor_net_warn"] = sum(1 for l in out2.splitlines() if "network activity" in l) if rc2 == 0 else None
     # bitcoind: established outbound p2p connections
     o["btc_peers"] = None
     if cfg["BTC_P2P_PORT"]:
-        rc, out = run_command(["ss", "-Htn", "state", "established", "( dport = :%s )" % cfg["BTC_P2P_PORT"]])
+        rc, out = run(["ss", "-Htn", "state", "established", "( dport = :%s )" % cfg["BTC_P2P_PORT"]])
         o["btc_peers"] = len(out.splitlines()) if rc == 0 else None
     o["anchors"], o["anchor_age_h"], o["receipts_error"] = None, None, None
     if cfg["RECEIPTS"]:

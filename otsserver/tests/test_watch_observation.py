@@ -40,7 +40,7 @@ import unittest
 from unittest import mock
 
 from otsserver.tests.faults import Stop, fail_on_call, unreadable
-from otsserver.tests.test_watch import ALL_OK, APPLIANCE, NOW, TOOL, cfg_with, box_cfg, watch, watcher_run
+from otsserver.tests.test_watch import ALL_OK, APPLIANCE, NOW, TOOL, cfg_with, review_cfg, watch, watcher_run
 
 BURST = dict(ALL_OK, ssh_unexpected=(False, 'ssh accepted from 1 source not in SSH_KNOWN_SOURCES'))
 SLOW = dict(ALL_OK, mem=(False, 'mem available 100MB'))   # a two-run check
@@ -133,12 +133,12 @@ class Test_unknown_is_a_state(unittest.TestCase):
         switched off or stubbed; no command runs."""
         with tempfile.TemporaryDirectory() as tmp:
             d = pathlib.Path(tmp)
-            cfg = box_cfg()
+            cfg = review_cfg()
             for key in watch.SKIP_WHEN_EMPTY.values():
                 cfg[key] = ''
             cfg['ENDPOINT_HEARTBEAT'] = str(d / 'heartbeat')
             cfg['RECEIPTS'] = str(d / 'receipts.jsonl')
-            with mock.patch.object(watch, 'run_command', return_value=(0, '')), \
+            with mock.patch.object(watch, 'run', return_value=(0, '')), \
                     mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')):
                 o = watch.observe(cfg, NOW, {'journal': NOW - 300})
                 self.assertEqual((o['endpoint_error'], o['receipts_error']), ('missing', 'missing'))
@@ -167,14 +167,14 @@ class Test_unknown_is_a_state(unittest.TestCase):
         review, 1)."""
         with tempfile.TemporaryDirectory() as tmp:
             d = pathlib.Path(tmp)
-            cfg = box_cfg()
+            cfg = review_cfg()
             for key in watch.SKIP_WHEN_EMPTY.values():
                 cfg[key] = ''
             cfg['ENDPOINT_HEARTBEAT'] = str(d / 'heartbeat')
             cfg['RECEIPTS'] = str(d / 'receipts.jsonl')
             (d / 'heartbeat').write_bytes(b'\xff')
             (d / 'receipts.jsonl').write_bytes(b'\xff\n')
-            with mock.patch.object(watch, 'run_command', return_value=(0, '')), \
+            with mock.patch.object(watch, 'run', return_value=(0, '')), \
                     mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')):
                 o = watch.observe(cfg, NOW, {'journal': NOW - 300})
             self.assertEqual((o['endpoint_error'], o['receipts_error']), ('unparseable', 'unparseable'))
@@ -187,7 +187,7 @@ class Test_unknown_is_a_state(unittest.TestCase):
             cfg2 = cfg_with(HEALTH_URL='http://127.0.0.1:8000/health')
             self.assertIsNone(watch.evaluate({'health_reach': True, 'health': ['not', 'an', 'object']}, cfg2)['health'][0])
             # And a run through real_run with such an observation ends with the status saying unknown.
-            live = dict(box_cfg(), **{k: '' for k in watch.SKIP_WHEN_EMPTY.values()})
+            live = dict(review_cfg(), **{k: '' for k in watch.SKIP_WHEN_EMPTY.values()})
             live['ENDPOINT_HEARTBEAT'], live['RECEIPTS'] = cfg['ENDPOINT_HEARTBEAT'], cfg['RECEIPTS']
             with watcher_run(d, watch.evaluate(o, cfg), lambda *_: (True, 'ok')):
                 with mock.patch.object(watch, 'load_config', return_value=live):
@@ -201,7 +201,7 @@ class Test_unknown_is_a_state(unittest.TestCase):
         (gate review, 2)."""
         with tempfile.TemporaryDirectory() as tmp:
             d = pathlib.Path(tmp)
-            cfg = box_cfg()
+            cfg = review_cfg()
             for key in watch.SKIP_WHEN_EMPTY.values():
                 cfg[key] = ''
             cfg['FEEDER_LOG'] = str(d / 'feeder.log')
@@ -222,7 +222,7 @@ class Test_unknown_is_a_state(unittest.TestCase):
                 return command
 
             def observe(command):
-                with mock.patch.object(watch, 'run_command', side_effect=command), \
+                with mock.patch.object(watch, 'run', side_effect=command), \
                         mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')):
                     return watch.observe(cfg, NOW, {'journal': NOW - 300})
             o = observe(commands(tail_rc=1))
@@ -638,7 +638,7 @@ sys.exit(watch.real_run(False))
     def kill_at(self, boundary):
         checks_path, cfg_path = self.dir / 'checks.json', self.dir / 'cfg.json'
         checks_path.write_text(json.dumps({k: list(v) for k, v in BURST.items()}))
-        cfg_path.write_text(json.dumps(box_cfg()))
+        cfg_path.write_text(json.dumps(review_cfg()))
         child = subprocess.Popen([sys.executable, '-B', '-c', self.CHILD, str(TOOL), str(self.dir), boundary,
                                   str(checks_path), str(cfg_path)],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -977,14 +977,14 @@ class Test_journal_exit_semantics(unittest.TestCase):
         return command
 
     def config(self):
-        cfg = box_cfg(NTFY_URL='')
+        cfg = review_cfg(NTFY_URL='')
         for key in watch.SKIP_WHEN_EMPTY.values():
             cfg[key] = ''
         return cfg
 
     def test_the_patterns_are_matched_here_and_a_quiet_window_is_a_successful_read(self):
         seen = []
-        with mock.patch.object(watch, 'run_command', side_effect=self.journalctl_like(seen)), \
+        with mock.patch.object(watch, 'run', side_effect=self.journalctl_like(seen)), \
                 mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')):
             o = watch.observe(self.config(), NOW, {'journal': NOW - 300})
         self.assertEqual(len(seen), 5, 'every journal query was made')
@@ -1004,7 +1004,7 @@ class Test_journal_exit_semantics(unittest.TestCase):
             (d / 'state.json').write_text(json.dumps({'cursors': {'journal': NOW - 300}}))
             with mock.patch.multiple(watch, WATCH_DIR=str(d), STATE=str(d / 'state.json'), STATUS=str(d / 'status')), \
                     mock.patch.object(watch, 'load_config', return_value=self.config()), \
-                    mock.patch.object(watch, 'run_command', side_effect=command), \
+                    mock.patch.object(watch, 'run', side_effect=command), \
                     mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')), \
                     mock.patch.object(watch.time, 'time', return_value=NOW), mock.patch.object(watch, 'log'):
                 codes = [watch.real_run(False) for _ in range(3)]
@@ -1040,11 +1040,11 @@ class Test_receipt_order(unittest.TestCase):
             receipts.write_text(''.join(
                 (l if isinstance(l, str) else json.dumps({'txid': '%064x' % i, 'confirmed_at': l})) + '\n'
                 for i, l in enumerate(lines)))
-            cfg = box_cfg(RECEIPTS=str(receipts))
+            cfg = review_cfg(RECEIPTS=str(receipts))
             for key in watch.SKIP_WHEN_EMPTY.values():
                 if key != 'RECEIPTS':
                     cfg[key] = ''
-            with mock.patch.object(watch, 'run_command', return_value=(0, '')), \
+            with mock.patch.object(watch, 'run', return_value=(0, '')), \
                     mock.patch.object(watch, 'kernel_versions', return_value=('k', 'k')):
                 o = watch.observe(cfg, NOW, {})
             return o, watch.evaluate(o, cfg)['anchor_age']
@@ -1125,7 +1125,7 @@ class Test_numeric_poison(unittest.TestCase):
 
     def test_the_valid_cap_control_folds(self):
         messages = [{'text': 'drop notice', 'queued': 'old', 'cap': True, 'dropped': 2}]
-        result, dropped = watch.enqueue(messages + [{'text': 'alert', 'queued': 'later'}] * 201, [], box_cfg(), 'now')
+        result, dropped = watch.enqueue(messages + [{'text': 'alert', 'queued': 'later'}] * 201, [], review_cfg(), 'now')
         self.assertEqual(len(result), watch.OUTBOX_MAX)
         self.assertGreater(result[0]['dropped'], 2)
         self.assertEqual(dropped, 2)

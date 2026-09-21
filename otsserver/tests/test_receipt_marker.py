@@ -145,7 +145,7 @@ class Test_receipt_marker(unittest.TestCase):
         fresh = make_stamper(self.receipts)
         fresh.calendar = self.calendar
         with self.assertLogs(level='WARNING') as captured:
-            fresh.settle_pending_receipts()
+            fresh.settle_pending_receipt()
         self.assertEqual(self.markers(), [])
         self.assertEqual(self.lines(), [])
         self.assertTrue(any(b2lx(tx.tx.GetTxid()) in l and 'discard' in l for l in captured.output),
@@ -171,7 +171,7 @@ class Test_receipt_marker(unittest.TestCase):
         fresh = make_stamper(self.receipts)
         fresh.calendar = self.calendar
         with self.assertLogs(level='WARNING') as captured:
-            fresh.settle_pending_receipts()
+            fresh.settle_pending_receipt()
         self.assertEqual([r['txid'] for r in self.lines()], [b2lx(tx.tx.GetTxid())])
         self.assertEqual(self.markers(), [])
         self.assertTrue(any('recovered' in l for l in captured.output), captured.output)
@@ -187,7 +187,7 @@ class Test_receipt_marker(unittest.TestCase):
 
         fresh = make_stamper(self.receipts)
         fresh.calendar = self.calendar
-        fresh.settle_pending_receipts()
+        fresh.settle_pending_receipt()
         self.assertEqual([r['txid'] for r in self.lines()], [b2lx(tx.tx.GetTxid())])
         self.assertEqual(self.markers(), [])
 
@@ -232,7 +232,7 @@ class Test_receipt_marker(unittest.TestCase):
         fresh.calendar = self.calendar
         with mock.patch('otsserver.stamper.os.unlink', side_effect=refuse_a), \
                 self.assertLogs(level='WARNING') as captured:
-            fresh.settle_pending_receipts()         # not owed, but the marker cannot go
+            fresh.settle_pending_receipt()         # not owed, but the marker cannot go
             self.assertTrue(os.path.exists(marker_a))
             fresh._Stamper__save_confirmed_timestamp_tx(mined(2, make_commitments(3)))   # the same commitments, anchor B
         b = [r['txid'] for r in self.lines()]
@@ -241,17 +241,17 @@ class Test_receipt_marker(unittest.TestCase):
         self.assertTrue(any('could not be settled' in l and 'PermissionError' in l for l in captured.output), captured.output)
         self.assertTrue(os.path.exists(marker_a), 'retried, not forgotten')
         with self.assertLogs(level='WARNING') as captured:
-            fresh.settle_pending_receipts()         # the unlink works again
+            fresh.settle_pending_receipt()         # the unlink works again
         self.assertEqual([r['txid'] for r in self.lines()], b, 'A is never owed: B saved B, not A')
         self.assertEqual(self.markers(), [])
         self.assertTrue(any('discarded' in l and b2lx(a.tx.GetTxid()) in l for l in captured.output), captured.output)
 
     def test_no_marker_and_receipts_off_are_no_ops(self):
-        self.stamper.settle_pending_receipts()
+        self.stamper.settle_pending_receipt()
         self.assertEqual(self.markers(), [])
         off = make_stamper(None)
         off.calendar = self.calendar
-        off.settle_pending_receipts()
+        off.settle_pending_receipt()
         off._Stamper__save_confirmed_timestamp_tx(mined(1, make_commitments(1)))
         self.assertEqual(self.lines(), [])
         self.assertEqual(os.listdir(self.tmpdir.name), [])
@@ -260,7 +260,7 @@ class Test_receipt_marker(unittest.TestCase):
         with open(self.marker, 'w') as fd:
             fd.write('not json')
         with self.assertLogs(level='WARNING'):
-            self.stamper.settle_pending_receipts()
+            self.stamper.settle_pending_receipt()
         self.assertFalse(os.path.exists(self.marker))
         self.assertEqual(self.markers(), [])
         self.assertTrue(any(n.startswith('anchor-receipts.jsonl.pending.corrupt-') for n in os.listdir(self.tmpdir.name)),
@@ -344,7 +344,7 @@ class Test_receipt_durability(unittest.TestCase):
         fresh = make_stamper(self.receipts)
         fresh.calendar = self.calendar
         with self.assertLogs(level='WARNING') as captured:
-            fresh.settle_pending_receipts()
+            fresh.settle_pending_receipt()
         self.assertEqual([r['txid'] for r in self.lines()],
                          [b2lx(first.tx.GetTxid()), b2lx(second.tx.GetTxid())])
         self.assertTrue(self.raw().startswith(whole), 'the completed receipt is untouched')
@@ -352,7 +352,7 @@ class Test_receipt_durability(unittest.TestCase):
         self.assertEqual(self.markers(), [])
         self.assertTrue(any('incomplete' in l for l in captured.output), captured.output)
         # Recovering again changes nothing.
-        fresh.settle_pending_receipts()
+        fresh.settle_pending_receipt()
         self.assertEqual(len(self.lines()), 2)
 
     def test_a_line_that_lost_only_its_newline_is_written_once(self):
@@ -363,7 +363,7 @@ class Test_receipt_durability(unittest.TestCase):
         fresh = make_stamper(self.receipts)
         fresh.calendar = self.calendar
         with self.assertLogs(level='WARNING'):
-            fresh.settle_pending_receipts()
+            fresh.settle_pending_receipt()
         self.assertEqual([r['txid'] for r in self.lines()], [b2lx(tx.tx.GetTxid())])
         self.assertEqual(self.raw().count(b'\n'), 1)
         self.assertEqual(self.markers(), [])
@@ -456,7 +456,7 @@ class Test_marker_per_anchor(unittest.TestCase):
         self.assertEqual(len(self.markers()), 1, "A's marker: the receipt is still owed")
         # Storage back: A is settled at the next start or before the next anchor.
         with self.assertLogs(level='WARNING') as captured:
-            self.stamper.settle_pending_receipts()
+            self.stamper.settle_pending_receipt()
         self.assertEqual(sorted(r['txid'] for r in self.lines()), sorted([txid_a, txid_b]))
         self.assertEqual(self.markers(), [])
         self.assertTrue(any('recovered' in l and txid_a in l for l in captured.output), captured.output)
@@ -472,12 +472,12 @@ class Test_marker_per_anchor(unittest.TestCase):
         self.assertEqual(self.lines(), [])
         self.assertEqual(len(self.markers()), 2, 'one marker per anchor still owed')
         with self.assertLogs(level='WARNING'):
-            self.stamper.settle_pending_receipts()
+            self.stamper.settle_pending_receipt()
         self.assertEqual(sorted(r['txid'] for r in self.lines()),
                          sorted([b2lx(a.tx.GetTxid()), b2lx(b.tx.GetTxid())]))
         self.assertEqual(self.markers(), [])
         # Settling again changes nothing.
-        self.stamper.settle_pending_receipts()
+        self.stamper.settle_pending_receipt()
         self.assertEqual(len(self.lines()), 2)
 
     def test_a_marker_from_before_per_anchor_names_is_settled(self):
@@ -494,7 +494,7 @@ class Test_marker_per_anchor(unittest.TestCase):
         with open(legacy, 'w') as fd:
             fd.write(json.dumps({'receipt': receipt, 'probe': tx.commitment_timestamps[0].msg.hex()}) + '\n')
         with self.assertLogs(level='WARNING'):
-            self.stamper.settle_pending_receipts()
+            self.stamper.settle_pending_receipt()
         self.assertEqual([r['txid'] for r in self.lines()], [txid])
         self.assertFalse(os.path.exists(legacy))
         self.assertEqual(self.markers(), [])
@@ -617,8 +617,8 @@ class Test_marker_before_save(unittest.TestCase):
             self.assertEqual(s.txs_waiting_for_confirmation, {})
             self.assertEqual(len(pending_markers(str(rp))), 1)
             self.assertEqual(block_queue.receipts(rp), [])
-            s.settle_pending_receipts()
-            s.settle_pending_receipts()
+            s.settle_pending_receipt()
+            s.settle_pending_receipt()
             self.assertEqual([r['txid'] for r in block_queue.receipts(rp)], [b2lx(tree.tx.GetTxid())])
             self.assertEqual(pending_markers(str(rp)), [])
 

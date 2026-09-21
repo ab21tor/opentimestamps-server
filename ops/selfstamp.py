@@ -740,7 +740,7 @@ def latest_manifest(manifests_dir):
         return None
     raw = files[-1].read_bytes()
     try:
-        parsed = _parse_manifest(raw)
+        parsed = _parse_foreign_manifest(raw)
     except ValueError as exp:
         raise ValueError('%s is not a manifest: %s' % (files[-1].name, exp))
     return files[-1].name, raw, parsed
@@ -828,7 +828,7 @@ def witnessed_entries(witnessed_dir, manifests_dir, log):
             continue
         try:
             raw = copy.read_bytes()
-            m = _parse_manifest(raw)
+            m = _parse_foreign_manifest(raw)
         except (OSError, ValueError) as exp:
             log('%s witnessed copy unreadable file=%s reason=%s' % (_stamp(), copy.name, _reason(exp)))
             problems += 1
@@ -901,7 +901,7 @@ def _check_foreign_proof(raw_ots, digest):
     return proof
 
 
-def _parse_manifest(raw):
+def _parse_foreign_manifest(raw):
     """The one manifest validator, applied to every manifest this tool
     reads: a delivery in the inbox, its own predecessor when it continues
     a chain, and each file verify walks. The bytes must be a JSON object
@@ -1077,7 +1077,7 @@ def _consume_manifest(path, name, inbox, witnessed_dir, held, log):
     raw = path.read_bytes()
     companion = _companion_claim(path, name, inbox) or path.with_name(path.name + '.ots')
     try:
-        m = _parse_manifest(raw)
+        m = _parse_foreign_manifest(raw)
     except ValueError as exp:
         if companion.exists():
             _quarantine(companion, name + '.ots', companion.read_bytes(), inbox, log, 'foreign proof',
@@ -1227,7 +1227,7 @@ def export_outbox(cfg, manifests_dir, log):
     for path in _files(manifests_dir, '.json'):
         try:
             raw = path.read_bytes()
-            m = _parse_manifest(raw)
+            m = _parse_foreign_manifest(raw)
             prefix = _label(m) or safe_name(m.get('host'))
             _export_file(path, outbox / ('%s-%s' % (prefix, path.name)), log)
             ots = proof_path(path)
@@ -1556,7 +1556,7 @@ def cross_check(manifests_dir, witness_dir, log):
     unreadable = 0
     for path in files:
         try:
-            m = _parse_manifest(path.read_bytes())
+            m = _parse_foreign_manifest(path.read_bytes())
         except (OSError, ValueError) as exp:
             log('witness manifest unreadable: %s (%s)' % (path.name, _reason(exp)))
             unreadable += 1
@@ -1570,7 +1570,7 @@ def cross_check(manifests_dir, witness_dir, log):
     for path in _files(manifests_dir, '.json'):
         try:
             raw = path.read_bytes()
-            m = _parse_manifest(raw)
+            m = _parse_foreign_manifest(raw)
         except (OSError, ValueError):
             continue   # verify_chain reports it
         mine = hashlib.sha256(raw).hexdigest()
@@ -1646,7 +1646,7 @@ def verify_chain(manifests_dir, log=None, witnessed=None, witness=None, skip_wit
             continue
         problems = []
         try:
-            manifest = _parse_manifest(raw)
+            manifest = _parse_foreign_manifest(raw)
         except ValueError as exp:
             # The one validator's verdict; what can still be checked of a
             # JSON object that failed it is checked below.

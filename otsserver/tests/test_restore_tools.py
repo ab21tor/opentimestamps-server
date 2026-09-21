@@ -40,7 +40,7 @@ from unittest import mock
 
 from otsserver.tests.faults import Stop, fail_on_call, unreadable
 from otsserver.tests.test_selfstamp import SelfstampCase, P3, TOOL, selfstamp
-from otsserver.tests.test_watch import ALL_OK, NOW, box_cfg, watch, watcher_run
+from otsserver.tests.test_watch import ALL_OK, NOW, review_cfg, watch, watcher_run
 
 OPS_TESTS = TOOL.parent / 'tests'
 LEGACY = OPS_TESTS / 'selfstamp' / 'v2' / 'legacy-a'        # a selfstamp/2 chain of two days, written at 3961a1f
@@ -177,7 +177,7 @@ class Test_what_older_tools_do_with_newer_state(unittest.TestCase):
             root = pathlib.Path(tmp)
             (root / 'state.json').write_text(json.dumps({'owed': owed}))
             with mock.patch.multiple(old, WATCH_DIR=str(root), STATE=str(root / 'state.json'), STATUS=str(root / 'status')), \
-                    mock.patch.object(old, 'load_config', return_value=box_cfg()), \
+                    mock.patch.object(old, 'load_config', return_value=review_cfg()), \
                     mock.patch.object(old, 'observe', return_value={}), \
                     mock.patch.object(old, 'evaluate', return_value=ALL_OK), \
                     mock.patch.object(old, 'log'), mock.patch.object(old, 'send') as sender:
