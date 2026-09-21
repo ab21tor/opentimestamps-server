@@ -107,10 +107,10 @@ if not (1 <= args.btc_conf_target <= 1008):
     args.parser.error("--btc-conf-target must be in range 1 <= N <= 1008")
 
 # Every flag is checked before a socket is bound or a worker started: a
-# value the stamper's constructor refused used to fail after the aggregator
-# thread and the listener existed, and the non-daemon worker kept a process
-# alive behind a bound port that served nothing (2026-09-18 cold review
-# R18). argparse exits 2 with the message, nothing running.
+# value refused inside the stamper's constructor would fail after the
+# aggregator thread and the listener existed, and the non-daemon worker
+# would keep a process alive behind a bound port that served nothing.
+# argparse exits 2 with the message, nothing running.
 if args.btc_min_confirmations < 2:
     args.parser.error("--btc-min-confirmations must be greater than 1")
 
@@ -121,10 +121,9 @@ calendar_path = os.path.expanduser(args.calendar_path)
 calendar = otsserver.calendar.Calendar(calendar_path)
 
 # Bind before any worker starts: a port that cannot be bound is a start
-# that fails whole, exit 1, nothing left running. Before 2026-09-16 the
-# workers started first, the bind's exception escaped, and their non-daemon
-# threads kept a process alive that served nothing (2026-09-15/16 review
-# F19). The aggregator is attached to the server once it exists.
+# that fails whole, exit 1, nothing left running; workers started first
+# would keep a process alive, on their non-daemon threads, that served
+# nothing. The aggregator is attached to the server once it exists.
 try:
     server = otsserver.rpc.StampServer((args.rpc_address, args.rpc_port), None, calendar)
 except OSError as exp:
@@ -135,7 +134,7 @@ except OSError as exp:
 # The workers, each starting its own thread. A constructor that raises
 # after an earlier worker has started stops what started, closes the
 # listener and exits 1: never a live process behind a bound port that
-# serves nothing (2026-09-18 cold review R18).
+# serves nothing.
 aggregator = None
 try:
     aggregator = otsserver.calendar.Aggregator(calendar, exit_event)

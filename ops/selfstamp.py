@@ -129,9 +129,9 @@ BITCOIN_TAG = bytes.fromhex('0588960d73d71901')
 # The other two block-header attestations the public client knows
 # (LitecoinBlockHeaderAttestation; EthereumBlockHeaderAttestation under
 # dubious/). Their payload is one varuint height, read to its end exactly
-# as the client reads it; they are not usable attestations here and read
-# as unknown (2026-09-18 cold review R09: they used to be opaque, so an
-# empty or trailing payload the client refuses parsed).
+# as the client reads it, so an empty or trailing payload the client
+# refuses is refused here too; they are not usable attestations here and
+# read as unknown.
 HEIGHT_TAGS = (BITCOIN_TAG, bytes.fromhex('06869a0d73d71b45'), bytes.fromhex('30fe8087b5c7ead7'))
 
 # The public client's limits (opentimestamps 0.4.x), mirrored so that
@@ -151,9 +151,8 @@ Proof = collections.namedtuple('Proof', 'digest commitment attestation ops_end')
 
 class OtsError(Exception):
     """A proof this tool cannot read or must not write: the only error the
-    reader raises, whatever the bytes (2026-09-15/16 review F14: a
-    UnicodeDecodeError from a foreign proof's URI escaped and stopped
-    every run at the same inbox file)."""
+    reader raises, whatever the bytes, so that no foreign file can stop
+    every run at the same inbox entry with an error nobody catches."""
 
 
 class Locked(Exception):
@@ -172,12 +171,12 @@ LOCK_WAIT = 300.0
 def state_lock(state_dir, wait=LOCK_WAIT):
     """An exclusive lock over the state directory for the whole of a run or
     an upgrade, across processes (flock on <state_dir>/.lock): the timer's
-    run and a manual one can no longer interleave their manifest, proof
-    and export writes (2026-09-15 review: two overlapping first runs left
-    a manifest with the other run's proof). Waits up to `wait` seconds for
-    the holder, then raises Locked. The lock goes with the descriptor: a
-    run that dies releases it. It covers this tool's processes and nothing
-    else: whoever delivers files into the inbox is not under it."""
+    run and a manual one cannot interleave their manifest, proof and
+    export writes (two overlapping first runs would leave a manifest with
+    the other run's proof). Waits up to `wait` seconds for the holder,
+    then raises Locked. The lock goes with the descriptor: a run that dies
+    releases it. It covers this tool's processes and nothing else: whoever
+    delivers files into the inbox is not under it."""
     state = pathlib.Path(state_dir)
     state.mkdir(parents=True, exist_ok=True)
     path = state / '.lock'
@@ -753,8 +752,8 @@ LABEL = re.compile(r'[0-9a-f]{32}\Z')
 def _label(m):
     """A manifest's chain label (selfstamp/3): 32 hex digits, or None for a
     manifest written under an older schema, which named a host instead.
-    Anything else in the field is not a label (2026-09-16 gate review,
-    P4), and the validator refuses the manifest."""
+    Anything else in the field is not a label, and the validator refuses
+    the manifest."""
     chain = m.get('chain')
     return chain if isinstance(chain, str) and LABEL.match(chain) else None
 
@@ -944,11 +943,10 @@ def _claim(inbox, log):
     before any of it is read: an atomic rename to .claim-<8 hex>-<name>.
     A deliverer that replaces the name meanwhile (the convention allows
     it) leaves its new file to the next run, instead of having it removed
-    under a name this run had already read (2026-09-16 gate review, P1).
-    A stop after a claim leaves the claim, and the next run resumes every
-    claim whatever run made it. Returns the number of deliveries that
-    could not be claimed; one taken back before the rename is nobody's
-    and is skipped."""
+    under a name this run had already read. A stop after a claim leaves
+    the claim, and the next run resumes every claim whatever run made it.
+    Returns the number of deliveries that could not be claimed; one taken
+    back before the rename is nobody's and is skipped."""
     token = os.urandom(4).hex()
     failures = 0
     for suffix in ('.json', '.json.ots'):
@@ -1016,7 +1014,7 @@ def _keep_foreign_proof(copy, data, digest, log):
     attestation (the source exports its proof only once anchored, so it
     normally arrives on a later pass than its manifest). What is held
     counts only if it is itself a proof of the copy: a held file that is
-    not (2026-09-16 gate review, P2) is set aside beside the copy as
+    not one is set aside beside the copy as
     <copy>.foreign.ots.rejected-<12 hex of its sha256>, logged, and
     never outranks a proof that is. Returns the state now held ('held …'
     when the delivery said less). OtsError when the bytes delivered are
@@ -1236,9 +1234,9 @@ def export_outbox(cfg, manifests_dir, log):
             if not ots.exists():
                 continue
             # The companion is a proof of exactly this manifest's bytes with
-            # a Bitcoin attestation, or it is not published (2026-09-16 gate
-            # review, P2: attestation presence alone let a proof of other
-            # bytes travel as this manifest's).
+            # a Bitcoin attestation, or it is not published: attestation
+            # presence alone would let a proof of other bytes travel as
+            # this manifest's.
             text, state = _describe_proof(ots, raw)
             if state == 'bitcoin':
                 _export_file(ots, outbox / ('%s-%s.ots' % (prefix, path.name)), log)
@@ -1481,8 +1479,8 @@ def _verify_witnessed(entries, witnessed_dir, log, skip_copies=False):
     hash to the recorded sha256, and the copy's own proof (if present) must
     be a proof of those bytes. A copy that is not there (the file, or the
     whole directory) or cannot be read is a break: the vouch is for bytes
-    this box claims to hold (2026-09-15 review: an absent directory used to
-    pass). With skip_copies the copies are not looked for at all and every
+    this box claims to hold, and an absent directory is not a pass. With
+    skip_copies the copies are not looked for at all and every
     vouch is labelled SKIPPED. Each line names the copy's state (ok,
     missing, unreadable, MISMATCH, SKIPPED), this box's own proof of it,
     what the foreign proof said when the entry was written, and what is
@@ -1542,7 +1540,7 @@ def cross_check(manifests_dir, witness_dir, log):
     not a manifest is named and makes the check incomplete: the other
     manifests are still checked, and the result is False, because an
     absence found in evidence that could not all be read is not
-    established (2026-09-16 gate review, P3). A witness directory that is
+    established. A witness directory that is
     not there is a break: nothing was checked. The last line sums it up.
     No message names a path."""
     witness_dir = pathlib.Path(witness_dir)

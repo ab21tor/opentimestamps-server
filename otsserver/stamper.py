@@ -145,12 +145,10 @@ class KnownBlocks:
         that raises anywhere in the scan (the tip, a hash, the reorg
         check) puts the known blocks back as they were before the call,
         so the blocks it had seen are seen again, and returned, by the
-        next call. Before this the tip advanced header by header while
-        the list was local to the call: a raise after the last header
-        and before the return left the tip advanced and the blocks never
-        returned, and the caller's next pass, finding no new blocks,
-        called every waiting tree mature against a chain whose bodies it
-        had not read (2026-09-21 year-of-operation review, scenario 24).
+        next call. A tip that advanced without the blocks being returned
+        would let the caller's next pass, finding no new blocks, call
+        every waiting tree mature against a chain whose bodies it had
+        not read.
         """
         known = list(self.__blocks)
         r = []
@@ -202,21 +200,20 @@ def marker_path(receipts_path, txid=None):
     """The pending-receipt marker beside the receipts file, one per anchor:
     `<receipts>.pending.<txid>`. An earlier anchor's marker is never
     touched by a later anchor: each is settled on its own and removed only
-    by the code that wrote its receipt or found it not owed (2026-09-15/16
-    review F08: one shared name, and a later anchor's success unlinked an
-    earlier anchor's still-owed marker). Without a txid: the single name
-    used before 2026-09-16, which pending_markers still finds."""
+    by the code that wrote its receipt or found it not owed; one shared
+    name would let a later anchor's success unlink an earlier anchor's
+    still-owed marker. Without a txid: the single name of earlier
+    releases, which pending_markers still finds."""
     return receipts_path + '.pending' + ('.' + txid if txid else '')
 
 
 def marker_role(path):
     """How a marker is named in a message: by its role and its anchor, never
     by its file name, which is made from the receipts file's name and can
-    say who the calendar is run for (2026-09-18 gate review, G3). The
-    anchor is named only when the suffix is a txid, 64 hex characters, as
-    pending_markers requires; a receipts file whose own name holds
-    `.pending.` gives its single-name marker a suffix of another kind
-    (corrections review, G3b)."""
+    say who the calendar is run for. The anchor is named only when the
+    suffix is a txid, 64 hex characters, as pending_markers requires; a
+    receipts file whose own name holds `.pending.` gives its single-name
+    marker a suffix of another kind."""
     base, _, suffix = os.path.basename(path).rpartition('.pending.')
     if base and len(suffix) == 64 and all(c in '0123456789abcdef' for c in suffix):
         return 'the pending receipt marker of anchor %s' % suffix
@@ -228,9 +225,9 @@ def anchor_probe(txid):
     saved tree holds it (make_timestamp_from_block_tx puts the txid node on
     the path from every commitment to the block). A commitment would
     answer for any anchor that carried it, and the same commitments are
-    anchored again after a save that did not happen (2026-09-18 gate
-    review, G1: a marker whose discard had failed was later satisfied by
-    the next anchor's save of the same commitments, and billed twice)."""
+    anchored again after a save that did not happen: a marker whose
+    discard had failed would then be satisfied by the next anchor's save
+    of the same commitments, and billed twice."""
     return lx(txid)
 
 
@@ -256,7 +253,7 @@ def pending_markers(receipts_path):
 def _write_all(fd, data):
     """Write every byte of data to fd: os.write may write less than it was
     given (a full disk, a signal), and a short write taken for a whole one
-    was the 2026-09-15 review's receipt finding. No progress is an error."""
+    is a receipt lost. No progress is an error."""
     view = memoryview(data)
     while len(view):
         n = os.write(fd, view)
@@ -273,9 +270,9 @@ def _write_pending_receipt(receipts_path, body):
     key anchor_probe gives for the receipt's txid>}: enough to settle,
     after a crash, whether the calendar save the marker guards ever
     happened. The current reader asks about the txid it finds in the
-    receipt; `probe` is written for the readers before 2026-09-18, which
-    look up the field as it is, and now ask the same question by it. The
-    marker is named by the receipt's txid.
+    receipt; `probe` is written for the readers of earlier releases, which
+    look the field up as it is, and it holds this same key, so they ask
+    the same question. The marker is named by the receipt's txid.
     """
     path = marker_path(receipts_path, body['receipt']['txid'])
     tmp = path + '.tmp'
@@ -474,33 +471,34 @@ def find_unspent(proxy):
 class Stamper:
     """Timestamping bot"""
 
-    # Empty-wallet warn-once flag. Class-level default (the RecordCounts
-    # io_failed pattern) so test doubles built via __new__ share it; the
-    # first trip shadows it with an instance attribute.
+    # Class-level defaults: a test double built with __new__ skips
+    # __init__ and reads these; the first write shadows one with an
+    # instance attribute. Where the default is a tuple the real instance
+    # owns a list.
+
+    # Warn-once flag: one ERROR when the wallet has no spendable output,
+    # one INFO when it has one again.
     wallet_empty_warned = False
 
-    # Fee-cap warn-once flag, the same pattern: one ERROR on entering the
-    # blocked state, one INFO when a transaction goes out again.
+    # Warn-once flag: one ERROR on entering the fee-capped state, one INFO
+    # when a transaction goes out again.
     fee_capped_warned = False
 
     # Reader for the journal.counts sidecar, set by the stamper loop when
-    # anchor receipts are on; None keeps every count path inert. Class-level
-    # default for the same test-double reason.
+    # anchor receipts are on; None keeps every count path inert.
     record_counts = None
 
     # Deep-reorg detector (check_anchors): every ANCHOR_CHECK_INTERVAL
     # seconds the stamp loop asks the wallet about the last
     # ANCHOR_CHECK_RECEIPTS receipted anchors. needs_attention is what the
     # status line and the watcher read: one line per anchor whose saved
-    # proofs name a block that no longer holds it. Class-level default for
-    # the same test-double reason; the real instance owns a list.
+    # proofs name a block that no longer holds it.
     ANCHOR_CHECK_INTERVAL = 3600
     ANCHOR_CHECK_RECEIPTS = 100
     needs_attention = ()
 
-    # Calendar-save warn-once flag, the same pattern: one ERROR when a
-    # mature tree's save fails (the tree is kept and retried every pass),
-    # one INFO when saves land again.
+    # Warn-once flag: one ERROR when a mature tree's save fails (the tree
+    # is kept and retried every pass), one INFO when saves land again.
     save_failed_warned = False
 
     # Set to the reason when the stamper stopped the service (a startup it
@@ -508,8 +506,7 @@ class Stamper:
     failure = None
 
     # Blocks whose headers are known and whose bodies have not been read
-    # yet, oldest first (__do_bitcoin). Class-level default for the same
-    # test-double reason; the real instance owns a list.
+    # yet, oldest first (__do_bitcoin).
     unprocessed_blocks = ()
 
     @staticmethod
@@ -601,7 +598,7 @@ class Stamper:
         except (ValueError, KeyError, TypeError) as exp:
             stamp = int(time.time())
             # The class only: a decoding error's repr carries the bytes it
-            # refused (2026-09-18 corrections review, G3a).
+            # refused.
             logging.warning("%s is unreadable (%s); set aside beside the receipts file with the suffix .corrupt-%d, "
                             "no receipt written" % (role, type(exp).__name__, stamp))
             os.rename(path, '%s.corrupt-%d' % (path, stamp))
@@ -731,12 +728,10 @@ class Stamper:
             # __save_mature_trees, which keeps the tree and retries every
             # pass. A receipts directory that cannot be written therefore
             # delays publication; it never retires a receipt that nothing
-            # durable owns (2026-09-18 cold review R06: the failure used to
-            # be logged and the save went on, and when the append after it
-            # failed too the tree was retired with no marker and no
-            # receipt). The other durable owner would be a record of the
-            # owed receipt inside the save's own batch; the delay is the
-            # smaller change and is the one the contract states (C5).
+            # durable owns. The other durable owner would be a record of
+            # the owed receipt inside the save's own batch; the delay is
+            # the smaller mechanism and is the one the contract states
+            # (docs/contracts.md, C5).
             self.settle_pending_receipt()
             _write_pending_receipt(self.anchor_receipts_path,
                                    {'receipt': receipt, 'probe': anchor_probe(txid).hex()})
@@ -909,20 +904,17 @@ class Stamper:
         # every tree waiting at its height has been put back to pending. A
         # fetch that raises leaves that block and every block after it
         # queued for the next pass, and no tree is saved as mature while a
-        # block is still owed (2026-09-18 cold review R01: the header
-        # cursor advanced before the bodies were read, so one failed fetch
-        # consumed a reorg's notification, and the next pass saved the
-        # orphaned tree against the new chain's height). The headers are
-        # seen as one discovery: update_from_proxy advances the cursor
-        # with the list it returns, and a read that raises inside it puts
-        # the cursor back, so nothing is ever seen without being queued
-        # here (2026-09-21 year-of-operation review, scenario 24: the
-        # cursor used to advance header by header, and a raise after the
-        # last header left it advanced with nothing returned, the same
-        # orphan saved by the next pass). update_from_proxy appends from
-        # the fork point up, so a block still queued at or above the first
-        # new height was itself replaced: its replacement is among the new
-        # blocks, and it is dropped unread.
+        # block is still owed: a header cursor that advanced before the
+        # bodies were read would let one failed fetch consume a reorg's
+        # notification, and the next pass would save the orphaned tree
+        # against the new chain's height. The headers are seen as one
+        # discovery: update_from_proxy advances the cursor with the list
+        # it returns, and a read that raises inside it puts the cursor
+        # back, so nothing is ever seen without being queued here.
+        # update_from_proxy appends from the fork point up, so a block
+        # still queued at or above the first new height was itself
+        # replaced: its replacement is among the new blocks, and it is
+        # dropped unread.
         for (block_height, block_hash) in new_blocks:
             logging.info("New block %s at height %d" % (b2lx(block_hash), block_height))
         if new_blocks:
@@ -1342,7 +1334,7 @@ class Stamper:
                 idx += 1
 
             # A snapshot: the stamper thread mutates this dict while an RPC
-            # thread is here (N16, 2026-09-08).
+            # thread is here.
             for height, ttx in list(self.txs_waiting_for_confirmation.items()):
                 for commitment_timestamp in ttx.commitment_timestamps:
                     if commitment == commitment_timestamp.msg:

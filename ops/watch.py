@@ -42,7 +42,7 @@ appliance and "ok 21/21" on the Pi both mean every configured check passed.
 The script lives in the fork's ops/ (read-only on the box); config, state,
 status and log live in WATCH_DIR (default ~/watcher).
 
-Alert contract (2026-09-07): checks fail on two consecutive runs before alerting and recover on
+Alert contract: checks fail on two consecutive runs before alerting and recover on
 two, except the burst checks (journal_errors, ssh_failures, egress_drops, ssh_unexpected) which
 alert on the run they are seen and clear on the next. egress_drops counts kernel "egress-drop*"
 lines (the host firewall's refused outbound, rate-limited at the source) since the previous run;
@@ -51,7 +51,7 @@ previous heartbeat. ssh_unexpected alerts once for any accepted publickey login 
 not in SSH_KNOWN_SOURCES; the message off-box carries the count, the log on the box the address.
 dhcp_lease, tor_circuits, btc_peers and calendar follow the two-run rule.
 
-Four rules from workflow three (2026-09-16, docs/contracts.md section 8):
+Four rules (docs/contracts.md, section 8):
 
 - Unknown is a state. A check whose source could not be read or gave no
   answer has the verdict None, never True: the status line and the
@@ -130,7 +130,7 @@ class OutboxUnreadable(Exception):
 def run_lock(wait=None):
     """An exclusive lock on WATCH_DIR for the whole run, across processes
     (flock on <WATCH_DIR>/.lock), so two runs never read and rewrite the
-    same outbox and state (2026-09-15/16 review F11). Waits up to LOCK_WAIT
+    same outbox and state. Waits up to LOCK_WAIT
     seconds for the holder, then raises Locked. The lock goes with the
     descriptor: a run that dies releases it."""
     wait = LOCK_WAIT if wait is None else wait
@@ -172,7 +172,7 @@ DEFAULTS = {
     "JOURNAL_ERRORS": "20", "SSH_FAILURES": "10",
     "RECEIPTS": HOME + "/gateway/receipts/anchor-receipts.jsonl", "ANCHOR_MAX_H": "36",
     "HEARTBEAT_HOUR": "8", "CONFIRM_RUNS": "2",
-    # 2026-09-07 egress session: refused-outbound burst, dhcp renewal, tor liveness, bitcoind peers
+    # Refused-outbound burst, dhcp renewal, tor liveness, bitcoind peers.
     "EGRESS_DROPS": "10", "DHCP_IFACE": "eth0", "DHCP_MIN_H": "6",
     "TOR_CONTAINER": "gateway-tor-1", "TOR_HB_MAX_H": "7", "TOR_WARN_MIN": "30",
     "BTC_P2P_PORT": "8333", "BTC_MIN_PEERS": "3",
@@ -372,11 +372,11 @@ def observe(cfg, now, cursors, want_updates=False):
     # exit, a timeout) is recorded in journal_failed and reads as no lines,
     # never as no events: evaluate turns the list into the journal_read
     # check, and real_run keeps the cursor at journal_since until every
-    # query succeeds (2026-09-15/16 review F09). The pattern searches are
-    # made here, over the window's lines, not by journalctl's -g: with -q
-    # that flag exits 1 when nothing matches, and a quiet window read as a
-    # failed query, so the cursor never moved and journal_read alarmed
-    # (2026-09-18 cold review R10; systemd v257 journalctl-show.c).
+    # query succeeds. The pattern searches are made here, over the
+    # window's lines, not by journalctl's -g: with -q that flag exits 1
+    # when nothing matches (systemd v257, journalctl-show.c), so a quiet
+    # window would read as a failed query, the cursor would never move
+    # and journal_read would alarm.
     o["journal_since"] = int(cursors.get("journal", now - 300))
     since = "@%d" % o["journal_since"]
     o["journal_failed"] = []
@@ -441,9 +441,9 @@ def observe(cfg, now, cursors, want_updates=False):
         else:
             # The newest confirmation, not the last line: a receipt
             # recovered from its marker is appended after later anchors'
-            # lines (C5), and the last line used to make a fresh anchor
-            # read as stale (2026-09-18 cold review R11). A confirmed_at
-            # that is not a finite number makes the file unparseable.
+            # lines (docs/contracts.md, C5), so the last line can make a
+            # fresh anchor read as stale. A confirmed_at that is not a
+            # finite number makes the file unparseable.
             try:
                 lines = [json.loads(l) for l in raw.decode("utf-8").splitlines() if l.strip()]
                 o["anchors"] = len(lines)
@@ -827,8 +827,7 @@ def load_outbox(cfg=None):
     queue. A file that cannot be read raises OutboxUnreadable: the run
     fails with nothing touched. Bytes that are not a list of messages are
     set aside for inspection as outbox.json.corrupt-<12 hex of their
-    sha256>, and the queue becomes one alert saying so (2026-09-15/16
-    review F10).
+    sha256>, and the queue becomes one alert saying so.
 
     The recovery is itself interruptible: the aside copy is written first
     (a name from the bytes, so a repeat writes the same file), and the
@@ -870,8 +869,8 @@ class StateUnreadable(Exception):
 
 def valid_messages(data):
     """A list of messages, each with the two fields delivery relies on,
-    and a cap notice with the count enqueue adds to (2026-09-18 cold
-    review R12: a `dropped` that was not a number crashed the fold)"""
+    and a cap notice with the count enqueue adds to: a `dropped` that is
+    not a number would crash the fold."""
     return isinstance(data, list) and all(
         isinstance(m, dict) and isinstance(m.get("text"), str) and isinstance(m.get("queued"), str)
         and (not m.get("cap") or _count(m.get("dropped"))) for m in data)
@@ -884,7 +883,7 @@ def _count(v):
 def _finite(v):
     """A number the run can do arithmetic on and convert: an int, or a
     float that is finite. JSON's 1e309 decodes to infinity, which passes
-    a type check and then fails int() (2026-09-18 cold review R12)."""
+    a type check and then fails int()."""
     if isinstance(v, bool):
         return False
     return isinstance(v, int) or (isinstance(v, float) and math.isfinite(v))
