@@ -140,21 +140,36 @@ class KnownBlocks:
     def update_from_proxy(self, proxy):
         """Update from an RPC proxy
 
-        Returns a list of new block heights, hashes
+        Returns a list of new block heights, hashes. All or nothing: the
+        remembered tip advances with the list this returns, and a read
+        that raises anywhere in the scan (the tip, a hash, the reorg
+        check) puts the known blocks back as they were before the call,
+        so the blocks it had seen are seen again, and returned, by the
+        next call. Before this the tip advanced header by header while
+        the list was local to the call: a raise after the last header
+        and before the return left the tip advanced and the blocks never
+        returned, and the caller's next pass, finding no new blocks,
+        called every waiting tree mature against a chain whose bodies it
+        had not read (2026-09-21 year-of-operation review, scenario 24).
         """
+        known = list(self.__blocks)
         r = []
-        while not self.__blocks or proxy.getbestblockhash() != self.__blocks[-1].hash:
-            self.__detect_reorgs(proxy)
+        try:
+            while not self.__blocks or proxy.getbestblockhash() != self.__blocks[-1].hash:
+                self.__detect_reorgs(proxy)
 
-            height = self.__blocks[-1].height + 1 if self.__blocks else proxy.getblockcount()
+                height = self.__blocks[-1].height + 1 if self.__blocks else proxy.getblockcount()
 
-            try:
-                hash = proxy.getblockhash(height)
-            except IndexError:
-                continue
+                try:
+                    hash = proxy.getblockhash(height)
+                except IndexError:
+                    continue
 
-            self.__blocks.append(KnownBlock(height, hash))
-            r.append(self.__blocks[-1])
+                self.__blocks.append(KnownBlock(height, hash))
+                r.append(self.__blocks[-1])
+        except BaseException:
+            self.__blocks[:] = known
+            raise
 
         return r
 
@@ -897,10 +912,17 @@ class Stamper:
         # block is still owed (2026-09-18 cold review R01: the header
         # cursor advanced before the bodies were read, so one failed fetch
         # consumed a reorg's notification, and the next pass saved the
-        # orphaned tree against the new chain's height). update_from_proxy
-        # appends from the fork point up, so a block still queued at or
-        # above the first new height was itself replaced: its replacement
-        # is among the new blocks, and it is dropped unread.
+        # orphaned tree against the new chain's height). The headers are
+        # seen as one discovery: update_from_proxy advances the cursor
+        # with the list it returns, and a read that raises inside it puts
+        # the cursor back, so nothing is ever seen without being queued
+        # here (2026-09-21 year-of-operation review, scenario 24: the
+        # cursor used to advance header by header, and a raise after the
+        # last header left it advanced with nothing returned, the same
+        # orphan saved by the next pass). update_from_proxy appends from
+        # the fork point up, so a block still queued at or above the first
+        # new height was itself replaced: its replacement is among the new
+        # blocks, and it is dropped unread.
         for (block_height, block_hash) in new_blocks:
             logging.info("New block %s at height %d" % (b2lx(block_hash), block_height))
         if new_blocks:

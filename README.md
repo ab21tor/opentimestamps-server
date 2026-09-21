@@ -1595,7 +1595,11 @@ Test modules live under `otsserver/tests/`:
   watcher's quiet journal window, the newest receipt rather than the
   last line, and infinite numbers in its state (`test_watch_observation.py`);
   and the Litecoin and Ethereum attestation payloads read as the library
-  reads them (`test_proof_corpus.py`).
+  reads them (`test_proof_corpus.py`). The 2026-09-21 year-of-operation
+  review's discovery boundary: a read that raises inside header discovery
+  puts the remembered tip back, so the next pass discovers the same
+  blocks again and reads them before anything is saved, and no orphan is
+  saved (`test_stamper_block_queue.py`).
   Every durability test injects failures at the write boundary or kills
   the process; none simulates a power cut.
 

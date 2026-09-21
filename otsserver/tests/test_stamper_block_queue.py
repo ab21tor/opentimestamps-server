@@ -34,6 +34,15 @@ block, the injection asserted to have fired; a real journal, database,
 checkpoint and receipts file; a restart as a fresh Stamper, running its
 real loop, on the same calendar directory. Not a power cut, not a live
 node.
+
+The same orphan from the other side of the handoff (2026-09-21
+year-of-operation review, scenario 24; Test_header_discovery_is_all_or_nothing):
+the remembered tip used to advance header by header while the list of
+new blocks was local to update_from_proxy, so a read that raised after
+the last header and before the return left the tip advanced and the
+blocks never queued, and the next pass, finding no new blocks, saved the
+same orphan. Now discovery advances the tip with the list it returns and
+puts it back when any read of the scan raises.
 """
 
 import contextlib
@@ -55,7 +64,7 @@ from opentimestamps.core.notary import PendingAttestation
 from opentimestamps.core.timestamp import Timestamp
 
 from otsserver.calendar import Calendar
-from otsserver.stamper import Stamper, TimestampTx, UnconfirmedTimestampTx, make_timestamp_from_block_tx, pending_markers
+from otsserver.stamper import KnownBlocks, Stamper, TimestampTx, UnconfirmedTimestampTx, make_timestamp_from_block_tx, pending_markers
 
 
 @contextlib.contextmanager
@@ -352,6 +361,113 @@ class Test_block_queue_with_a_doubled_chain(unittest.TestCase):
         self.assertEqual(s.unprocessed_blocks, [])
         s.calendar.add_commitment_timestamps.assert_called_once()
         self.assertEqual(s.txs_waiting_for_confirmation, {})
+
+
+class Test_header_discovery_is_all_or_nothing(unittest.TestCase):
+    """2026-09-21 year-of-operation review, scenario 24. The remembered
+    tip used to advance header by header while the list of new blocks was
+    local to update_from_proxy: a read that raised after the last header
+    and before the return (here the tip read that ends the scan, once 107
+    is appended) left the tip at 107 and the blocks never returned, and
+    the next pass, finding no new blocks, read no body, put no tree back
+    to pending, and saved the orphaned tree against the new chain's
+    height, receipted; the public library rejects that proof against the
+    replacement block. Now discovery advances the tip with the list it
+    returns and puts it back when a read raises, so the next pass
+    discovers the same blocks again and reads them before anything is
+    called mature.
+
+    Fault model: the review's probe: one OSError from the tip read once
+    the scan has appended 107, the injection asserted to have fired; the
+    real store, as above; then each read of the scan raising once on
+    KnownBlocks alone."""
+
+    def interrupted_scan(self, chain, s, fail):
+        """chain.getbestblockhash raising once, when the scan has appended
+        107 (the last replacement header) and asks the tip again to end.
+        Returns the list the injection appends to when it fires."""
+        original = chain.getbestblockhash
+        fired = []
+
+        def tip():
+            if fail and not fired and s.known_blocks.best_block_height() == 107:
+                fired.append(True)
+                raise OSError('injected RPC disconnect during header discovery')
+            return original()
+        chain.getbestblockhash = tip
+        return fired
+
+    def test_a_raise_inside_discovery_puts_the_tip_back_and_the_next_pass_reads_every_body(self):
+        with calendar_fixture() as (d, cal, rp):
+            msg, tree, s, chain = shallow_anchor_then_reorg(cal, rp)
+            fired = self.interrupted_scan(chain, s, True)
+            with mock.patch('otsserver.stamper.make_proxy', return_value=chain):
+                with self.assertRaises(OSError):
+                    do_bitcoin(s)
+                self.assertEqual(fired, [True], 'the injected disconnect fired')
+                # Nothing was seen without being queued: the tip is where it was.
+                self.assertEqual(s.known_blocks.best_block_height(), 102)
+                self.assertEqual(s.known_blocks.best_block_hash(), b'c' * 32)
+                self.assertEqual(s.unprocessed_blocks, [])
+                self.assertEqual(chain.reads, [], 'no body read')
+                self.assertEqual(s.txs_waiting_for_confirmation, {102: tree}, 'the tree is owned, not saved')
+                self.assertNotIn(msg, cal)
+                # The next pass: the same headers discovered again, the bodies read.
+                do_bitcoin(s)
+            self.assertEqual(s.known_blocks.best_block_height(), 107)
+            self.assertEqual(s.unprocessed_blocks, [])
+            self.assertEqual(len(chain.reads), 7, 'every replacement body read')
+            self.assertNotIn(msg, cal, 'no orphan proof')
+            self.assertIn(msg, s.pending_commitments, 'the commitment is back in pending')
+            self.assertEqual(s.txs_waiting_for_confirmation, {})
+            self.assertEqual(receipts(rp), [])
+            self.assertEqual(pending_markers(str(rp)), [])
+
+    def test_the_healthy_control_reads_the_replacement_bodies(self):
+        with calendar_fixture() as (d, cal, rp):
+            msg, tree, s, chain = shallow_anchor_then_reorg(cal, rp)
+            fired = self.interrupted_scan(chain, s, False)
+            with mock.patch('otsserver.stamper.make_proxy', return_value=chain):
+                do_bitcoin(s)
+                do_bitcoin(s)
+            self.assertEqual(fired, [])
+            self.assertEqual(len(chain.reads), 7)
+            self.assertNotIn(msg, cal)
+            self.assertIn(msg, s.pending_commitments)
+            self.assertEqual(receipts(rp), [])
+
+    def test_a_raise_at_any_read_of_the_scan_leaves_the_known_blocks_as_they_were(self):
+        """KnownBlocks alone, on the chain double, known to 102 and then a
+        two-block reorg grown to 105: the reorg check (the hash asked at
+        102), a hash read mid-scan (104) and the tip read that ends the
+        scan each raise once. After each the known blocks are the three
+        the scan started from, and the next call returns the whole
+        replacement chain, in order."""
+        for boundary, at in (('getblockhash', 102), ('getblockhash', 104), ('getbestblockhash', None)):
+            with self.subTest(boundary=boundary, at=at):
+                chain = Chain()
+                kb = KnownBlocks()
+                kb.update_from_proxy(chain)
+                chain.hashes.update({101: b'b' * 32, 102: b'c' * 32})
+                self.assertEqual([tuple(b) for b in kb.update_from_proxy(chain)], [(101, b'b' * 32), (102, b'c' * 32)])
+                for height in range(101, 106):
+                    chain.hashes[height] = block_hash(height)
+                original = getattr(chain, boundary)
+                fired = []
+
+                def read(*args, original=original, at=at):
+                    if not fired and ((at is None and kb.best_block_height() == 105) or (args and args[0] == at)):
+                        fired.append(True)
+                        raise OSError('injected')
+                    return original(*args)
+                setattr(chain, boundary, read)
+                with self.assertRaises(OSError):
+                    kb.update_from_proxy(chain)
+                self.assertEqual(fired, [True], 'the injection fired')
+                self.assertEqual((kb.best_block_height(), kb.best_block_hash()), (102, b'c' * 32), 'as they were')
+                new = kb.update_from_proxy(chain)
+                self.assertEqual([tuple(b) for b in new], [(h, block_hash(h)) for h in range(101, 106)])
+                self.assertEqual(kb.best_block_height(), 105)
 
 
 if __name__ == "__main__":
