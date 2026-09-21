@@ -9,7 +9,7 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""ops/selfstamp.py, workflow two: the state transitions of the self-stamp
+"""ops/selfstamp.py: the state transitions of the self-stamp
 (docs/contracts.md, "Workflow 2", tables S1-S9), each pinned beside its
 failure cases.
 
@@ -28,13 +28,12 @@ The legacy corpus under ops/tests/selfstamp/v2/ was written by the tool as
 it stood at 3961a1f (schema selfstamp/2): two chains, one witnessing the
 other. It is copied into a scratch directory before any test touches it.
 
-The 2026-09-16 gate review's nine assertions (a replaced delivery lost, a
-held proof of other bytes outranking a right one, a proof of other bytes
-exported, unreadable witness evidence read as success, unrelated legacy
-chains called a mismatch, paths in messages, a non-hex label accepted, a
+Nine failure modes (a replaced delivery lost, a held proof of other
+bytes outranking a right one, a proof of other bytes exported,
+unreadable witness evidence read as success, unrelated legacy chains
+called a mismatch, paths in messages, a non-hex label accepted, a
 predecessor with an unknown schema accepted, a quarantine acknowledged
-before it was durable) are kept here as permanent regressions, in this
-module's shape.
+before it was durable) are kept here as permanent regressions.
 """
 
 import contextlib
@@ -157,7 +156,7 @@ class Test_period_and_observation(SelfstampCase):
     def test_a_predecessor_that_is_not_a_manifest_refuses_the_run(self):
         """S3. The newest file in manifests/ is read by the one validator: a
         JSON object with the right field types but an unknown schema is not
-        a manifest, and nothing is chained to it (gate review, P4)."""
+        a manifest, and nothing is chained to it."""
         manifests = self.state / 'manifests'
         manifests.mkdir(parents=True)
         (manifests / '2026-09-01.json').write_text(json.dumps({'schema': 'not-a-manifest', 'seq': 41, 'period': '2026-09-01'}))
@@ -393,7 +392,7 @@ class Test_amnesia(SelfstampCase):
     def test_operational_messages_name_no_path(self):
         """S1, S6, S9. A missing or unreadable inbox, a held lock, an empty or
         missing directory at verify: each is said without the path, which
-        could name a client (gate review, P4)."""
+        could name a client."""
         cfg = dict(self.cfg, state_dir=str(self.marked / 'state'), inbox=str(self.marked / 'no-inbox'), outbox=None)
         log = []
         self.assertEqual(selfstamp.run(cfg, period=P1, log=log.append), 1, log)
@@ -426,7 +425,7 @@ class Test_amnesia(SelfstampCase):
         """S3, S6, S9. A `chain` that is not 32 hex digits is not a label: the
         validator refuses it, the inbox quarantines it, a chain does not
         continue from it, and verify calls it a break, none of them
-        repeating it (gate review, P4)."""
+        repeating it."""
         bad = json.dumps({'schema': 'selfstamp/3', 'chain': self.MARK, 'seq': 1, 'period': '2026-09-01'}).encode()
         with self.assertRaises(ValueError):
             selfstamp._parse_manifest(bad)
@@ -545,8 +544,7 @@ class Test_proof_states(SelfstampCase):
     def test_a_proof_not_of_its_manifest_is_never_exported(self):
         """S8. The outbox publishes a companion only when it is a proof of the
         manifest's bytes with a Bitcoin attestation: attestation presence
-        alone let a proof of other bytes travel as this manifest's (gate
-        review, P2)."""
+        alone would let a proof of other bytes travel as this manifest's."""
         outbox = self.root / 'outbox'
         self.cfg['outbox'] = str(outbox)
         self.assertEqual(self.run_tool(P1), 0, self.log)
@@ -776,7 +774,7 @@ class Test_inbox_faults(WitnessCase):
         """The deliverer follows the convention and renames a second file
         over the first one's name while the run is copying the first: the
         second is not removed under it; it waits for the next run, which
-        witnesses it too (gate review, P1)."""
+        witnesses it too."""
         first = self.foreign_manifest(created='2026-09-02T00:30:00Z')
         second = self.foreign_manifest(created='2026-09-02T00:31:00Z')
         delivery = self.inbox / 'other-2026-09-01.json'
@@ -827,7 +825,7 @@ class Test_inbox_faults(WitnessCase):
     def test_a_held_foreign_proof_of_other_bytes_never_outranks_a_proof_of_the_copy(self):
         """What is held counts only if it is a proof of the copy: a held file
         with a Bitcoin attestation for other bytes is set aside, and the
-        arriving pending proof of the copy is kept (gate review, P2)."""
+        arriving pending proof of the copy is kept."""
         raw = self.foreign_manifest()
         digest = hashlib.sha256(raw).digest()
         (self.inbox / 'other-2026-09-01.json').write_bytes(raw)
@@ -856,7 +854,7 @@ class Test_inbox_faults(WitnessCase):
         rejected/, then rejected/ and the inbox fsynced, and only then is the
         rejection logged; a new rejected/ has its parent entry fsynced before
         anything is moved into it. Fault model: none; the syscalls are
-        recorded in order (gate review, P5). This shows the barriers are
+        recorded in order. This shows the barriers are
         there, not what a power cut would do."""
         events = []
         real_fsync, real_replace = os.fsync, os.replace
@@ -1209,7 +1207,7 @@ class Test_verify_states(WitnessCase):
     def test_unreadable_witness_evidence_is_incomplete_not_a_success(self):
         """A witness manifest that cannot be read or is not a manifest is
         named, the rest is still checked, the result is not success, and the
-        last line says the check was incomplete (gate review, P3)."""
+        last line says the check was incomplete."""
         self.assertEqual(self.run_tool(P1), 0, self.log)
         mine = self.state / 'manifests'
         raw = (mine / '2026-09-01.json').read_bytes()
@@ -1315,7 +1313,7 @@ class Test_legacy_compatibility(WitnessCase):
         seq and period and, at a witness, nothing else: a cross-check of one
         against evidence about the other says AMBIGUOUS, not MISMATCH, and
         is not a break; a labelled chain in the same position is a mismatch,
-        because a label names one chain (gate review, P3)."""
+        because a label names one chain."""
         def legacy(host):
             return (json.dumps({'schema': 'selfstamp/2', 'host': host, 'seq': 1, 'period': '2026-09-01', 'prev': None,
                                 'commissioning': {}, 'witnessed': []}, sort_keys=True, indent=2) + '\n').encode()

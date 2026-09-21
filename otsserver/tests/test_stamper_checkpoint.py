@@ -118,7 +118,7 @@ class Test_checkpoint_written(unittest.TestCase):
 
     def test_without_a_generation_no_checkpoint_is_written(self):
         """An index alone is the form before generations, which the next
-        start refuses (2026-09-17 workflow four): it is never written. A
+        start refuses: it is never written. A
         real calendar always has a generation; this one is a double."""
         stamper = self.make_checkpoint_stamper()
         stamper.calendar.generation = None
@@ -196,10 +196,10 @@ class Test_checkpoint_honoured_on_restart(unittest.TestCase):
 
 
 class Test_checkpoint_the_stamper_cannot_read(unittest.TestCase):
-    """2026-09-15 review, P2 "malformed or unreadable checkpoint kills only
-    the stamper": a start the stamper cannot complete now stops the whole
-    service (CRITICAL log, exit_event set for the launcher), never a dead
-    thread behind a live listener and never an unhandled exception."""
+    """A malformed or unreadable checkpoint must not kill only the stamper:
+    a start the stamper cannot complete stops the whole service (CRITICAL
+    log, exit_event set for the launcher), never a dead thread behind a
+    live listener and never an unhandled exception."""
 
     def start(self, path):
         event = threading.Event()

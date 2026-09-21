@@ -9,20 +9,21 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""Observed is not processed (2026-09-18 cold review R01; C4).
+"""Observed is not processed (C4).
 
-KnownBlocks records the headers the stamper has seen. Before this change
-__do_bitcoin took the list of new blocks as processed the moment it was
-returned and read the bodies afterwards. One body fetch that raised (a
-transient RPC error, which the loop logs and survives) left every block
-after it unread, and among them the block that had replaced a shallow
-anchor's: the tree waiting at that height was never put back to pending,
-and the next pass, seeing no new headers, saved it as mature against the
-new chain's height. The proof named a block the chain no longer held, the
-receipt was written, and nothing was owed any more; the public library
-rejects such a proof against the replacement block.
+KnownBlocks records the headers the stamper has seen. Were __do_bitcoin
+to take the list of new blocks as processed the moment it is returned
+and read the bodies afterwards, one body fetch that raises (a transient
+RPC error, which the loop logs and survives) would leave every block
+after it unread, and among them the block that replaced a shallow
+anchor's: the tree waiting at that height would never be put back to
+pending, and the next pass, seeing no new headers, would save it as
+mature against the new chain's height. The proof would name a block the
+chain no longer holds, the receipt would be written, and nothing owed
+any more; the public library rejects such a proof against the
+replacement block.
 
-Now the blocks whose bodies have not been read are a queue the stamper
+The blocks whose bodies have not been read are a queue the stamper
 owns (unprocessed_blocks). A fetch that raises leaves the block, and every
 block after it, for the next pass; no tree is saved while a block is owed;
 a queued block the chain has since replaced is dropped, its replacement
@@ -35,14 +36,14 @@ checkpoint and receipts file; a restart as a fresh Stamper, running its
 real loop, on the same calendar directory. Not a power cut, not a live
 node.
 
-The same orphan from the other side of the handoff (2026-09-21
-year-of-operation review, scenario 24; Test_header_discovery_is_all_or_nothing):
-the remembered tip used to advance header by header while the list of
-new blocks was local to update_from_proxy, so a read that raised after
-the last header and before the return left the tip advanced and the
-blocks never queued, and the next pass, finding no new blocks, saved the
-same orphan. Now discovery advances the tip with the list it returns and
-puts it back when any read of the scan raises.
+The same orphan from the other side of the handoff
+(Test_header_discovery_is_all_or_nothing): a remembered tip that
+advanced header by header while the list of new blocks was local to
+update_from_proxy would let a read that raises after the last header and
+before the return leave the tip advanced and the blocks never queued,
+and the next pass, finding no new blocks, would save the same orphan.
+Discovery advances the tip with the list it returns and puts it back
+when any read of the scan raises.
 """
 
 import contextlib
@@ -364,23 +365,22 @@ class Test_block_queue_with_a_doubled_chain(unittest.TestCase):
 
 
 class Test_header_discovery_is_all_or_nothing(unittest.TestCase):
-    """2026-09-21 year-of-operation review, scenario 24. The remembered
-    tip used to advance header by header while the list of new blocks was
-    local to update_from_proxy: a read that raised after the last header
-    and before the return (here the tip read that ends the scan, once 107
-    is appended) left the tip at 107 and the blocks never returned, and
-    the next pass, finding no new blocks, read no body, put no tree back
-    to pending, and saved the orphaned tree against the new chain's
-    height, receipted; the public library rejects that proof against the
-    replacement block. Now discovery advances the tip with the list it
-    returns and puts it back when a read raises, so the next pass
-    discovers the same blocks again and reads them before anything is
-    called mature.
+    """A remembered tip that advanced header by header while the list of
+    new blocks was local to update_from_proxy would let a read that
+    raises after the last header and before the return (here the tip read
+    that ends the scan, once 107 is appended) leave the tip at 107 and
+    the blocks never returned, and the next pass, finding no new blocks,
+    would read no body, put no tree back to pending, and save the
+    orphaned tree against the new chain's height, receipted; the public
+    library rejects that proof against the replacement block. Discovery
+    advances the tip with the list it returns and puts it back when a
+    read raises, so the next pass discovers the same blocks again and
+    reads them before anything is called mature.
 
-    Fault model: the review's probe: one OSError from the tip read once
-    the scan has appended 107, the injection asserted to have fired; the
-    real store, as above; then each read of the scan raising once on
-    KnownBlocks alone."""
+    Fault model: one OSError from the tip read once the scan has
+    appended 107, the injection asserted to have fired; the real store,
+    as above; then each read of the scan raising once on KnownBlocks
+    alone."""
 
     def interrupted_scan(self, chain, s, fail):
         """chain.getbestblockhash raising once, when the scan has appended

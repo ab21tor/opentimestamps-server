@@ -9,13 +9,13 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""The anchor-receipt pending marker (full-review J1, ruled 2026-09-08).
+"""The anchor-receipt pending marker.
 
-Before this change the receipt line was appended BEFORE the calendar save,
-so a crash between the two re-anchored the same commitments under a new
-txid and billed the records twice (the billing red-team's b1 W2 window).
-Now the stamper writes a marker beside the receipts file — the receipt
-plus one commitment to probe — before the save, appends the receipt after
+A receipt line appended BEFORE the calendar save would let a crash
+between the two re-anchor the same commitments under a new txid and bill
+the records twice. The stamper writes a marker beside the receipts file —
+the receipt plus the anchor's own key to probe — before the save, appends
+the receipt after
 it, and removes the marker. A leftover marker is settled at the next
 start (and before any new marker): probe in the calendar → the receipt
 is appended if its txid is not already on file; probe absent → the save
@@ -209,7 +209,7 @@ class Test_receipt_marker(unittest.TestCase):
         self.assertEqual(self.markers(), [])
 
     def test_a_marker_whose_discard_failed_is_never_satisfied_by_a_later_anchor(self):
-        """2026-09-18 gate review, G1. A's save never happened, and the
+        """A's save never happened, and the
         discard of its marker failed (the unlink refused). The same
         commitments went out again in B, which saved. A is still not owed:
         the calendar is asked about A's own txid node, which B's tree does
@@ -269,9 +269,9 @@ class Test_receipt_marker(unittest.TestCase):
 
 
 class Test_receipt_durability(unittest.TestCase):
-    """2026-09-15 review, P2 "successful file calls do not imply complete
-    records": a short os.write was taken for a whole receipt and the marker
-    removed. Now the append is a checked write-all loop, the file and its
+    """A successful file call does not imply a complete record: a short
+    os.write taken for a whole receipt would remove the marker with the
+    receipt unwritten. The append is a checked write-all loop, the file and its
     directory are fsynced, the marker goes only after that, and an
     incomplete tail left by an interrupted append is dropped before the
     next append with its receipt recovered from the marker: no completed
@@ -401,11 +401,11 @@ class Test_receipt_durability(unittest.TestCase):
 
 
 class Test_marker_per_anchor(unittest.TestCase):
-    """2026-09-15/16 review F08: one marker per anchor. Before this change
-    there was one marker name; when settling an earlier anchor's marker
-    failed (its receipt append raised), the later anchor went on, wrote its
-    own receipt, and unlinked "the" marker: the earlier anchor's, whose
-    receipt had never been written. Now a marker is named by its txid,
+    """One marker per anchor. With one marker name, when settling an
+    earlier anchor's marker fails (its receipt append raises), the later
+    anchor goes on, writes its own receipt, and unlinks "the" marker: the
+    earlier anchor's, whose receipt was never written. A marker is named
+    by its txid,
     settling is one marker at a time and a failure leaves that marker
     standing, and an anchor unlinks only its own. Exception injection at
     the write boundary; not a power cut."""
@@ -483,7 +483,7 @@ class Test_marker_per_anchor(unittest.TestCase):
     def test_a_marker_from_before_per_anchor_names_is_settled(self):
         """Control for the upgrade: the single-name marker a calendar
         running the previous code may leave behind is read and settled. Its
-        `probe` is a commitment, as every marker's was before 2026-09-18:
+        `probe` is a commitment, as every marker's was in earlier releases:
         the reader asks about the txid in the receipt, not the field."""
         tx = self.anchor(1, 0x10, 1)
         txid = b2lx(tx.tx.GetTxid())
@@ -501,11 +501,11 @@ class Test_marker_per_anchor(unittest.TestCase):
 
 
 class Test_marker_before_save(unittest.TestCase):
-    """C5 (2026-09-18 cold review R06): a marker that cannot be written is
-    a save that does not happen. Before this change the failure was logged
-    and the save went on; when the receipt append then failed too, the
-    tree was retired with no marker and no receipt, and the message said
-    the marker kept a receipt no marker held. Now the error reaches
+    """C5: a marker that cannot be written is a save that does not happen.
+    Were the failure logged and the save to go on, a receipt append then
+    failing too would retire the tree with no marker and no receipt, and
+    the message would say the marker kept a receipt no marker held. The
+    error reaches
     __save_mature_trees, the tree is kept and retried every pass, and a
     receipts directory that cannot be written delays publication (the
     trade-off C5 states) rather than retiring a receipt nothing durable

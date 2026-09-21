@@ -9,21 +9,20 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""The aggregator must not die silently (D7, 2026-09-08 review).
+"""The aggregator must not die silently.
 
-Pre-fix, one exception in Aggregator.__loop — a journal fsync failing on a
-full disk was the reproduction — killed the aggregator thread while the
-HTTP server kept accepting digests: every later submit() waited on a
+One exception in Aggregator.__loop (a journal fsync failing on a full
+disk, for one) would otherwise kill the aggregator thread while the HTTP
+server kept accepting digests: every later submit() waiting on a
 done_event nobody would ever set, each RPC thread pinned forever, and the
-homepage still rendered "Best-block", so the gateway's /health said the
-calendar was fine. Now a failed round is logged and exit_event is set so
-the process leaves (the container restarts it), submit() waits at most
+status still showing a best block, so the gateway's /health would say the
+calendar was fine. A failed round is logged and exit_event is set so the
+process leaves (the container restarts it), submit() waits at most
 SUBMIT_TIMEOUT seconds and raises AggregatorUnavailable, and /digest
 answers 503 instead of hanging.
 
-2026-09-15 (independent review, P1 "aggregator failure stops workers but
-leaves the serving process alive"): the exit event was set but nothing
-consumed it while the listener kept serving. The launcher now runs
+An exit event that nothing consumed while the listener kept serving would
+stop the workers and leave the serving process alive. The launcher runs
 otsserver.rpc.serve_until_exit, which shuts the HTTP server down, joins
 the workers and returns nonzero the moment a worker sets the event; otsd
 exits 1 and the supervisor restarts the service. The process boundary

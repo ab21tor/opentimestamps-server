@@ -136,8 +136,8 @@ class Test_what_older_tools_do_with_newer_state(unittest.TestCase):
         """The label is drawn once. The current tool, back on such a chain,
         finds its newest manifest unlabelled and an earlier one labelled:
         it refuses, writes nothing, and says what the operator does.
-        (Before workflow four it took the unlabelled predecessor for a
-        chain from before selfstamp/3 and drew a second label.)"""
+        (Taking the unlabelled predecessor for a chain from before
+        selfstamp/3 would draw a second label.)"""
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             cfg = self.continued_by_the_older_writer(root)
@@ -374,8 +374,8 @@ class Test_a_restored_watcher(unittest.TestCase):
                          'the status, the record, the outbox, the record again: each a replace with two fsyncs')
 
     def test_a_state_read_after_its_outbox_loses_the_alert_unseen(self):
-        """The limit the gate review named (2026-09-18, G5), pinned as it
-        is. A sequential copy reads the outbox before a transition and the
+        """A limit of the backup, pinned as it is. A sequential copy reads
+        the outbox before a transition and the
         state after it, once `owed` has been cleared: the state says the
         alarm was recorded, the outbox holds nothing. The restored run
         sends nothing, exits 0, and nothing in either file can show what

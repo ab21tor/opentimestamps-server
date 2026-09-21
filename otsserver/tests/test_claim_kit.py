@@ -9,7 +9,7 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""The claim kit (green review 2026-09-11, item 8): ops/verify_claim.py and
+"""The claim kit: ops/verify_claim.py and
 ops/export_headers.py, loaded by path like the other ops tools.
 
 Real data: two anchored proofs from the reference deployment -- the first
@@ -28,15 +28,15 @@ is then tampered with in every way the verifier must catch.
 
 Fails on the pre-change code: neither tool exists.
 
-2026-09-15 (independent review, P1 "fabricated evidence receives a valid
-verdict" and P2 "impossible targets accepted"): the chain is checked whole,
+Fabricated evidence must not receive a valid verdict and impossible
+targets must not be accepted: the chain is checked whole,
 Bitcoin Core's target rules are enforced, easy-difficulty chains need
 --network regtest by name, and a file tied to neither genesis nor a stated
-checkpoint is INCOMPLETE (exit 2), never HOLDS. The hostile kit the review
-built (a genuine later checkpoint over an unmined, substituted block-1
-header) is the regression Test_hostile_kits keeps.
+checkpoint is INCOMPLETE (exit 2), never HOLDS. The hostile kit (a
+genuine later checkpoint over an unmined, substituted block-1 header) is
+the regression Test_hostile_kits keeps.
 
-Carried from the same review (fixed in this session): a checkpoint pins
+A checkpoint pins
 only the headers at or below it — headers above it are chained forward
 only, and a chain that follows the rules is not thereby Bitcoin's chain.
 So the stated checkpoint must be at or after the attested block, and a
@@ -414,7 +414,7 @@ class Test_headers_chain(unittest.TestCase):
             (0x1d80ffff, 'negative target'),          # sign bit set, mantissa nonzero
             (0x1d000000, 'zero target'),              # mantissa zero
             (0x00800000, 'zero target'),              # sign bit with a zero mantissa is zero, not negative (Core)
-            (0x2200ffff, 'target overflow'),          # the review's header: > 256 bits
+            (0x2200ffff, 'target overflow'),          # > 256 bits
             (0x2301ffff, 'target overflow'),
             (0x1e00ffff, 'above the mainnet powLimit'),
         )
@@ -516,7 +516,7 @@ class Test_worked_example(unittest.TestCase):
         self.assertIn('VERDICT: HOLDS', out)
         self.assertIn('block %d is below the checkpoint' % k['anchor_height'], out)
         self.assertIn('not-before bound: block %d' % k['not_before'], out)
-        # The review's attack: substitute the anchor header for one that
+        # The attack: substitute the anchor header for one that
         # carries the exhibit's root without mining it, and hand over a
         # genuine later checkpoint. Every header is checked, so it FAILS.
         offset = (k['anchor_height'] - k['checkpoint']) * 80 + 36
@@ -728,8 +728,8 @@ class Test_export_headers(unittest.TestCase):
         self.assertIn('refused', log)
 
     def test_short_writes_are_completed(self):
-        # 2026-09-15 review, P2: os.write's count was ignored, so 81 bytes
-        # of a batch were reported as the whole batch. Every byte now lands.
+        # os.write's count must not be ignored: 81 bytes of a batch must not
+        # be reported as the whole batch. Every byte lands.
         real = os.write
         with mock.patch.object(export_headers.os, 'write', side_effect=lambda fd, data: real(fd, data[:81])):
             code, log = self.export()
@@ -900,10 +900,10 @@ class Test_incompatible_forks(unittest.TestCase):
 
 
 class Test_hostile_kits(unittest.TestCase):
-    """The kit the 2026-09-15 review built: a new exhibit, its digest
-    substituted into the genuine block-1 header without mining it, and
-    genuine mainnet block 5 handed over as the checkpoint. Before the fix
-    only block 5 was checked and the exhibit "existed" in 2009."""
+    """A hostile kit: a new exhibit, its digest substituted into the
+    genuine block-1 header without mining it, and genuine mainnet block 5
+    handed over as the checkpoint. Were only block 5 checked, the exhibit
+    would have "existed" in 2009."""
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()

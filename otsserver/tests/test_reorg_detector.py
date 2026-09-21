@@ -9,7 +9,7 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""Deep-reorg detector (green review 2026-09-11, item 12).
+"""Deep-reorg detector.
 
 A receipted anchor had min_confirmations when its receipt was written, and
 the calendar saved proofs naming that block. A reorg deeper than that
@@ -24,8 +24,7 @@ line (test_rpc_status) and the watcher (test_watch) -- is logged at ERROR
 on every check while it stands, and is never acted on: nothing is
 re-anchored automatically.
 
-FakeChain is the reorg contract of the billing red-team's fake bitcoind
-(audit/billing-redteam-20260904/harness/fakenode.py, 2026-09-04):
+FakeChain is the reorg contract of a fake bitcoind:
 gettransaction reports confirmations as tip - height + 1 for a mined
 wallet transaction and 0 once x_invalidate has dropped its block and put
 it back in the mempool; a txid the wallet never saw is RPC error -5. The

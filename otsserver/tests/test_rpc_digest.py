@@ -22,11 +22,11 @@ the aggregator.
 The test fails on the pre-fix code: the handler read the 4 KiB body,
 submitted it, and answered from whatever the aggregator returned.
 
-Test_post_digest_body_length (2026-09-18 cold review R17): the handler
-checked the declared Content-Length and not the bytes it read, so a peer
-that closed after one byte of a declared 32 had that one byte aggregated
-and acknowledged as a digest. Now a body shorter than declared is a 400
-with nothing submitted, on a socketless handler and over a real TCP
+Test_post_digest_body_length: a handler that checked the declared
+Content-Length and not the bytes it read would let a peer that closed
+after one byte of a declared 32 have that one byte aggregated and
+acknowledged as a digest. A body shorter than declared is a 400 with
+nothing submitted, on a socketless handler and over a real TCP
 connection half-closed by the peer.
 """
 
@@ -103,7 +103,7 @@ class Test_post_digest_content_length_parse(unittest.TestCase):
 
 
 class Test_post_digest_body_length(unittest.TestCase):
-    """2026-09-18 cold review R17: the bytes read, not the length declared,
+    """The bytes read, not the length declared,
     are the digest. Fault model: a body shorter than its Content-Length,
     on the socketless handler and from a real peer that half-closes."""
 

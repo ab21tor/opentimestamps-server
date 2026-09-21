@@ -9,14 +9,14 @@
 # modified, propagated, or distributed except according to the terms contained
 # in the LICENSE file.
 
-"""A mature tree stays until its save is durable (2026-09-15 review, P1
-"confirmation is removed from memory before storage succeeds").
+"""A mature tree stays until its save is durable: confirmation is never
+removed from memory before storage succeeds.
 
-Before this change __do_bitcoin popped the tree that had reached
-min_confirmations and then saved it; a save that raised (a storage error)
-was logged by the loop and the tree was gone from every queue, its
-journal entries already behind the scan cursor, so the next block never
-retried it. Now a tree leaves txs_waiting_for_confirmation only after its
+Were __do_bitcoin to pop the tree that reached min_confirmations and then
+save it, a save that raised (a storage error) would be logged by the loop
+with the tree gone from every queue, its journal entries already behind
+the scan cursor, so the next block would never retry it. A tree leaves
+txs_waiting_for_confirmation only after its
 save has returned (LevelDB's synchronous write), a failed save is logged
 once and the tree kept, and every pass, with or without a new block,
 retries every mature unsaved tree until it lands. The checkpoint the save
@@ -107,7 +107,7 @@ class Test_mature_tree_saves(unittest.TestCase):
                 fd.write(b'\x01' * 32)
             # The journal the checkpoint will describe: entries 0-2 are the
             # anchored commitment (a resubmission keeps its lowest index),
-            # entry 3 the outstanding one. Since 2026-09-16 a restart checks
+            # entry 3 the outstanding one. A restart checks
             # the journal against the checkpoint (test_calendar,
             # Test_journal_boundary), so the file must exist and agree.
             with open(os.path.join(d, 'journal'), 'wb') as fd:

@@ -556,8 +556,8 @@ def iso_mtime(path):
 
 
 class Test_commissioning(SelfstampCase):
-    """Item 13 of the 2026-09-11 green review, as selfstamp/3 keeps it: the
-    genesis manifest is the commissioning record. It carries what every
+    """The genesis manifest is the commissioning record, as selfstamp/3
+    keeps it. It carries what every
     manifest carries — the chain label, the fork's commit, the fingerprint
     of the configuration the run used — and its created_at is the box's
     own clock; the proven bound is its proof's block. A selfstamp/2
@@ -899,9 +899,9 @@ with m.state_lock(sys.argv[2], 0):
 
 
 class Test_state_lock(SelfstampCase):
-    """2026-09-15 review, P2 "concurrent self-stamp runs can leave an
-    irrecoverably mismatched proof": run and upgrade hold an exclusive lock
-    on the state directory for their whole duration, across processes."""
+    """Concurrent self-stamp runs must not leave an irrecoverably
+    mismatched proof: run and upgrade hold an exclusive lock on the state
+    directory for their whole duration, across processes."""
 
     def test_two_overlapping_runs_in_one_process_leave_one_manifest_with_its_own_proof(self):
         # Two runs for the same period, with different clocks (so their
@@ -986,7 +986,7 @@ class Test_state_lock(SelfstampCase):
 
 
 class Test_witnessed_copies(unittest.TestCase):
-    """2026-09-15 review: a vouch whose copy is absent (the file or the whole
+    """A vouch whose copy is absent (the file or the whole
     directory) is a break, unless the partial check is asked for by name;
     a proof delivered later for a manifest already witnessed is stored."""
 
@@ -1096,13 +1096,12 @@ class Test_witness_delivery(Test_witness):
 
 
 class Test_malformed_foreign_proof(SelfstampCase):
-    """2026-09-15/16 review F14: a foreign proof companion whose pending URI
-    held an invalid UTF-8 byte raised UnicodeDecodeError out of parse_ots,
-    past the OtsError handling, before the host's own manifest was
-    written; the same inbox pair stopped every later run. The reader now
-    raises only OtsError, so the companion is rejected into
-    <inbox>/rejected/ (kept, not deleted: workflow two), the manifest
-    witnessed, and the heartbeat written."""
+    """A foreign proof companion whose pending URI holds an invalid UTF-8
+    byte must not raise UnicodeDecodeError out of parse_ots, past the
+    OtsError handling, before the host's own manifest is written, with the
+    same inbox pair stopping every later run. The reader raises only
+    OtsError, so the companion is rejected into <inbox>/rejected/ (kept,
+    not deleted), the manifest witnessed, and the heartbeat written."""
 
     def test_a_malformed_foreign_proof_is_rejected_and_the_heartbeat_goes_on(self):
         inbox = self.root / 'inbox'
