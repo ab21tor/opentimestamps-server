@@ -425,8 +425,12 @@ def listunspent(proxy, minconf=0, maxconf=999999):
 
 def find_unspent(proxy):
     def sort_filter_unspent(unspent):
-        return list(reversed(sorted(filter(lambda x: x['amount'] > DUST and x['spendable'], unspent),
-                      key=lambda x: x['amount'])))
+        # Ascending, so that the caller's unspent[-1] is the biggest
+        # output here as it is in the unconfirmed branch below: a remnant
+        # too small to pay any fee must never be chosen while a larger
+        # output can pay it.
+        return sorted(filter(lambda x: x['amount'] > DUST and x['spendable'], unspent),
+                      key=lambda x: x['amount'])
 
     unspent = sort_filter_unspent(listunspent(proxy, 1))
 
@@ -502,6 +506,15 @@ class Stamper:
     # mature tree's save fails (the tree is kept and retried every pass),
     # one INFO when saves land again.
     save_failed_warned = False
+
+    # The anchor the node last refused whose fee could not rise: the
+    # chosen output, its whole value as the fee, and the chain tip it was
+    # tried against. Not sent again while those three stand (__do_bitcoin).
+    # Warn-once flag beside it: one ERROR at the first refusal, one INFO
+    # when an anchor is accepted again. Class-level defaults for the same
+    # test-double reason.
+    refused_anchor = None
+    anchor_refused_warned = False
 
     # Set to the reason when the stamper stopped the service (a startup it
     # cannot complete); None while it runs. otsd reads it at exit.
@@ -1147,6 +1160,13 @@ class Stamper:
                     self.fee_capped_warned = True
                 return
 
+            # The node refused this attempt already (that output, that
+            # fee, against this chain tip) and nothing has changed: it is
+            # not sent again. A refill changes the output, a block the tip.
+            attempt = (unsigned_tx.vin[0].prevout, fee, self.known_blocks.best_block_hash())
+            if attempt == self.refused_anchor:
+                return
+
             r = proxy.signrawtransactionwithwallet(unsigned_tx)
             if not r['complete']:
                 logging.error("Failed to sign transaction! r = %r" % r)
@@ -1158,6 +1178,18 @@ class Stamper:
             except bitcoin.rpc.JSONRPCError as err:
                 if err.error['code'] == -26:
                     logging.debug("Err: %r" % err.error)
+                    if len(unsigned_tx.vout) == 1:
+                        # No change output: the input's whole value is the
+                        # fee already, so a higher feerate builds the same
+                        # transaction and earns the same refusal. Remember
+                        # the attempt and wait for something to change.
+                        self.refused_anchor = attempt
+                        if not self.anchor_refused_warned:
+                            logging.error("Anchor refused by the node (%s) and its fee cannot rise: the chosen output "
+                                          "holds %d sats and all of it is the fee; anchoring waits for a spendable "
+                                          "output that can pay the fee" % (err.error.get('message'), fee))
+                            self.anchor_refused_warned = True
+                        return
                     # Insufficient priority - basically means we didn't
                     # pay enough, so try again with a higher feerate
                     bump_feerate *= 1.25
@@ -1171,6 +1203,10 @@ class Stamper:
         if self.fee_capped_warned:
             self.fee_capped_warned = False
             logging.info("Fee back under the cap; anchoring resumes")
+        if self.refused_anchor is not None:
+            self.refused_anchor = None
+            self.anchor_refused_warned = False
+            logging.info("Anchor accepted by the node again; anchoring resumes")
 
         if self.unconfirmed_txs:
             logging.info("Sent timestamp tx %s, replacing %s; %d total commitments; %d prior tx versions" %
@@ -1400,6 +1436,9 @@ class Stamper:
         self.next_anchor_check = 0
         self.anchor_findings = {}
         self.needs_attention = []
+
+        # The anchor the node refused whose fee cannot rise (__do_bitcoin).
+        self.refused_anchor = None
 
         self.thread = threading.Thread(target=self.__loop)
         self.thread.start()

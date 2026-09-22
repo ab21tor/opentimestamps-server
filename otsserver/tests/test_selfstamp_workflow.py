@@ -39,6 +39,7 @@ module's shape.
 
 import contextlib
 import datetime
+import errno
 import functools
 import hashlib
 import io
@@ -49,6 +50,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -1377,6 +1379,162 @@ class Test_observation_failures(SelfstampCase):
         self.assertNotIn('low', f)
         self.assertNotIn('balance_sats', f)
         self.assertIn('error', f)
+
+
+class Test_barriers_repeated(unittest.TestCase):
+    """S5, S6. A file found visible is not known durable: the run that
+    renamed it into place may have failed at the directory fsync after
+    the rename, and nothing on disk says which. The upgrade pass repeats
+    a complete proof's barrier before it calls the proof complete, and
+    the inbox repeats a held copy's (or held foreign proof's) barrier
+    before the claim that delivered it goes. Fault model: EIO injected at
+    the destination directory's fsync on the runs named, the real fsync
+    everywhere else, real files throughout."""
+
+    PENDING_URI = b'http://127.0.0.1:14788'
+
+    def pending_proof(self, raw):
+        uri = self.PENDING_URI
+        attestation = (b'\0' + selfstamp.PENDING_TAG + selfstamp.varuint(len(uri) + 1)
+                       + selfstamp.varuint(len(uri)) + uri)
+        return selfstamp.build_ots(hashlib.sha256(raw).digest(), attestation)
+
+    def upgrade_runs(self, inject_at):
+        """Three upgrade passes over one pending proof the calendar answers
+        with a Bitcoin attestation; the manifests directory's fsync raises
+        EIO on the runs in inject_at. Returns (exits, events, logs)."""
+        with tempfile.TemporaryDirectory() as td:
+            manifests = pathlib.Path(td) / 'manifests'
+            manifests.mkdir()
+            raw = b'{}'
+            manifest = manifests / '2026-09-01.json'
+            manifest.write_bytes(raw)
+            proof = selfstamp.proof_path(manifest)
+            proof.write_bytes(self.pending_proof(raw))
+            response = b'\0' + selfstamp.BITCOIN_TAG + b'\x01\x01'
+            real = selfstamp._fsync_dir
+            events, run = [], [0]
+
+            def barrier(path):
+                events.append((run[0], pathlib.Path(path).name))
+                if run[0] in inject_at and pathlib.Path(path) == manifests:
+                    raise OSError(errno.EIO, 'injected directory fsync failure')
+                return real(path)
+            cfg = {'state_dir': td, 'calendar_url': 'http://127.0.0.1:14788'}
+            exits, logs = [], []
+            with mock.patch.object(selfstamp, 'fetch_timestamp', return_value=response), \
+                    mock.patch.object(selfstamp, '_fsync_dir', side_effect=barrier):
+                for n in (1, 2, 3):
+                    run[0] = n
+                    lines = []
+                    exits.append(selfstamp.upgrade(cfg, log=lines.append))
+                    logs.append(lines)
+            self.assertEqual(selfstamp.parse_ots(proof.read_bytes()).attestation[0], 'bitcoin')
+            self.assertFalse(any(td in line for lines in logs for line in lines), 'no message names the path')
+            return exits, events, logs
+
+    def test_a_complete_proof_is_called_complete_only_after_its_barrier(self):
+        exits, events, logs = self.upgrade_runs({1})
+        self.assertEqual(exits, [1, 0, 0])
+        self.assertTrue(any('upgrade refused' in line for line in logs[0]), logs[0])
+        self.assertIn((2, 'manifests'), events, 'the second run repeated the barrier before success')
+        self.assertFalse(any('proof not durable' in line for line in logs[1]), logs[1])
+
+    def test_a_barrier_that_fails_again_is_a_failure_again(self):
+        exits, events, logs = self.upgrade_runs({1, 2})
+        self.assertEqual(exits, [1, 1, 0])
+        self.assertTrue(any('proof not durable file=2026-09-01.json.ots error=OSError errno=5' in line
+                            for line in logs[1]), logs[1])
+        self.assertIn((3, 'manifests'), events)
+
+    def test_healthy_control_repeats_the_barrier_on_the_real_directory(self):
+        exits, events, logs = self.upgrade_runs(set())
+        self.assertEqual(exits, [0, 0, 0])
+        self.assertEqual([n for n, name in events if name == 'manifests'], [1, 2, 3],
+                         'the write, then the repeated barrier on every later run')
+
+    def witness_runs(self, inject_at, redeliver_proof=False):
+        """Three inbox passes over one delivery; the witnessed directory's
+        fsync raises EIO on the runs in inject_at. With redeliver_proof the
+        delivery is a manifest and its proof, and the proof is delivered
+        again alone before run 2 (the held one then answers for it).
+        Returns (exits, events, logs, inbox names after each run)."""
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            inbox, witnessed = root / 'inbox', root / 'witnessed'
+            inbox.mkdir()
+            witnessed.mkdir()
+            raw = json.dumps({'schema': 'selfstamp/3', 'chain': 'a' * 32, 'seq': 1,
+                              'period': '2026-09-01', 'prev': None}).encode()
+            (inbox / 'source.json').write_bytes(raw)
+            if redeliver_proof:
+                (inbox / 'source.json.ots').write_bytes(self.pending_proof(raw))
+            real_sync, real_remove = selfstamp._fsync_dir, selfstamp._remove
+            events, run = [], [0]
+
+            def sync(path):
+                events.append((run[0], 'sync', pathlib.Path(path).name))
+                if run[0] in inject_at and pathlib.Path(path) == witnessed:
+                    raise OSError(errno.EIO, 'injected directory fsync failure')
+                return real_sync(path)
+
+            def remove(path):
+                events.append((run[0], 'remove', pathlib.Path(path).name))
+                return real_remove(path)
+            exits, logs, left = [], [], []
+            with mock.patch.object(selfstamp, '_fsync_dir', side_effect=sync), \
+                    mock.patch.object(selfstamp, '_remove', side_effect=remove):
+                for n in (1, 2, 3):
+                    run[0] = n
+                    if n == 2 and redeliver_proof:
+                        (inbox / 'source.json.ots').write_bytes(self.pending_proof(raw))
+                    lines = []
+                    exits.append(selfstamp.witness_inbox({'inbox': str(inbox)}, witnessed, lines.append))
+                    logs.append(lines)
+                    left.append(sorted(p.name for p in inbox.iterdir()))
+            self.assertEqual(len(list(witnessed.glob('*.json'))), 1, 'one copy, whatever happened')
+            self.assertFalse(any(td in line for lines in logs for line in lines), 'no message names the path')
+            return exits, events, logs, left
+
+    def order_in_run(self, events, n):
+        return [(kind, name) for run, kind, name in events if run == n]
+
+    def test_a_claim_stays_until_the_copy_is_durable(self):
+        exits, events, logs, left = self.witness_runs({1})
+        self.assertEqual(exits, [1, 0, 0])
+        self.assertTrue(any('inbox error' in line for line in logs[0]), logs[0])
+        self.assertTrue(left[0] and left[0][0].startswith('.claim-'), 'the claim stands after the failed barrier')
+        second = self.order_in_run(events, 2)
+        self.assertIn(('sync', 'witnessed'), second)
+        self.assertLess(second.index(('sync', 'witnessed')), next(i for i, e in enumerate(second) if e[0] == 'remove'),
+                        'the copy\'s barrier is repeated before the claim goes')
+        self.assertEqual(left[1], [])
+        self.assertTrue(any('inbox duplicate' in line for line in logs[1]), logs[1])
+
+    def test_a_barrier_that_fails_again_keeps_the_claim_again(self):
+        exits, events, logs, left = self.witness_runs({1, 2})
+        self.assertEqual(exits, [1, 1, 0])
+        self.assertTrue(left[1] and left[1][0].startswith('.claim-'), 'still claimed after the second failure')
+        self.assertFalse(any(kind == 'remove' for _, kind, _ in [e for e in events if e[0] == 2]))
+        self.assertEqual(left[2], [])
+
+    def test_a_held_foreign_proof_answers_for_a_redelivery_only_after_its_barrier(self):
+        exits, events, logs, left = self.witness_runs(set(), redeliver_proof=True)
+        self.assertEqual(exits, [0, 0, 0])
+        self.assertEqual(left, [[], [], []])
+        second = self.order_in_run(events, 2)
+        self.assertIn(('sync', 'witnessed'), second)
+        self.assertLess(second.index(('sync', 'witnessed')), next(i for i, e in enumerate(second) if e[0] == 'remove'),
+                        'the held proof\'s barrier is repeated before the redelivered companion goes')
+        self.assertTrue(any('inbox foreign proof' in line and 'foreign_proof=held pending' in line for line in logs[1]),
+                        logs[1])
+
+    def test_healthy_control_copies_then_syncs_then_removes(self):
+        exits, events, logs, left = self.witness_runs(set())
+        self.assertEqual(exits, [0, 0, 0])
+        first = self.order_in_run(events, 1)
+        self.assertLess(first.index(('sync', 'witnessed')), next(i for i, e in enumerate(first) if e[0] == 'remove'))
+        self.assertEqual(left, [[], [], []])
 
 
 if __name__ == "__main__":

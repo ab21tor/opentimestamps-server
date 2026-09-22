@@ -738,7 +738,10 @@ python3 ops/selfstamp.py verify  --manifests ~/selfstamp/manifests  # offline, n
 `run` is idempotent per period: a manifest that exists is left alone (a
 second run the same day writes nothing), a manifest without a proof is
 resubmitted rather than rewritten, a pending proof is asked about once
-per run, a complete proof is never touched again. The period is the UTC
+per run, a complete proof is never asked about again (its barrier, the
+file then its directory, is repeated every run before it is called
+complete, since nothing on disk says whether the run that wrote it got
+its directory fsync back). The period is the UTC
 day before the run's clock; `--period` names another finished day, and
 is refused for a day not yet over or one not after the newest manifest.
 Missed days are not backfilled: a run after an outage covers the day
@@ -974,8 +977,10 @@ witnessed file is not a record and never reaches a receipt), upgrades
 that proof on later runs like its own, and removes the claim. The copy
 is written before anything is removed, so a run interrupted anywhere
 converges: a file whose bytes are already held (by content, whatever the
-copy's name) is a duplicate and is removed after any proof delivered
-beside it is kept. A proof delivered beside a manifest, or alone later as
+copy's name) is a duplicate and is removed after the copy's barrier is
+repeated (the run that wrote the copy may have failed at its directory
+fsync, leaving the claim for that reason) and any proof delivered beside
+it is kept. A proof delivered beside a manifest, or alone later as
 `<name>.json.ots`, is kept as `<copy>.foreign.ots` if it is a proof of
 exactly those bytes and says more than what is held: the source exports
 its proof only once it is anchored, so the proof normally arrives on a
@@ -1530,6 +1535,7 @@ Test modules live under `otsserver/tests/`:
   `test_stamper_checkpoint.py`, `test_stamper_wallet_empty.py`,
   `test_operator_lane.py`, `test_selfstamp.py`,
   `test_stamper_dead_cycle.py`, `test_stamper_fee_cap.py`,
+  `test_stamper_coin_selection.py`,
   `test_watch.py`, `test_not_before.py`, `test_reorg_detector.py`,
   `test_claim_kit.py`, `test_stamper_save_retry.py`,
   `test_rpc_privacy.py`, `test_proof_corpus.py`,

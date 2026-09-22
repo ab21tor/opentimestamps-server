@@ -275,8 +275,9 @@ class Test_a_restored_self_stamp(SelfstampCase):
                                 self.first_run(cfg)
                         self.assertTrue(again['fired'])
                     self.converged(cfg, carried, published)
-        self.assertEqual(swept, {'rename': 0, 'replace': 2, 'unlink': 0, 'fsync': 4},
-                         'the manifest and its proof written whole, each with its file and directory fsync')
+        self.assertEqual(swept, {'rename': 0, 'replace': 2, 'unlink': 0, 'fsync': 6},
+                         'the manifest and its proof written whole, each with its file and directory fsync, and '
+                         'the barrier of the one complete proof carried (2026-09-01) repeated, file then directory (S5)')
 
     def test_the_label_waits_while_an_earlier_manifest_cannot_be_read(self):
         """Whether the chain already has its label is read from its

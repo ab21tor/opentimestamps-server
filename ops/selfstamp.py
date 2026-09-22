@@ -1019,8 +1019,10 @@ def _keep_foreign_proof(copy, data, digest, log):
     not (2026-09-16 gate review, P2) is set aside beside the copy as
     <copy>.foreign.ots.rejected-<12 hex of its sha256>, logged, and
     never outranks a proof that is. Returns the state now held ('held …'
-    when the delivery said less). OtsError when the bytes delivered are
-    not a proof of the copy."""
+    when the delivery said less: the held file then answers for the
+    delivery, so its barrier is repeated before the caller removes the
+    delivery). OtsError when the bytes delivered are not a proof of the
+    copy."""
     proof = _check_foreign_proof(data, digest)
     target = copy.with_name(copy.name + '.foreign.ots')
     if target.exists():
@@ -1033,6 +1035,8 @@ def _keep_foreign_proof(copy, data, digest, log):
             log('%s foreign proof set aside copy=%s kept=%s reason=%s' % (_stamp(), copy.name, aside.name, exp))
         else:
             if held.attestation[0] == 'bitcoin' or proof.attestation[0] != 'bitcoin':
+                _fsync_file(target)
+                _fsync_dir(target.parent)
                 return 'held ' + proof_state(held)
     write_atomic(target, data)
     return proof_state(proof)
@@ -1071,7 +1075,11 @@ def _consume_manifest(path, name, inbox, witnessed_dir, held, log):
     """One claimed *.json. Not a manifest: its companion, then it, are
     quarantined (the companion first, so a stop between the two leaves the
     manifest to be found again). Bytes already held, by content, whatever
-    the copy's name: the companion is consumed, the claim removed. New:
+    the copy's name: the copy's barrier is repeated (the run that wrote it
+    may have failed at the directory fsync after the rename, leaving this
+    claim standing for that reason), then the companion is consumed, then
+    the claim removed; a barrier that fails raises, and the claim stays
+    for the next run. New:
     the copy is written first (it is the record), then the companion
     consumed, then the claim removed, so a stop anywhere leaves the pair
     to be found again as a duplicate. Nothing is read from anywhere but
@@ -1089,6 +1097,8 @@ def _consume_manifest(path, name, inbox, witnessed_dir, held, log):
     digest = hashlib.sha256(raw).digest()
     copy = held.get(digest)
     if copy is not None:
+        _fsync_file(copy)
+        _fsync_dir(copy.parent)
         foreign = _consume_companion(copy, companion, name + '.ots', digest, inbox, log)
         _remove(path)
         log('%s inbox duplicate file=%s already=%s foreign_proof=%s' % (_stamp(), name, copy.name, foreign))
@@ -1331,6 +1341,18 @@ def _upgrade_pass(cfg, directory, log):
             failures += 1
             continue
         if state != 'pending':
+            # A complete proof is visible, not known durable: the run that
+            # replaced it may have failed at the directory fsync after the
+            # rename, and nothing on disk says which. Its barrier is
+            # repeated, the file then its directory, before it is called
+            # complete; one that fails is this run's failure, and is
+            # repeated next run.
+            try:
+                _fsync_file(path)
+                _fsync_dir(path.parent)
+            except OSError as exp:
+                log('%s proof not durable file=%s error=%s' % (_stamp(), path.name, _error_text(exp)))
+                failures += 1
             continue
         try:
             ots = path.read_bytes()
